@@ -2,6 +2,8 @@
 
 Документ — источник правды для реализации. Требования: [requirements.md](requirements.md).
 Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
+Итерация 2 (размытые сроки, локальный Whisper, связи и подзадачи, Mini App): [features/iteration-2.md](features/iteration-2.md);
+сделанное оттуда кратко отмечено ниже.
 
 ## 1. Общая схема
 
@@ -85,7 +87,7 @@ src/dumpbot/
     app.py                 build_bot(), build_dispatcher(), on_startup/on_shutdown                    [bot]
     middlewares.py  cbdata.py  keyboards.py  states.py  views.py  sender.py                           [bot]
     routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
-migrations/  alembic (env.py async, initial migration)                                                [infra]
+migrations/  alembic (env.py async, 0001 initial, 0002 item periods)                                     [infra]
 Dockerfile  compose.yaml  .dockerignore  .env.example  README.md                                     [infra]
 tests/conftest.py (фикстуры БД)                                                                       [foundation ✔]
 tests/<area>/test_*.py                                                                                [владелец модуля]
@@ -120,13 +122,16 @@ class ReminderPlan:
 @dataclass(frozen=True)
 class Resolution:
     due_at: datetime | None    # aware UTC; None → у записи нет времени и напоминаний
-    precision: Precision       # exact|slot|date|default|relative|fallback|none
+    precision: Precision       # exact|slot|date|default|relative|fallback|period|soon|someday|none
     reminders: tuple[ReminderPlan, ...]
     rrule: str | None          # нормализованный RRULE (без DTSTART) или None
     rec_time_local: time | None
     rec_dtstart_local: datetime | None   # naive, локальное время prefs.tz
     needs_confirm: bool
     warnings: tuple[str, ...]  # по-русски, для карточки: "время уже прошло — перенёс на завтра"
+    period_kind: str | None    # week|month|season|soon|someday (итерация 2)
+    period_start: date | None  # локальные даты срока, включительно (None у someday)
+    period_end: date | None
 
 def localize(d: date, t: time, tz: ZoneInfo) -> datetime
     """DST-safe: aware datetime в tz. Несуществующее время (весенний переход) → сдвиг вперёд;
@@ -136,7 +141,12 @@ def resolve_item(item: ExtractedItem, now: datetime, prefs: Prefs, *, source: So
 def resolve_when(when: When, now: datetime, prefs: Prefs) -> tuple[datetime | None, Precision, list[str], bool]
     """(due_at UTC | None, precision, warnings, needs_confirm) — без напоминаний; используется и для правок."""
 def plan_reminders(due_at: datetime, precision: Precision, role: str, lead: list[int] | None,
-                   prefs: Prefs, now: datetime) -> tuple[ReminderPlan, ...]
+                   prefs: Prefs, now: datetime, *, period: tuple[date, date] | None = None) -> tuple[ReminderPlan, ...]
+def period_bounds(period: str, now: datetime, prefs: Prefs) -> tuple[date, date]
+    """When.period → локальные [start, end]: неделя пн–вс, месяц (YYYY-MM: прошедший → следующий год), ближайший
+    незакончившийся сезон (зима дек–фев), soon = сегодня…+soon_days. someday → ValueError."""
+def when_period(when: When, now: datetime, prefs: Prefs) -> tuple[str | None, date | None, date | None]
+    """(period_kind, start, end), которые запись хранит; дедлайн «до конца недели» — обычная дата → (None, None, None)."""
 def resolve_range(spec_range: str, now: datetime, prefs: Prefs) -> tuple[datetime, datetime]
     """QuerySpec.range → [start, end) в UTC по локальному календарю prefs.tz.
     today|tomorrow|yesterday|this_week|next_week|last_week (неделя с понедельника)|this_month|last_month
@@ -154,7 +164,8 @@ def lead_applies(precision: str, minutes: int) -> bool
 
 | Вход | Результат |
 |---|---|
-| Приоритет полей When | `at` > `in_min` > (`day` и/или `time`). Лишние игнорируются. |
+| Приоритет полей When | `at` > `in_min` > `period` > (`day` и/или `time`). Лишние игнорируются. |
+| `period` (итерация 2) | неделя / месяц / сезон: precision `period`, due = напоминание (2) — последний рабочий день срока в `task_default_time`, если прошёл — последний день срока, если и он прошёл — этот момент без напоминания; `soon`: через `soon_days` в `task_default_time`, precision `soon`; `someday`: без due и без напоминания по умолчанию, precision `someday`. С role `deadline` неделя/месяц/сезон → обычная дата: последний рабочий день срока (прошёл → последний день). Подробно: [iteration-2.md §A](features/iteration-2.md). |
 | `in_min` | `due = now + in_min` (в UTC), precision `relative`, напоминание ровно в `due` (lead 0, auto=False). |
 | только `time` (слот или HH:MM) | сегодня в это время; если ≤ now → **завтра** (без предупреждения). precision `slot`/`exact`. |
 | `day` без `time` | время `bare_date_time` (10:00); для `weekend` — `weekend_time`; precision `date`. Явная дата (`+N`, `dN`, `MM-DD`, `YYYY-MM-DD`), которая сегодня, **остаётся сегодня** и после 10:00 (это не время пользователя): `task_default_time` (19:00), если ещё впереди, иначе через 1 ч (не позже 23:59); без предупреждения. |
@@ -183,6 +194,9 @@ def lead_applies(precision: str, minutes: int) -> bool
 - Если `fire_at ≤ now` но `due > now` → `fire_at = now` (сразу). Если `due ≤ now` → напоминаний нет.
 - auto=True → `quiet.shift_out_of_quiet(fire_at, prefs)`.
 - Дубликаты `fire_at` схлопнуть; сортировка по времени.
+- Итерация 2: precision `period` → (2) в due и (1) утром первого дня срока (`bare_date_time`), если срок начинается
+  после сегодняшнего дня; `soon` → ровно в due; role `deadline` с exact/slot/date/fallback → ещё накануне в
+  `task_default_time`. Все они auto; прошедшие (1) и «накануне» пропускаются.
 
 Повторы (`item.rrule` есть): `normalize_rrule`; время суток = `time` из When (слот/HH:MM) или `task_default_time`;
 `rec_dtstart_local` = дата из `day` («с понедельника», «начиная со следующей пятницы» — от неё отсчитываются INTERVAL и
@@ -279,7 +293,7 @@ class ChutesWhisperSTT:
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v1"
+PROMPT_VERSION: str  # "v2" (итерация 2: when.period)
 
 @dataclass
 class ExtractInput:
@@ -428,7 +442,11 @@ async def move_to_tomorrow(session, occurrence_ids: list[int], prefs: Prefs, now
 ```
 
 Внутренние правила: при любом перепланировании pending-напоминания текущего occurrence → cancelled, создаются новые
-по `plan_reminders`. Перед отменой pending-напоминаний строки occurrences блокируются (`SELECT … FOR UPDATE` до commit):
+по `plan_reminders` (для precision `period` — с `period=(item.period_start, item.period_end)`). Итерация 2: `Item`
+хранит `period_kind/period_start/period_end/someday`; `apply_patch` с `when.period` пересчитывает срок и
+напоминания («перенеси на следующую неделю»), `someday` отменяет open occurrences с напоминаниями; явная дата,
+`move_to_tomorrow` и rrule делают запись обычной датированной (period сбрасывается).
+Перед отменой pending-напоминаний строки occurrences блокируются (`SELECT … FOR UPDATE` до commit):
 два одновременных перепланирования одного occurrence (двойное нажатие «+15 мин», кнопка и job правки) выполняются по
 очереди, и второе видит и отменяет напоминание первого, а не добавляет дубликат. `Item.updated_at` обновляется. Повторяющиеся записи: `Item.status` остаётся open, пока активен повтор.
 
@@ -449,6 +467,10 @@ class Row:
     created_at: datetime
     snippet: str | None            # фрагмент source_text/details (≤200 символов)
     urls: list[str]
+    period_kind: str | None        # итерация 2: Item.period_kind/period_start/period_end/someday
+    period_start: date | None
+    period_end: date | None
+    someday: bool
 
 @dataclass
 class Agenda:
@@ -456,6 +478,8 @@ class Agenda:
     open: list[Row]                # open occurrences с due в этот день (сортировка по времени)
     overdue: list[Row]             # open occurrences с due < начала дня (только для сегодня), не старше 30 дней
     done: list[Row]                # done в этот день
+    period_items: list[Row]        # итерация 2: open записи, чей срок (неделя/месяц/сезон) содержит день;
+                                   # пока срок идёт, их нет в open/overdue
 
 @dataclass
 class UsageSummary:
@@ -467,10 +491,12 @@ class UsageSummary:
 
 async def agenda(session, prefs: Prefs, now: datetime, *, day_offset: int = 0) -> Agenda
 async def open_tasks(session, prefs: Prefs, now: datetime, limit: int = 30) -> list[Row]
-    # ACTIONABLE, status open; сначала с due (по возрастанию), потом без
+    # ACTIONABLE, status open, не someday; сначала с due (по возрастанию), потом без
+async def someday_items(session, limit: int = 50) -> list[Row]    # open someday-записи (/someday), новые первыми
 async def recent(session, limit: int = 15) -> list[Row]           # по created_at desc, без deleted
 async def search(session, text: str, limit: int = 20) -> list[Row]  # FTS + ILIKE-фолбэк по title/tags
 async def run_query(session, spec: QuerySpec, prefs: Prefs, now: datetime) -> list[Row]
+    # date_field=due + range: occurrences с due в диапазоне и записи, чей срок пересекается с диапазоном
 async def recurring(session) -> list[Row]                          # rec_active, с ближайшим open occurrence
 async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, limit: int = 5, *,
                                exact: bool = False) -> list[Row]
@@ -664,6 +690,7 @@ def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Pre
     # "🔔 <b>Купить наушники</b>\nчерез 5 мин · сегодня 13:00"  [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
 def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
 def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
+    # + раздел «🗓 На этой неделе (до вс 11 окт)» / «🗓 В этом месяце» / «🗓 Этим летом» (period_sections)
 def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
     # вечерний: сделано / не сделано (уже наступило) / «Ещё сегодня» (due > now, не считается в «Сделано X из Y»)
     # / просрочено + [📅 Перенести невыполненное на завтра] (DigestCb с днём дайджеста), если есть что переносить
@@ -680,8 +707,8 @@ def help_text() -> str
 
 Порядок: `commands` → `settings` (FSM-ввод) → `edit` (FSM-ввод) → `callbacks` → `capture` (всё остальное).
 
-Команды (`set_my_commands` со scope владельца): `/today`, `/tasks`, `/recent`, `/search <текст>`, `/ask <вопрос>`,
-`/recurring`, `/settings`, `/usage`, `/help`, `/start`. Неизвестная команда → подсказка.
+Команды (`set_my_commands` со scope владельца): `/today`, `/tasks`, `/someday`, `/recent`, `/search <текст>`,
+`/ask <вопрос>`, `/recurring`, `/settings`, `/usage`, `/help`, `/start`. Неизвестная команда → подсказка.
 `/start` при `OWNER_ID=0`: отвечает любому «Твой Telegram ID: N — впиши его в .env как OWNER_ID и перезапусти».
 
 `capture`: всё, что не команда. `?…` → force_query. Reply разбирается по тому, на что он: сообщение бота с item_id

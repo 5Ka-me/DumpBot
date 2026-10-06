@@ -15,7 +15,7 @@ Overview:
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import date, datetime, time
 from decimal import Decimal
 from typing import Any
 
@@ -23,6 +23,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     Computed,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -105,6 +106,7 @@ class Item(Base):
         Index("ix_items_status_kind", "status", "kind"),
         Index("ix_items_created", "created_at"),
         Index("ix_items_raw", "raw_message_id"),
+        Index("ix_items_period", "period_start", "period_end"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
@@ -131,6 +133,13 @@ class Item(Base):
     rec_dtstart_local: Mapped[datetime | None] = mapped_column(DateTime(timezone=False))
     rec_tz: Mapped[str | None] = mapped_column(String(64))
     rec_active: Mapped[bool] = mapped_column(Boolean, server_default=sa_text("false"), default=False)
+
+    # Fuzzy time (docs/features/iteration-2.md §A): week | month | season | soon | someday, with the local dates of
+    # the span (inclusive; none for someday). ``someday`` items have no occurrence and are not in /tasks.
+    period_kind: Mapped[str | None] = mapped_column(String(16))  # domain.kinds.PeriodKind
+    period_start: Mapped[date | None] = mapped_column(Date)
+    period_end: Mapped[date | None] = mapped_column(Date)
+    someday: Mapped[bool] = mapped_column(Boolean, server_default=sa_text("false"), default=False)
 
     needs_confirm: Mapped[bool] = mapped_column(Boolean, server_default=sa_text("false"), default=False)
     confidence: Mapped[str | None] = mapped_column(String(8))

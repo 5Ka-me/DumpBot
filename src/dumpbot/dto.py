@@ -28,6 +28,11 @@ class Resolution:
     rec_dtstart_local: datetime | None = None  # naive, local wall time of prefs.tz
     needs_confirm: bool = False
     warnings: tuple[str, ...] = ()
+    # Fuzzy time ("на этой неделе", "на днях", "когда-нибудь"): domain.kinds.PeriodKind and the local dates of the
+    # span, both inclusive (None for someday). A deadline "до конца недели" is a plain date, not a period.
+    period_kind: str | None = None
+    period_start: date | None = None
+    period_end: date | None = None
 
 
 @dataclass
@@ -61,6 +66,10 @@ class Row:
     created_at: datetime
     snippet: str | None  # fragment of source_text/details (<= 200 chars)
     urls: list[str] = field(default_factory=list)
+    period_kind: str | None = None  # Item.period_kind
+    period_start: date | None = None
+    period_end: date | None = None
+    someday: bool = False
 
 
 @dataclass
@@ -69,6 +78,9 @@ class Agenda:
     open: list[Row]  # open occurrences due that day, by time
     overdue: list[Row]  # open occurrences due before that day (only for today), not older than 30 days
     done: list[Row]  # occurrences done that day
+    # Open items with a calendar period (week / month / season) that contains the day, the shortest span first.
+    # While its period runs such an item is listed here, not in open / overdue.
+    period_items: list[Row] = field(default_factory=list)
 
 
 @dataclass

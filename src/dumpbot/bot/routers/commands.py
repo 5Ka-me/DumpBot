@@ -1,4 +1,4 @@
-"""Slash commands: /start /help /today /tasks /recent /search /ask /recurring /settings /usage /cancel.
+"""Slash commands: /start /help /today /tasks /someday /recent /search /ask /recurring /settings /usage /cancel.
 
 This router runs first, so commands (``/cancel`` in particular) work in the middle of an input dialog. Any other
 ``/word`` gets a short hint instead of being saved as a note.
@@ -41,6 +41,7 @@ log = logging.getLogger(__name__)
 BOT_COMMANDS: Final[tuple[tuple[str, str], ...]] = (
     ("today", "План на сегодня"),
     ("tasks", "Открытые задачи"),
+    ("someday", "Когда-нибудь (без срока)"),
     ("recent", "Последние записи"),
     ("search", "Поиск: /search текст"),
     ("ask", "Вопрос по сохранённому"),
@@ -57,6 +58,7 @@ SEARCH_HINT: Final = "🔎 Напиши в ответ на это сообщен
 ASK_HINT: Final = "❓ Напиши вопрос в ответ на это сообщение. Или сразу: <code>/ask что у меня завтра?</code>"
 UNKNOWN_COMMAND: Final = "🤷 Не знаю такой команды. Список команд — /help"
 CANCELLED: Final = "Отменено."
+SOMEDAY_EMPTY: Final = "Пусто. Напиши, например, «когда-нибудь выучить испанский» — запись попадёт сюда."
 NOTHING_TO_CANCEL: Final = "Нечего отменять."
 
 LIST_LIMIT: Final = 30
@@ -85,6 +87,7 @@ def make_router() -> Router:
     router.message.register(cmd_cancel, Command("cancel"))
     router.message.register(cmd_today, Command("today"))
     router.message.register(cmd_tasks, Command("tasks"))
+    router.message.register(cmd_someday, Command("someday"))
     router.message.register(cmd_recent, Command("recent"))
     router.message.register(cmd_search, Command("search"))
     router.message.register(cmd_ask, Command("ask"))
@@ -125,6 +128,14 @@ async def cmd_tasks(message: Message, ctx: AppContext) -> None:
     async def load(session: AsyncSession, prefs: Prefs, now: datetime) -> views.View:
         rows = await query.open_tasks(session, prefs, now, limit=LIST_LIMIT)
         return views.rows_list("📋 Открытые задачи", rows, prefs, now, empty="Открытых задач нет 🎉")
+
+    await _send_list(ctx, load)
+
+
+async def cmd_someday(message: Message, ctx: AppContext) -> None:
+    async def load(session: AsyncSession, prefs: Prefs, now: datetime) -> views.View:
+        rows = await query.someday_items(session, limit=LIST_LIMIT)
+        return views.rows_list("🌙 Когда-нибудь", rows, prefs, now, empty=SOMEDAY_EMPTY)
 
     await _send_list(ctx, load)
 
@@ -205,11 +216,14 @@ async def cmd_unknown(message: Message) -> None:
 
 
 def today_view(agenda: Agenda, prefs: Prefs, now: datetime) -> views.View:
-    """``/today``: today's not-done occurrences, then overdue and done ones (sections only when non-empty)."""
+    """``/today``: today's not-done occurrences, then overdue ones, the running spans ("🗓 На этой неделе") and done
+    ones (sections only when non-empty)."""
     title = f"📅 Сегодня, {fmt_date(agenda.day)}"
     parts = [views.rows_list(title, agenda.open, prefs, now, empty="На сегодня ничего не запланировано.")[0]]
     if agenda.overdue:
         parts.append(views.rows_list("⚠️ Просрочено", agenda.overdue, prefs, now)[0])
+    if agenda.period_items:
+        parts.append("\n".join(views.period_sections(agenda.period_items, prefs, now)))
     if agenda.done:
         parts.append(views.rows_list("✅ Сделано", agenda.done, prefs, now)[0])
     return views.fit("\n\n".join(parts)), None

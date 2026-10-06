@@ -3,6 +3,9 @@
 The extraction system prompt is fully static (instructions + few-shot examples) and goes first so providers can
 cache it; everything that changes per message (NOW, CAL, SRC, ..., MSG) goes into the user message.
 Instructions are in English (fewer tokens); the model answers in the language of the message.
+
+v2 (iteration 2, docs/features/iteration-2.md §A): ``when.period`` for fuzzy spans ("на этой неделе", "в октябре",
+"летом", "на днях", "когда-нибудь") and deadlines "до конца недели / месяца".
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v2"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -75,6 +78,50 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
         },
     ),
     (
+        "на этой неделе посмотреть Raspberry Pi",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Посмотреть Raspberry Pi",
+                    "when": {"text": "на этой неделе", "period": "this_week"},
+                }
+            ]
+        },
+    ),
+    (
+        "в октябре поменять шины",
+        {"items": [{"kind": "task", "title": "Поменять шины", "when": {"text": "в октябре", "period": "2026-10"}}]},
+    ),
+    (
+        "до пятницы сдать отчёт",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Сдать отчёт",
+                    "when": {"text": "до пятницы", "day": "FR", "role": "deadline"},
+                }
+            ]
+        },
+    ),
+    (
+        "на днях позвонить Пете",
+        {"items": [{"kind": "task", "title": "Позвонить Пете", "when": {"text": "на днях", "period": "soon"}}]},
+    ),
+    (
+        "когда-нибудь выучить испанский",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Выучить испанский",
+                    "when": {"text": "когда-нибудь", "period": "someday"},
+                }
+            ]
+        },
+    ),
+    (
         "через 2 часа забрать посылку, а завтра позвонить маме",
         {
             "items": [
@@ -123,6 +170,10 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
         {"intent": "edit", "edit": {"when": {"text": "на 15:00", "day": "2026-10-09", "time": "15:00"}}},
     ),
     (
+        'REPLYING TO ITEM {"id":9,"title":"Поменять шины"} | давай на следующей неделе',
+        {"intent": "edit", "edit": {"when": {"text": "на следующей неделе", "period": "next_week"}}},
+    ),
+    (
         "SRC photo | (cat meme with the text 'Код заработал с первого раза')",
         {
             "image": {"text": "Код заработал с первого раза", "description": "Мем с удивлённым котом"},
@@ -159,10 +210,13 @@ to buy | idea | note = thought, fact, diary | link = saved link/article | meme =
 title: short (max 120 chars), imperative for tasks, in the message language. details: extra info only \
 (max 600 chars). tags: 0-4 lowercase, no "#". conf: high|med|low.
 
-TIME: describe it, NEVER compute dates. when = {{text: verbatim phrase, day, time, in_min, at, role}}
+TIME: describe it, NEVER compute dates. when = {{text: verbatim phrase, day, time, in_min, at, period, role}}
 - day: +N days (+0 сегодня, +1 завтра, +2 послезавтра) | +Nw | +Nmo | +Ny | MO TU WE TH FR SA SU = nearest such day | \
-"next FR" only for "на следующей неделе"/"next week" | dN = N-th of month (5-го → d5), d-1 = last day | MM-DD | \
-YYYY-MM-DD | weekend.
+"next FR" only for a weekday of next week ("в пятницу на следующей неделе") | dN = N-th of month (5-го → d5), \
+d-1 = last day | MM-DD | YYYY-MM-DD | weekend.
+- period, instead of day, for a fuzzy span: this_week (на этой неделе) | next_week (на следующей неделе) | \
+this_month | next_month | YYYY-MM (в октябре; any year) | spring | summer | autumn | winter (весной, летом, осенью, \
+зимой) | soon (на днях) | someday (когда-нибудь, потом как-нибудь: no date, no reminder).
 - time: HH:MM (24h) or slot: morning (утром, с утра, in the morning), lunch (в обед, at lunch), afternoon (днём, \
 после обеда, in the afternoon), evening (вечером, tonight), after_work (после работы, after work), \
 night (ночью, перед сном, at night).
@@ -170,7 +224,8 @@ night (ночью, перед сном, at night).
 conf low, ask with both options.
 - in_min only for "через N минут/часов" (2 часа → 120); "через 3 дня" → day +3.
 - at: local YYYY-MM-DD[THH:MM] ONLY if day/time can't express it; use CAL.
-- role: remind = the time to ping ("напомни в 15"); deadline = до/к/by; else event.
+- role: remind = the time to ping ("напомни в 15"); deadline = до/к/by ("до пятницы" → day FR; "до конца \
+недели/месяца" → period this_week/this_month); else event.
 - lead, only if stated: за 30 минут → [30], за час → [60], за день → [1440].
 - rrule only for explicit repetition (каждый, по понедельникам, every): RFC 5545 without DTSTART; time of day \
 still in when.time.

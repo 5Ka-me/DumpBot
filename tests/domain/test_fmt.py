@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from dumpbot import clock
-from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_dt, fmt_duration, fmt_time, plural_ru
+from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time, plural_ru
 
 TZ = ZoneInfo("Europe/Warsaw")
 NOW = datetime(2026, 10, 6, 14, 5, tzinfo=TZ)  # Tuesday
@@ -132,3 +132,34 @@ def test_fmt_duration(minutes: int, text: str):
 )
 def test_plural_ru(n: int, word: str):
     assert plural_ru(n, "задача", "задачи", "задач") == word
+
+
+@pytest.mark.parametrize(
+    ("d", "text"),
+    [
+        (date(2026, 10, 6), "вт 6 окт"),
+        (date(2026, 10, 7), "ср 7 окт"),
+        (date(2026, 10, 11), "вс 11 окт"),
+        (date(2027, 8, 31), "31 авг 2027"),
+    ],
+)
+def test_fmt_date_without_relative_words(d: date, text: str):
+    assert fmt_date(d, today=TODAY, relative=False) == text
+
+
+@pytest.mark.parametrize(
+    ("d", "text"),
+    [
+        (date(2026, 10, 6), "сегодня"),
+        (date(2026, 10, 7), "завтра"),
+        (date(2026, 10, 8), "чт"),
+        (date(2026, 10, 9), "пт"),
+        (date(2026, 10, 12), "пн"),  # six days ahead: still unambiguous
+        (date(2026, 10, 13), "вт 13 окт"),  # a week ahead: the same weekday as today
+        (date(2026, 10, 5), "пн 5 окт"),
+        (date(2027, 6, 1), "1 июн 2027"),
+        (datetime(2026, 10, 9, 19, 0), "пт"),
+    ],
+)
+def test_fmt_day(d: date, text: str):
+    assert fmt_day(d, today=TODAY) == text

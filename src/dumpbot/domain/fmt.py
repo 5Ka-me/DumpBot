@@ -47,17 +47,30 @@ def fmt_time(t: time) -> str:
     return f"{t.hour:02d}:{t.minute:02d}"
 
 
-def fmt_date(d: date, *, today: date | None = None) -> str:
-    """Local date: "сегодня" / "завтра" / "вчера" (only with ``today``), "пт 9 окт", "9 окт 2027" (other year)."""
+def fmt_date(d: date, *, today: date | None = None, relative: bool = True) -> str:
+    """Local date: "сегодня" / "завтра" / "вчера" (only with ``today`` and ``relative``), "пт 9 окт",
+    "9 окт 2027" (other year than ``today``)."""
     d = _as_date(d)
     if today is not None:
         today = _as_date(today)
-        relative = {0: "сегодня", 1: "завтра", -1: "вчера"}.get((d - today).days)
-        if relative:
-            return relative
+        word = {0: "сегодня", 1: "завтра", -1: "вчера"}.get((d - today).days) if relative else None
+        if word:
+            return word
         if d.year != today.year:
             return f"{d.day} {MONTHS_SHORT[d.month - 1]} {d.year}"
     return f"{WEEKDAYS_SHORT[d.weekday()]} {d.day} {MONTHS_SHORT[d.month - 1]}"
+
+
+def fmt_day(d: date, *, today: date) -> str:
+    """A day close to ``today`` as short as it stays clear: "сегодня", "завтра", the weekday alone within the next
+    six days ("пт"), otherwise the date ("пн 19 окт", "1 июн 2027")."""
+    d, today = _as_date(d), _as_date(today)
+    delta = (d - today).days
+    if delta in (0, 1):
+        return ("сегодня", "завтра")[delta]
+    if 1 < delta < 7:
+        return WEEKDAYS_SHORT[d.weekday()]
+    return fmt_date(d, today=today, relative=False)
 
 
 def fmt_dt(dt: datetime, tz: ZoneInfo, *, now: datetime | None = None) -> str:

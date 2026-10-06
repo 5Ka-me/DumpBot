@@ -43,7 +43,7 @@ from dumpbot import clock
 from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
 from dumpbot.ai.extract import ExtractInput, ExtractOutput, answer_query, extract
 from dumpbot.ai.linkinfo import fetch_titles
-from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QuerySpec
+from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QuerySpec, When
 from dumpbot.bot import sender, views
 from dumpbot.context import AppContext
 from dumpbot.db.models import Job, OnceKey, RawMessage
@@ -290,13 +290,19 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
 
 
 def _time_patch(edit: EditPatch | None, now: datetime, prefs: Prefs) -> EditPatch | None:
-    """The time part of the model's patch for a "🕒 Время" answer; None when it has no usable time."""
+    """The time part of the model's patch for a "🕒 Время" answer; None when it has no usable time ("когда-нибудь"
+    is one: it takes the dates away)."""
     if edit is None:
         return None
-    when = edit.when if edit.when is not None and timeresolve.resolve_when(edit.when, now, prefs)[0] else None
+    when = edit.when if edit.when is not None and _usable_when(edit.when, now, prefs) else None
     if when is None and not edit.rrule and not edit.lead:
         return None
     return EditPatch(when=when, rrule=edit.rrule, lead=edit.lead)
+
+
+def _usable_when(when: When, now: datetime, prefs: Prefs) -> bool:
+    due, precision, _, _ = timeresolve.resolve_when(when, now, prefs)
+    return due is not None or precision == "someday"
 
 
 HANDLERS: dict[str, Handler] = {

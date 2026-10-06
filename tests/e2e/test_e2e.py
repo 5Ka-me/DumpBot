@@ -15,7 +15,7 @@ import pytest
 from sqlalchemy import select
 
 from dumpbot.ai import linkinfo
-from dumpbot.db.models import AiUsage, Item, Job, OnceKey, RawMessage
+from dumpbot.db.models import AiUsage, BotMessage, Item, Job, OnceKey, RawMessage
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 PRIMARY = "google/gemma-4-31B-turbo-TEE"
@@ -451,6 +451,12 @@ async def test_recurring_task_done_and_stopped(e2e: Any) -> None:
         lambda: next((c for c in e2e.tg.sent if c.text.startswith("<b>🔁")), None), "/recurring answer"
     )
     assert "Зарядка" in listing.text and "каждый день" in listing.text
+
+    async def listing_recorded() -> bool:  # the sender records the list (purpose "recurring") right after sending
+        async with e2e.ctx.sessionmaker() as s:
+            return await s.scalar(select(BotMessage).where(BotMessage.message_id == listing.message_id)) is not None
+
+    await e2e.wait_db(listing_recorded, "the /recurring list recorded")
     e2e.tg.push_callback(listing, listing.button(f"i:stoprec:{item.id}"))
     [edit] = await e2e.wait(lambda: e2e.tg.edits_of(listing.message_id), "the list re-rendered")
     assert "Повторяющихся задач нет." in edit.text

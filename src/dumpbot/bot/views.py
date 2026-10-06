@@ -6,7 +6,9 @@ Rules:
 - every user/LLM string is passed through ``html.escape(s, quote=False)`` (``href`` values with ``quote=True``);
 - user strings are clipped *before* they are escaped and wrapped in tags, and each line keeps its tags balanced,
   so ``fit`` can drop whole lines to stay within Telegram's 4096-character limit (counted in UTF-16 units);
-- dates are rendered in Russian by ``domain.fmt`` relative to the ``now`` argument (never the wall clock).
+- dates are rendered in Russian by ``domain.fmt`` relative to the ``now`` argument (never the wall clock);
+- fuzzy time (docs/features/iteration-2.md §A) has its own time lines: "🗓 на этой неделе (до вс 11 окт) · напомню
+  пт в 19:00", "⏳ до пт 9 окт · напомню чт в 19:00 и пт в 10:00", "🌙 когда-нибудь".
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / lead / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -69,8 +71,8 @@ from dumpbot.bot.keyboards import (
     reminder_keyboard,
     undone_keyboard,
 )
-from dumpbot.domain.fmt import fmt_date, fmt_dt, fmt_duration, fmt_time
-from dumpbot.domain.kinds import ACTIONABLE, KIND_EMOJI, KIND_LABELS, KINDS
+from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time
+from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS, KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import SLOT_LABELS, SLOT_NAMES, Prefs
 from dumpbot.domain.recurrence import describe_rrule_ru
 
@@ -98,6 +100,30 @@ CANDIDATES_MAX: Final = 5
 _TAIL_RESERVE: Final = 300
 
 PENDING: Final[frozenset[str | None]] = frozenset({None, "pending", "sending"})
+SOMEDAY_LINE: Final = "🌙 когда-нибудь"
+# Precisions whose occurrence can be a deadline "⏳ до …" (role deadline): an explicit date or time.
+_DEADLINE_PRECISIONS: Final[frozenset[str]] = frozenset({"exact", "slot", "date", "fallback"})
+_MONTHS_IN: Final[tuple[str, ...]] = (
+    "январе",
+    "феврале",
+    "марте",
+    "апреле",
+    "мае",
+    "июне",
+    "июле",
+    "августе",
+    "сентябре",
+    "октябре",
+    "ноябре",
+    "декабре",
+)
+# First month of a season -> (when it is not the current one, when it is).
+_SEASON_WORDS: Final[dict[int, tuple[str, str]]] = {
+    3: ("весной", "этой весной"),
+    6: ("летом", "этим летом"),
+    9: ("осенью", "этой осенью"),
+    12: ("зимой", "этой зимой"),
+}
 LEAD_CHOICES: Final[tuple[int, ...]] = (0, 5, 15, 30, 60, 1440)  # item "remind before" menu
 NEEDS_CONFIRM_HINT: Final = "проверь, правильно ли я понял"
 
@@ -250,11 +276,103 @@ def _reminder_phrase(due: datetime, pending: Sequence[Reminder], tz: ZoneInfo, n
     return "напомню " + _join_ru([f"за {fmt_duration(m)}" if m > 0 else f"в {due_time}" for m in leads])
 
 
+def _fires_phrase(pending: Sequence[Reminder], tz: ZoneInfo, now: datetime) -> str:
+    """Reminder moments by day: "напомню пт в 19:00", "напомню чт в 19:00 и пт в 10:00", "напомню сейчас"."""
+    today = _local(now, tz).date()
+    parts: list[str] = []
+    for r in pending:
+        local = _local(r.fire_at, tz)
+        part = (
+            "сейчас"
+            if r.fire_at <= now + timedelta(minutes=1)
+            else f"{fmt_day(local.date(), today=today)} в {fmt_time(local.time())}"
+        )
+        if part not in parts:
+            parts.append(part)
+    return "напомню " + _join_ru(parts)
+
+
+def period_label(kind: str | None, start: date, end: date, today: date) -> str:
+    """A fuzzy span as words, relative to ``today``: "на этой неделе", "на следующей неделе", "на неделе с 19 окт",
+    "в этом месяце", "в следующем месяце", "в ноябре", "в марте 2028", "этой осенью", "летом", "летом 2027",
+    "на днях"."""
+    if kind == "week":
+        monday = today - timedelta(days=today.weekday())
+        if start == monday:
+            return "на этой неделе"
+        if start == monday + timedelta(days=7):
+            return "на следующей неделе"
+        return f"на неделе с {start.day} {MONTHS_SHORT[start.month - 1]}"
+    if kind == "month":
+        months_ahead = (start.year - today.year) * 12 + start.month - today.month
+        if months_ahead in (0, 1):
+            return ("в этом месяце", "в следующем месяце")[months_ahead]
+        name = f"в {_MONTHS_IN[start.month - 1]}"
+        return name if start.year == today.year else f"{name} {start.year}"
+    if kind == "season" and start.month in _SEASON_WORDS:
+        plain, current = _SEASON_WORDS[start.month]
+        if start <= today <= end:
+            return current
+        return plain if start.year == today.year else f"{plain} {start.year}"
+    return "на днях" if kind == "soon" else ""
+
+
+def _span_end(end: date, today: date) -> str:
+    """End of a span for "(до вс 11 окт)": the plain date, with the year when it is another one."""
+    return fmt_date(end, today=today, relative=False)
+
+
+def _period_head(item: Item, occ: Occurrence, today: date) -> str | None:
+    """ "🗓 на этой неделе (до вс 11 окт)" / "🗓 на днях" for an occurrence of a fuzzy span, else None."""
+    if occ.precision == "soon":
+        return "🗓 на днях"
+    start, end = item.period_start, item.period_end
+    if occ.precision != "period" or item.period_kind not in CALENDAR_PERIODS or start is None or end is None:
+        return None
+    return f"🗓 {period_label(item.period_kind, start, end, today)} (до {_span_end(end, today)})"
+
+
+def _is_deadline(item: Item, occ: Occurrence) -> bool:
+    return occ.precision in _DEADLINE_PRECISIONS and (item.when_spec or {}).get("role") == "deadline"
+
+
+def _deadline_day(occ: Occurrence, tz: ZoneInfo, today: date) -> str:
+    """ "пт 9 окт" (a date deadline) or "пт 9 окт 15:00" (one with a time)."""
+    local = _local(occ.due_at, tz)
+    day = fmt_date(local.date(), today=today, relative=False)
+    return day if occ.precision in ("date", "fallback") else f"{day} {fmt_time(local.time())}"
+
+
+def _fuzzy_time_line(
+    item: Item, occ: Occurrence, reminders: Sequence[Reminder], prefs: Prefs, now: datetime
+) -> str | None:
+    """Time line of a period / "на днях" / deadline occurrence, None for other ones."""
+    tz = prefs.zone
+    today = _local(now, tz).date()
+    head = _period_head(item, occ, today)
+    if head is None and _is_deadline(item, occ):
+        head = f"⏳ до {_deadline_day(occ, tz, today)}"
+    if head is None:
+        return None
+    if _occ_done(item, occ) or occ.status in ("missed", "cancelled"):
+        return head
+    pending = _pending(reminders)
+    if pending:
+        return f"{head} · {_fires_phrase(pending, tz, now)}"
+    running = item.period_end is not None and item.period_end >= today and occ.precision == "period"
+    return f"{head} · {'без напоминания' if running or occ.due_at > now else 'просрочено'}"
+
+
 def _time_line(
     item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime
 ) -> str | None:
+    if item.someday:
+        return SOMEDAY_LINE
     if occ is None or occ.due_at is None:
         return None
+    fuzzy = _fuzzy_time_line(item, occ, reminders, prefs, now)
+    if fuzzy is not None:
+        return fuzzy
     tz = prefs.zone
     done = _occ_done(item, occ)
     if occ.precision == "default":
@@ -378,6 +496,8 @@ def item_card(
     """Card for a saved item: title, time and reminders, recurrence, category/tags, source, details, warnings."""
     if item.status == "deleted":
         return deleted_card(item)
+    if item.someday:  # no date on purpose: an old (cancelled or done) occurrence says nothing about it any more
+        occ = None
     done = _occ_done(item, occ)
     lines = [f"{_kind_emoji(item.kind)} <b>{q(item.title)}</b>"]
     lines += filter(None, [_time_line(item, occ, reminders, prefs, now), _recurrence_line(item)])
@@ -465,15 +585,35 @@ def reminder_message(item: Item, occ: Occurrence, reminder: Reminder | None, pre
 
     ``reminder`` is accepted for the contract; the text depends only on the occurrence and ``now``.
     """
-    lines = [f"🔔 <b>{q(item.title)}</b>", f"{_relative(occ.due_at, now)} · {fmt_dt(occ.due_at, prefs.zone, now=now)}"]
+    lines = [f"🔔 <b>{q(item.title)}</b>", _reminder_when(item, occ, prefs, now)]
     lines += filter(None, [_recurrence_line(item), _details_line(item)])
     return fit("\n".join(lines)), reminder_keyboard(occ.id)
+
+
+def _reminder_when(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> str:
+    """Second line of a reminder: "через 5 мин · сегодня 13:00"; for a span "🗓 на этой неделе (до вс 11 окт)";
+    for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00 · через 5 мин"."""
+    tz = prefs.zone
+    today = _local(now, tz).date()
+    head = _period_head(item, occ, today)
+    if head is not None and occ.precision == "period":
+        return head
+    if _is_deadline(item, occ):
+        local = _local(occ.due_at, tz)
+        day = fmt_date(local.date(), today=today)
+        if occ.precision in ("date", "fallback"):
+            return f"⏳ срок: {day}"
+        return f"⏳ срок: {day} в {fmt_time(local.time())} · {_relative(occ.due_at, now)}"
+    return f"{_relative(occ.due_at, now)} · {fmt_dt(occ.due_at, tz, now=now)}"
 
 
 def reminder_done(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> MenuView:
     """Reminder edited after "Готово": "✅ <s>Купить наушники</s>" [↩️ Не сделано]."""
     lines = [f"✅ <s>{q(item.title)}</s>"]
-    if occ.due_at is not None:
+    head = _period_head(item, occ, _local(now, prefs.zone).date()) if occ.due_at is not None else None
+    if head is not None and occ.precision == "period":
+        lines.append(f"<i>{head.removeprefix('🗓 ')} · сделано</i>")
+    elif occ.due_at is not None:
         lines.append(f"<i>{fmt_dt(occ.due_at, prefs.zone, now=now)} · сделано</i>")
     rec = _recurrence_line(item)
     if rec:
@@ -507,7 +647,12 @@ def _row_title(row: Row) -> str:
 
 
 def _row_when(row: Row, prefs: Prefs, now: datetime, day: date | None = None) -> str | None:
-    """Due time of a row: "13:00" when it is due on ``day``, otherwise "сегодня 13:00" / "пт 9 окт 15:00"."""
+    """Due time of a row: "13:00" when it is due on ``day``, otherwise "сегодня 13:00" / "пт 9 окт 15:00"; a fuzzy
+    span as words ("на этой неделе"), "когда-нибудь"."""
+    if row.someday:
+        return "когда-нибудь"
+    if row.period_kind in CALENDAR_PERIODS and row.period_start is not None and row.period_end is not None:
+        return period_label(row.period_kind, row.period_start, row.period_end, _local(now, prefs.zone).date())
     if row.due_at is None:
         return None
     if day is not None and _local(row.due_at, prefs.zone).date() == day:
@@ -545,8 +690,28 @@ def ask_message(ask: Ask, raw_id: int) -> MenuView:
     return f"🤔 {q(ask.q, QUESTION_MAX)}", markup(*buttons)
 
 
+def period_sections(rows: Sequence[Row], prefs: Prefs, now: datetime) -> list[str]:
+    """Items of the running spans, one section per span: "🗓 <b>На этой неделе</b> (до вс 11 окт)" then
+    "• 📌 Посмотреть Raspberry Pi" lines; sections are separated by an empty line."""
+    today = _local(now, prefs.zone).date()
+    groups: dict[tuple[str, date], list[Row]] = {}
+    for row in rows:
+        if row.period_kind is None or row.period_start is None or row.period_end is None:
+            continue
+        label = period_label(row.period_kind, row.period_start, row.period_end, today)
+        groups.setdefault((label, row.period_end), []).append(row)
+    lines: list[str] = []
+    for (label, end), group in groups.items():
+        if lines:
+            lines.append("")
+        lines.append(f"🗓 <b>{label[:1].upper()}{label[1:]}</b> (до {_span_end(end, today)})")
+        lines += [f"• {_row_title(r)}" for r in group]
+    return lines
+
+
 def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> View:
-    """Morning plan "☀️ Доброе утро! План на сегодня, пт 9 окт": numbered open items, overdue, recurring count."""
+    """Morning plan "☀️ Доброе утро! План на сегодня, пт 9 окт": numbered open items, overdue, the running
+    spans ("🗓 На этой неделе"), recurring count."""
     agenda = data.agenda
     head = [f"☀️ <b>Доброе утро!</b> План на сегодня, {fmt_date(agenda.day)}", ""]
     if agenda.open:
@@ -562,6 +727,9 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> View:
         used = tg_len("\n".join(body))
         overdue = [f"• {_row_when(r, prefs, now) or '—'} · {_row_title(r)}" for r in agenda.overdue]
         body += ["", "⚠️ <b>Просрочено</b>", *fit_lines(overdue, budget - used - 30)]
+    if agenda.period_items:
+        used = tg_len("\n".join(body))
+        body += ["", *fit_lines(period_sections(agenda.period_items, prefs, now), max(budget - used - 30, 60))]
     if data.recurring_today:
         body += ["", f"🔁 Повторяющихся сегодня: {data.recurring_today}"]
     return fit("\n".join(head + body)), None
@@ -654,6 +822,10 @@ def help_text() -> str:
             "",
             "<b>Напоминания</b>",
             "• о событиях со временем — заранее (по умолчанию за 5 мин), задачи без времени — вечером (19:00)",
+            "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00 (и утром первого дня,"
+            " если срок ещё не начался); такие дела каждое утро в плане, пока срок идёт",
+            "• «до пятницы» — накануне в 19:00 и в сам день в 10:00, «на днях» — через 2 дня в 19:00",
+            "• «когда-нибудь» — без напоминаний, такие записи в /someday",
             "• в напоминании: ✅ Готово, ⏰ отложить на 15 мин / 1 час, 📅 на завтра",
             "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",
             "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
@@ -663,6 +835,7 @@ def help_text() -> str:
             "<b>Команды</b>",
             "/today — план на сегодня",
             "/tasks — открытые задачи",
+            "/someday — когда-нибудь (без срока)",
             "/recent — последние записи",
             "/search <i>текст</i> — поиск",
             "/ask <i>вопрос</i> — вопрос по сохранённому",

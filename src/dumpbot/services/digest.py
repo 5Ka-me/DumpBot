@@ -19,7 +19,7 @@ DigestKind = Literal["morning", "evening"]
 async def build_digest(session: AsyncSession, kind: str, prefs: Prefs, now: datetime) -> DigestData | None:
     """Agenda of the local day of ``now``; None when there is nothing to say.
 
-    morning: today's open occurrences + overdue (skipped if both are empty);
+    morning: today's open occurrences + overdue + the running periods' items (skipped if all are empty);
     evening: done / not done today + overdue (skipped if all are empty).
     ``recurring_today`` counts today's occurrences (open or done) of active series.
     """
@@ -27,7 +27,7 @@ async def build_digest(session: AsyncSession, kind: str, prefs: Prefs, now: date
         raise ValueError(f"unknown digest kind: {kind}")
     agenda = await query.agenda(session, prefs, now)
     if kind == "morning":
-        empty = not agenda.open and not agenda.overdue
+        empty = not agenda.open and not agenda.overdue and not agenda.period_items
     else:
         empty = not agenda.open and not agenda.done and not agenda.overdue
     if empty:

@@ -25,9 +25,8 @@ DUE = L(2026, 10, 9, 15, 0)
 
 
 @pytest.mark.parametrize("precision", ["exact", "slot"])
-@pytest.mark.parametrize("role", ["event", "deadline"])
-def test_default_lead_for_exact_and_slot(precision: str, role: str, now: datetime, prefs: Prefs):
-    assert fires(plan_reminders(DUE, precision, role, None, prefs, now)) == [(L(2026, 10, 9, 14, 55), 5, False)]
+def test_default_lead_for_exact_and_slot(precision: str, now: datetime, prefs: Prefs):
+    assert fires(plan_reminders(DUE, precision, "event", None, prefs, now)) == [(L(2026, 10, 9, 14, 55), 5, False)]
 
 
 def test_default_lead_from_prefs(now: datetime):
@@ -89,9 +88,14 @@ def test_lead_applies_matches_the_plan(precision: str, minutes: int, applies: bo
 
 
 @pytest.mark.parametrize("precision", ["date", "default", "fallback"])
-@pytest.mark.parametrize("role", ["event", "remind", "deadline"])
+@pytest.mark.parametrize("role", ["event", "remind"])
 def test_automatic_precisions_fire_at_due_auto(precision: str, role: str, now: datetime, prefs: Prefs):
     assert fires(plan_reminders(DUE, precision, role, None, prefs, now)) == [(DUE, 0, True)]
+
+
+def test_default_deadline_has_no_evening_before(now: datetime, prefs: Prefs):
+    # A deadline without any date (a task "до …" the model could not place) keeps the single default reminder.
+    assert fires(plan_reminders(DUE, "default", "deadline", None, prefs, now)) == [(DUE, 0, True)]
 
 
 @pytest.mark.parametrize("precision", ["date", "fallback"])

@@ -41,6 +41,7 @@ class Prefs(BaseModel):
     task_default_time: time = time(19, 0)  # actionable item without any time
 
     lead_minutes: int = Field(5, ge=0, le=10080)  # default "remind N minutes before the event"
+    soon_days: int = Field(2, ge=1, le=14)  # "на днях" = in this many days (at task_default_time)
 
     quiet_enabled: bool = True
     quiet_start: time = time(23, 0)

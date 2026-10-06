@@ -5,6 +5,7 @@ import re
 from datetime import UTC, datetime
 
 import pytest
+from pydantic import ValidationError
 
 from dumpbot.ai.prompts import (
     EXAMPLES,
@@ -14,7 +15,7 @@ from dumpbot.ai.prompts import (
     build_answer_text,
     build_user_text,
 )
-from dumpbot.ai.schemas import MAX_ITEMS, Extraction, extraction_json_schema
+from dumpbot.ai.schemas import MAX_ITEMS, Extraction, When, extraction_json_schema
 from dumpbot.domain.kinds import KINDS
 from dumpbot.domain.prefs import SLOT_NAMES, Prefs
 
@@ -26,7 +27,7 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v1"
+    assert PROMPT_VERSION == "v2"
 
 
 def test_static_prompt_explains_every_kind():
@@ -65,10 +66,11 @@ def test_static_prompt_describes_the_when_grammar_and_rules():
 
 
 def test_static_prompt_size_budget():
-    # ~1500 tokens: English ~4 chars/token, Cyrillic ~3 chars/token.
+    # ~1900 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
+    # (~350 tokens); the static prompt is a cacheable prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
-    assert estimate < 1650
+    assert estimate < 2000
 
 
 def test_examples_are_valid_extractions_and_rendered():
@@ -207,3 +209,77 @@ def test_build_answer_text():
         "QUESTION что у меня завтра?\n"
         'ROWS [{"title":"Созвон","due":"2026-10-07 10:00"}]'
     )
+
+
+# --- v2: fuzzy time (docs/features/iteration-2.md §A) --------------------------------------------------------------
+
+
+def test_static_prompt_describes_the_period_grammar():
+    period_line = _line("- period")
+    for token in (
+        "this_week",
+        "next_week",
+        "this_month",
+        "next_month",
+        "YYYY-MM",
+        "spring",
+        "summer",
+        "autumn",
+        "winter",
+        "soon",
+        "someday",
+    ):
+        assert re.search(rf"\b{token}\b", period_line), token
+    for phrase in ("на этой неделе", "на следующей неделе", "в октябре", "летом", "зимой", "на днях", "когда-нибудь"):
+        assert phrase in period_line, phrase
+    role_line = _line("- role:")
+    assert "до пятницы" in role_line and "до конца" in role_line and "period this_week/this_month" in role_line
+
+
+def test_examples_cover_fuzzy_time():
+    by_input = dict(EXAMPLES)
+    expected = {
+        "на этой неделе посмотреть Raspberry Pi": {"text": "на этой неделе", "period": "this_week"},
+        "в октябре поменять шины": {"text": "в октябре", "period": "2026-10"},
+        "до пятницы сдать отчёт": {"text": "до пятницы", "day": "FR", "role": "deadline"},
+        "на днях позвонить Пете": {"text": "на днях", "period": "soon"},
+        "когда-нибудь выучить испанский": {"text": "когда-нибудь", "period": "someday"},
+    }
+    for src, when in expected.items():
+        [item] = by_input[src]["items"]
+        assert item["when"] == when, src
+    edits = [out["edit"] for src, out in EXAMPLES if src.startswith("REPLYING TO ITEM") and "edit" in out]
+    assert {"text": "на следующей неделе", "period": "next_week"} in [e.get("when") for e in edits]
+
+
+@pytest.mark.parametrize(
+    "period",
+    [
+        "this_week",
+        "next_week",
+        "this_month",
+        "next_month",
+        "2026-10",
+        "2027-03",
+        "spring",
+        "summer",
+        "autumn",
+        "winter",
+        "soon",
+        "someday",
+    ],
+)
+def test_when_accepts_every_period(period: str):
+    assert When(text="x", period=period).period == period
+
+
+@pytest.mark.parametrize("period", ["week", "2026-1", "2026-10-01", "next_year", "This_week", "someday "])
+def test_when_rejects_unknown_periods(period: str):
+    with pytest.raises(ValidationError):
+        When(text="x", period=period)
+
+
+def test_json_schema_offers_the_period_to_the_model():
+    when = extraction_json_schema()["$defs"]["When"]["properties"]["period"]
+    patterns = [opt.get("pattern") for opt in when.get("anyOf", [when])]
+    assert any(p and "this_week" in p and "someday" in p for p in patterns)

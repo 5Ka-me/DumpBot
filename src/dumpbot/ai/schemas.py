@@ -31,6 +31,8 @@ DAY_RE = (
     r"|weekend)$"
 )
 AT_RE = r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$"
+# Fuzzy spans: calendar week / month (YYYY-MM: the code picks the year) / season, "на днях", "когда-нибудь".
+PERIOD_RE = r"^(this_week|next_week|this_month|next_month|\d{4}-\d{2}|spring|summer|autumn|winter|soon|someday)$"
 RRULE_RE = r"^FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;[A-Z]+=[-+,0-9A-Z]+)*$"
 RANGE_RE = (
     r"^(today|tomorrow|yesterday|this_week|next_week|last_week|this_month|last_month"
@@ -77,13 +79,15 @@ def _norm_tags(v: Any) -> list[str]:
 
 
 class When(_S):
-    """How the message describes the time. At most one of ``at`` / ``in_min`` / (``day`` and/or ``time``)."""
+    """How the message describes the time. At most one of ``at`` / ``in_min`` / ``period`` / (``day`` and/or
+    ``time``); when the model sends more, the first in that order wins."""
 
     text: str = Field("", max_length=80, description="verbatim time phrase from the message")
     day: str | None = Field(None, pattern=DAY_RE)
     time: str | None = Field(None, pattern=TIME_RE)
     in_min: int | None = Field(None, ge=1, le=525600, description="'через N минут/часов' as minutes")
     at: str | None = Field(None, pattern=AT_RE, description="local wall time, only if inexpressible")
+    period: str | None = Field(None, pattern=PERIOD_RE, description="fuzzy span instead of a day")
     role: Literal["event", "remind", "deadline"] = "event"
 
 

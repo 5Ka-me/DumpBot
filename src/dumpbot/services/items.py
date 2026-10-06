@@ -10,6 +10,10 @@ Conventions kept by this module:
 - ``Item.lead_minutes == []`` means "reminders switched off" (🔕): set by ``remove_reminders``, so the next
   occurrences of a series stay silent too; an explicit new time or lead switches reminders back on;
 - precision and role of a recurring series come from ``Item.when_spec`` (moving one instance does not change it);
+- fuzzy time (docs/features/iteration-2.md §A): ``Item.period_kind/period_start/period_end`` keep the span of
+  "на этой неделе" & co. and its occurrence has precision ``period`` (reminders (1)/(2) are planned from the span);
+  ``Item.someday`` items have no open occurrence. A new explicit date, a move to tomorrow or a recurrence turns
+  such an item into a plain dated one;
 - ``updated_at`` is always set explicitly (server-side ``onupdate`` would expire it, and async sessions cannot
   lazy-load).
 """
@@ -184,6 +188,10 @@ async def _create_all(
             status="open",
             when_spec=_when_dump(extracted.when),
             lead_minutes=extracted.lead,
+            period_kind=res.period_kind,
+            period_start=res.period_start,
+            period_end=res.period_end,
+            someday=res.precision == "someday",
             needs_confirm=res.needs_confirm,
             confidence=extracted.conf,
             ai_model=model,
@@ -230,10 +238,11 @@ async def get_item(session: AsyncSession, item_id: int) -> Item | None:
 
 
 async def item_snapshot(session: AsyncSession, item_id: int, prefs: Prefs, now: datetime) -> dict[str, Any]:
-    """Item as the edit prompt sees it: {id, kind, title, details, tags, due_local, rrule, lead, status}."""
+    """Item as the edit prompt sees it: {id, kind, title, details, tags, due_local, rrule, lead, status}, plus
+    ``period`` ("YYYY-MM-DD..YYYY-MM-DD") or ``someday: true`` for an item with a fuzzy time."""
     item = await _get_item(session, item_id)
     occ = await current_occurrence(session, item_id)
-    return {
+    snap: dict[str, Any] = {
         "id": item.id,
         "kind": item.kind,
         "title": item.title,
@@ -244,6 +253,12 @@ async def item_snapshot(session: AsyncSession, item_id: int, prefs: Prefs, now: 
         "lead": item.lead_minutes,
         "status": item.status,
     }
+    if item.someday:  # an old (cancelled) occurrence is not its time any more
+        snap["someday"] = True
+        snap["due_local"] = None
+    elif item.period_start is not None and item.period_end is not None:
+        snap["period"] = f"{item.period_start.isoformat()}..{item.period_end.isoformat()}"
+    return snap
 
 
 def current_occurrence_order() -> tuple[ColumnElement[Any], ...]:
@@ -549,15 +564,25 @@ async def _reschedule(
     now: datetime,
     warnings: list[str],
 ) -> bool:
-    """Move the current open occurrence (or create one) to ``when``. False if ``when`` gives no time."""
+    """Move the current open occurrence (or create one) to ``when``. False if ``when`` gives no time.
+
+    "Когда-нибудь" drops the dates instead (``_make_someday``); a fuzzy span ("на следующей неделе") is kept on
+    the item, any other time clears it. An instance of a series moved to a span becomes a plain date.
+    """
     first = await _first_open(session, item.id)
     when = _keep_future_date(when, first, prefs, now)
     due, precision, when_warnings, confirm = timeresolve.resolve_when(when, now, prefs)
     warnings.extend(when_warnings)
+    if precision == "someday":
+        await _make_someday(session, item, when, confirm)
+        return True
     if due is None:
         return False
     if not (item.rec_active and item.rrule):  # a series keeps its own spec; only this instance moves
         item.when_spec = _when_dump(when)
+        _set_period(item, *timeresolve.when_period(when, now, prefs))
+    elif precision in ("period", "soon"):
+        precision = "date"
     if lead:
         item.lead_minutes = _clean_lead(lead)
     elif item.lead_minutes == []:  # a new explicit time switches reminders back on
@@ -575,7 +600,7 @@ def _keep_future_date(when: When, occ: Occurrence | None, prefs: Prefs, now: dat
     The prompt asks the model to repeat the date (``day: YYYY-MM-DD``); this guards against a model that does not:
     without it the item for Friday would jump to today. Today's / past occurrences keep the usual rule.
     """
-    if occ is None or not when.time or when.day or when.at or when.in_min:
+    if occ is None or not when.time or when.day or when.at or when.in_min or when.period:
         return when
     tz = prefs.zone
     occ_day = occ.due_at.astimezone(tz).date()
@@ -615,6 +640,7 @@ async def _set_rrule(
     if time_spec:
         spec["time"] = time_spec
     item.when_spec = spec
+    _set_period(item, None, None, None)
     item.rrule = rule
     item.rec_time_local = dtstart.time()
     item.rec_dtstart_local = dtstart
@@ -668,11 +694,35 @@ def _series_start(
 
 
 async def _schedule_default(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> None:
-    """An item that just became actionable and has no open occurrence gets the default-time reminder."""
-    if item.status != "open" or await _has_open(session, item.id):
+    """An item that just became actionable and has no open occurrence gets the default-time reminder (not a
+    "когда-нибудь" one: it has no date on purpose)."""
+    if item.status != "open" or item.someday or await _has_open(session, item.id):
         return
     occ = await _move(session, item, None, _default_due(now, prefs), "default")
     await _replan(session, item, occ, prefs, now)
+
+
+async def _make_someday(session: AsyncSession, item: Item, when: When, confirm: bool) -> None:
+    """ "Перенеси на когда-нибудь": no date any more — open occurrences are cancelled with their pending reminders,
+    a series stops, a finished item is open again."""
+    item.when_spec = _when_dump(when)
+    _set_period(item, "someday", None, None)
+    item.rec_active = False
+    item.needs_confirm = confirm
+    stmt = select(Occurrence).where(Occurrence.item_id == item.id, Occurrence.status == "open")
+    occs = list((await session.scalars(stmt)).all())
+    for occ in occs:
+        occ.status = "cancelled"
+    await _cancel_pending(session, [o.id for o in occs])
+    _reopen(item)
+
+
+def _set_period(item: Item, kind: str | None, start: date | None, end: date | None) -> None:
+    """Fuzzy time of the item (``timeresolve.when_period``); all None makes it a plain dated one."""
+    item.period_kind = kind
+    item.period_start = start
+    item.period_end = end
+    item.someday = kind == "someday"
 
 
 async def _drop_default(session: AsyncSession, item: Item) -> None:
@@ -816,7 +866,11 @@ async def move_to_tomorrow(
         due = timeresolve.localize(new_day, local.time(), tz).astimezone(UTC)
         if due <= now:
             due = timeresolve.localize(new_day + timedelta(days=1), local.time(), tz).astimezone(UTC)
-        target = await _move(session, item, occ, due, occ.precision)
+        precision = occ.precision
+        if precision in ("period", "soon"):  # "на этой неделе" moved to a day is that day now
+            precision = "date"
+            _set_period(item, None, None, None)
+        target = await _move(session, item, occ, due, precision)
         _reopen(item)
         await _replan(session, item, target, prefs, now)
         _touch(item)
@@ -919,8 +973,16 @@ async def _plan(
         item.lead_minutes or None,
         prefs,
         now,
+        period=_period_span(item, occ),
     )
     return await _add_reminders(session, occ.id, plans)
+
+
+def _period_span(item: Item, occ: Occurrence) -> tuple[date, date] | None:
+    """The span reminder (1) of a ``period`` occurrence is planned from."""
+    if occ.precision != "period" or item.period_start is None or item.period_end is None:
+        return None
+    return item.period_start, item.period_end
 
 
 async def _add_reminders(session: AsyncSession, occurrence_id: int, plans: Iterable[ReminderPlan]) -> list[Reminder]:
