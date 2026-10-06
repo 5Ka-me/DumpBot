@@ -3,7 +3,8 @@
 Test files cannot import each other (``--import-mode=importlib``), so fakes and helpers live here as fixtures.
 DB tests use Postgres from ``tests/conftest.py`` (``TEST_DATABASE_URL``). Nothing talks to the network:
 ``extract`` / ``answer_query`` / ``fetch_titles`` in ``dumpbot.services.processor`` are replaced by ``FakeAI``
-(autouse), the bot is ``FakeBot`` and speech-to-text is ``FakeSTT``.
+(autouse), the bot is ``FakeBot`` and speech-to-text is the real ``RoutedSTT`` over ``FakeSTT`` backends: ``stt`` stands
+for chutes; ``local_stt`` for the local Whisper, wired in by ``with_local_stt()``.
 
 Reference time: Tue 2026-10-06 10:00 Europe/Warsaw (CEST, UTC+2), frozen via ``dumpbot.clock.utcnow``.
 """
@@ -28,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from dumpbot import clock
 from dumpbot.ai.extract import ExtractInput, ExtractOutput
 from dumpbot.ai.schemas import ExtractedItem, Extraction
+from dumpbot.ai.stt import RoutedSTT
 from dumpbot.config import Settings
 from dumpbot.context import AppContext
 from dumpbot.db.models import BotMessage, Item, Job, Occurrence, RawMessage, Reminder
@@ -150,13 +152,14 @@ class FakeBot:
 
 
 class FakeSTT:
-    def __init__(self) -> None:
+    def __init__(self, default: str = "голосовой транскрипт") -> None:
         self.calls: list[dict[str, Any]] = []
         self.results: list[str | BaseException] = []
+        self.default = default
 
     async def transcribe(self, audio: bytes, *, mime_type: str | None = None, language: str | None = None) -> str:
         self.calls.append({"audio": audio, "mime_type": mime_type, "language": language})
-        result = self.results.pop(0) if self.results else "голосовой транскрипт"
+        result = self.results.pop(0) if self.results else self.default
         if isinstance(result, BaseException):
             raise result
         return result
@@ -207,7 +210,24 @@ def bot() -> FakeBot:
 
 @pytest.fixture
 def stt() -> FakeSTT:
+    """The chutes Whisper (paid)."""
     return FakeSTT()
+
+
+@pytest.fixture
+def local_stt() -> FakeSTT:
+    """The local Whisper (free); only used after ``with_local_stt()``."""
+    return FakeSTT("локальный транскрипт")
+
+
+@pytest.fixture
+def with_local_stt(ctx: AppContext, stt: FakeSTT, local_stt: FakeSTT) -> Callable[[], None]:
+    """Configure the local Whisper (as LOCAL_STT_URL does in production)."""
+
+    def _wire() -> None:
+        ctx.stt = RoutedSTT(stt, local_stt)  # type: ignore[arg-type]
+
+    return _wire
 
 
 @pytest.fixture(autouse=True)
@@ -245,7 +265,8 @@ def settings(tmp_path: Path) -> Settings:
 def ctx(
     sessionmaker: async_sessionmaker[AsyncSession], settings: Settings, bot: FakeBot, stt: FakeSTT, frozen: FrozenClock
 ) -> AppContext:
-    return AppContext(settings=settings, sessionmaker=sessionmaker, bot=bot, ai=None, stt=stt)  # type: ignore[arg-type]
+    routed = RoutedSTT(stt)  # type: ignore[arg-type]  # no LOCAL_STT_URL: every mode is "chutes"
+    return AppContext(settings=settings, sessionmaker=sessionmaker, bot=bot, ai=None, stt=routed)  # type: ignore[arg-type]
 
 
 # --- DB helpers --------------------------------------------------------------------------------------------------

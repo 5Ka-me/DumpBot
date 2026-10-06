@@ -40,6 +40,10 @@ class Settings(BaseSettings):
     stt_convert_wav: bool = False  # convert OGG/Opus -> 16 kHz mono WAV with ffmpeg before sending
     stt_usd_per_second: float = 0.0005  # billed per started second of GPU time (estimate)
 
+    # Local Whisper service (whisper/, compose profile "whisper"), free; "" = off. Prefs.stt_mode picks the order.
+    local_stt_url: str = ""  # e.g. http://whisper:9000
+    local_stt_timeout_s: float = 120.0  # CPU transcription; the first request also loads (or downloads) the model
+
     # Seeds for the per-user preferences row
     default_tz: str = "Europe/Warsaw"
     default_budget_usd: float = 5.0

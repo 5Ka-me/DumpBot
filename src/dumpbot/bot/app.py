@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from dumpbot import logging_setup
 from dumpbot.ai.client import ChutesClient
-from dumpbot.ai.stt import ChutesWhisperSTT
+from dumpbot.ai.stt import ChutesWhisperSTT, LocalWhisperSTT, RoutedSTT
 from dumpbot.bot.middlewares import InFlight, OwnerOnly
 from dumpbot.bot.routers import make_routers
 from dumpbot.bot.routers.commands import bot_commands
@@ -196,7 +196,7 @@ class _Resources:
 
     bot: Bot
     ai: ChutesClient
-    stt: ChutesWhisperSTT
+    stt: RoutedSTT
     http: aiohttp.ClientSession
     engine: AsyncEngine
     closed: bool = field(default=False)
@@ -234,7 +234,8 @@ async def build_app(
     sessionmaker = make_sessionmaker(engine)
     http = aiohttp.ClientSession()
     ai = ChutesClient(settings, sessionmaker, http)
-    stt = ChutesWhisperSTT(settings, sessionmaker, http)
+    local = LocalWhisperSTT(settings, sessionmaker, http) if settings.local_stt_url.strip() else None
+    stt = RoutedSTT(ChutesWhisperSTT(settings, sessionmaker, http), local)
     bot = build_bot(settings, session=bot_session)
     ctx = AppContext(settings=settings, sessionmaker=sessionmaker, bot=bot, ai=ai, stt=stt)
     resources = _Resources(bot=bot, ai=ai, stt=stt, http=http, engine=engine)

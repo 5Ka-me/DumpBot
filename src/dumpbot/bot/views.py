@@ -32,6 +32,7 @@ key                v                                          action
 ``quiet_toggle``   ``""``                                     flip ``Prefs.quiet_enabled``
 ``digest_toggle``  ``morning`` | ``evening``                  flip ``Prefs.digest_<v>_enabled``
 ``stt``            ``auto`` | ``ru`` | ``en``                 set ``Prefs.stt_language`` (``auto`` -> None)
+``stt_mode``       ``auto`` | ``local`` | ``chutes``          set ``Prefs.stt_mode`` (speech-to-text order)
 ``budget``         dollars: ``1`` ``3`` ``5`` ``10``          set ``Prefs.budget_usd``
 ``ask``            a ``Prefs`` field name from ``ASK_FIELDS``  ask the user to type a value for that field: show
                                                               ``settings_ask(v, prefs)``, wait for text (FSM),
@@ -805,7 +806,8 @@ def help_text() -> str:
             "📥 <b>Dump Bot</b> — личная «свалка»: присылай что угодно, я разберу, сохраню и напомню.",
             "",
             "<b>Что присылать</b>",
-            "• текст, голосовые, фото и скриншоты (можно файлом), ссылки, пересланные посты",
+            "• текст, голосовые и аудиофайлы (до 5 мин), фото и скриншоты (можно файлом), ссылки, пересланные посты",
+            "• кружочки сохраняю без распознавания (с подписью — разберу подпись)",
             "• в одном сообщении может быть несколько дел — разберу на отдельные записи",
             "• «завтра в 15 созвон», «купить молоко», «каждый понедельник в 9 планёрка, напомни за 10 минут»",
             "• заметки, идеи, мемы и ссылки отмечаю реакцией 👌, задачи и события — карточкой с кнопками",
@@ -840,7 +842,7 @@ def help_text() -> str:
             "/search <i>текст</i> — поиск",
             "/ask <i>вопрос</i> — вопрос по сохранённому",
             "/recurring — повторяющиеся задачи",
-            "/settings — часовой пояс, время, тихие часы, дайджесты, бюджет",
+            "/settings — часовой пояс, время, тихие часы, дайджесты, бюджет, голос",
             "/usage — расходы на ИИ за месяц",
             "/cancel — отменить ввод",
             "/help — эта справка",
@@ -854,6 +856,13 @@ TZ_CHOICES: Final[tuple[str, ...]] = ("Europe/Warsaw", "Europe/Berlin", "Europe/
 SETTINGS_LEAD_CHOICES: Final[tuple[int, ...]] = (0, 5, 10, 15, 30)
 BUDGET_CHOICES: Final[tuple[int, ...]] = (1, 3, 5, 10)
 STT_CHOICES: Final[tuple[tuple[str, str], ...]] = (("auto", "Авто"), ("ru", "Русский"), ("en", "English"))
+# Prefs.stt_mode -> (short label, button text).
+STT_MODE_CHOICES: Final[dict[str, tuple[str, str]]] = {
+    "auto": ("авто", "🔀 Авто: chutes, при сбое — локальный"),
+    "local": ("локальный", "💻 Локальный, при сбое — chutes"),
+    "chutes": ("только chutes", "☁️ Только chutes"),
+}
+NOT_CONFIGURED: Final = " (не настроен)"
 SETTINGS_NOTE: Final = "<i>Изменения действуют для новых напоминаний — уже созданные не перепланируются.</i>"
 
 
@@ -884,6 +893,7 @@ SETTINGS_PARENT: Final[dict[str, str]] = {
     "quiet_toggle": "quiet",
     "digest_toggle": "digest",
     "stt": "stt",
+    "stt_mode": "stt",
     "budget": "budget",
 }
 
@@ -907,6 +917,10 @@ def _stt_label(lang: str | None) -> str:
     return dict(STT_CHOICES).get(lang or "auto", lang or "Авто")
 
 
+def _stt_mode_label(mode: str) -> str:
+    return STT_MODE_CHOICES.get(mode, STT_MODE_CHOICES["auto"])[0]
+
+
 def _back_row(menu: str = "main") -> list[InlineKeyboardButton]:
     return [button(BACK, SetCb(key="menu", v=menu))]
 
@@ -925,7 +939,7 @@ def _field_value(prefs: Prefs, field: str) -> str:
 
 
 def settings_menu(prefs: Prefs) -> MenuView:
-    """All current values + a button per group."""
+    """All current values + a button per group (the "🎙 Голос" submenu is ``settings_stt_menu``)."""
     slots = " · ".join(f"{SLOT_LABELS[s]} {fmt_time(prefs.slot(s))}" for s in SLOT_NAMES)
     lines = [
         "⚙️ <b>Настройки</b>",
@@ -939,7 +953,7 @@ def settings_menu(prefs: Prefs) -> MenuView:
         f"📰 Дайджесты: утро {fmt_time(prefs.digest_morning_time)} ({_on_off(prefs.digest_morning_enabled)}),"
         f" вечер {fmt_time(prefs.digest_evening_time)} ({_on_off(prefs.digest_evening_enabled)})",
         f"💰 Бюджет: {fmt_money(prefs.budget_usd)} в месяц",
-        f"🎙 Язык голосовых: {_stt_label(prefs.stt_language)}",
+        f"🎙 Голос: язык {_stt_label(prefs.stt_language)}, распознавание {_stt_mode_label(prefs.stt_mode)}",
         "",
         SETTINGS_NOTE,
     ]
@@ -953,7 +967,7 @@ def settings_menu(prefs: Prefs) -> MenuView:
             button("🕘 Время суток", SetCb(key="menu", v="slots")),
         ],
         [button("🌙 Тихие часы", SetCb(key="menu", v="quiet")), button("📰 Дайджесты", SetCb(key="menu", v="digest"))],
-        [button("💰 Бюджет", SetCb(key="menu", v="budget")), button("🎙 Голосовые", SetCb(key="menu", v="stt"))],
+        [button("💰 Бюджет", SetCb(key="menu", v="budget")), button("🎙 Голос", SetCb(key="menu", v="stt"))],
         [button("✖️ Закрыть", SetCb(key="close"))],
     )
     return "\n".join(lines), kb
@@ -1047,17 +1061,34 @@ def settings_digest_menu(prefs: Prefs) -> MenuView:
     return text, kb
 
 
-def settings_stt_menu(prefs: Prefs) -> MenuView:
-    current = prefs.stt_language or "auto"
-    text = "\n".join(
-        [
-            "🎙 <b>Язык голосовых</b>",
-            f"Сейчас: {_stt_label(prefs.stt_language)}",
-            "«Авто» — распознавание само определит язык; укажи язык, если часто ошибается.",
-        ]
-    )
-    buttons = [button(f"{_check(code == current)}{label}", SetCb(key="stt", v=code)) for code, label in STT_CHOICES]
-    return text, markup(buttons, _back_row())
+def settings_stt_menu(prefs: Prefs, *, local_stt: bool = False) -> MenuView:
+    """Voice: the language and the speech-to-text mode. ``local_stt``: the local Whisper is configured
+    (``LOCAL_STT_URL``); without it "local" is marked «(не настроен)» and every mode works as chutes."""
+    language = prefs.stt_language or "auto"
+    mode = prefs.stt_mode if prefs.stt_mode in STT_MODE_CHOICES else "auto"
+    lines = [
+        "🎙 <b>Голос</b>",
+        f"Язык: {_stt_label(prefs.stt_language)}",
+        f"Распознавание: {_stt_mode_label(mode)}",
+        "",
+        "Язык «Авто» — распознавание само определит язык; укажи язык, если часто ошибается.",
+        "Распознаю голосовые и аудиофайлы (пересланные тоже) до 5 минут; кружочки — нет.",
+        "Локальный Whisper бесплатный и работает на твоём компьютере; chutes.ai — платный (из бюджета).",
+    ]
+    if not local_stt:
+        lines.append(
+            "<i>Локальный Whisper не настроен (LOCAL_STT_URL пуст): все режимы работают как «только chutes».</i>"
+        )
+    languages = [button(f"{_check(code == language)}{label}", SetCb(key="stt", v=code)) for code, label in STT_CHOICES]
+    modes = [
+        [button(f"{_check(code == mode)}{label}{_stt_mode_note(code, local_stt)}", SetCb(key="stt_mode", v=code))]
+        for code, (_, label) in STT_MODE_CHOICES.items()
+    ]
+    return "\n".join(lines), markup(languages, *modes, _back_row())
+
+
+def _stt_mode_note(code: str, local_stt: bool) -> str:
+    return NOT_CONFIGURED if code == "local" and not local_stt else ""
 
 
 def settings_budget_menu(prefs: Prefs) -> MenuView:
@@ -1088,8 +1119,11 @@ SETTINGS_MENUS: Final[dict[str, Callable[[Prefs], MenuView]]] = {
 }
 
 
-def settings_view(name: str, prefs: Prefs) -> MenuView:
-    """Menu for ``SetCb(key="menu", v=name)``; unknown names fall back to the main menu."""
+def settings_view(name: str, prefs: Prefs, *, local_stt: bool = False) -> MenuView:
+    """Menu for ``SetCb(key="menu", v=name)``; unknown names fall back to the main menu. ``local_stt``: the local
+    Whisper is configured (the voice menu shows it)."""
+    if name == "stt":
+        return settings_stt_menu(prefs, local_stt=local_stt)
     return SETTINGS_MENUS.get(name, settings_menu)(prefs)
 
 

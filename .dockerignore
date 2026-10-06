@@ -25,6 +25,7 @@ build/
 .vscode/
 tests/
 docs/
+whisper/
 backups/
 *.backup
 *.dump
