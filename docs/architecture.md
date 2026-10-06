@@ -1,0 +1,623 @@
+# Dump Bot — архитектура и контракты модулей
+
+Документ — источник правды для реализации. Требования: [requirements.md](requirements.md).
+Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
+
+## 1. Общая схема
+
+```
+Telegram ──long polling──► aiogram Dispatcher
+                              │  OwnerOnly middleware (whitelist OWNER_ID)
+                              │  routers: commands → settings/edit FSM → callbacks → capture (catch-all)
+                              ▼
+          capture: save RawMessage (idempotent) → react 👀 → enqueue job → wake worker      (быстро, без ИИ)
+                              │
+           JobWorker (asyncio task) ◄── jobs table (FOR UPDATE SKIP LOCKED, backoff, RetryLater)
+              handle_message / handle_album / handle_edit / handle_clarify   (services/processor.py)
+                 голос → STT (chutes Whisper chute) ; фото → vision в том же вызове LLM ; ссылки → заголовки
+                 → ai.extract() (structured output) → services.items.create_items() / query / apply_patch
+                 → bot.views.* + bot.sender.send() → карточки, реакции 👌/✍/🤔
+                              │
+           Scheduler (asyncio task, тик ≤30 c или wake):
+                 напоминания (claim → send → sent, восстановление зависших), повторы (следующее occurrence),
+                 дайджесты (once_keys), heartbeat-файл
+                              │
+                         PostgreSQL 18
+```
+
+Один процесс Python: aiogram polling + 2 фоновые задачи (`JobWorker.run`, `Scheduler.run`), стартуют в
+`dp.startup`, отменяются в `dp.shutdown`. Падение фоновой задачи → лог + `os._exit(1)` → Docker перезапустит.
+
+Контейнеры: `db` (postgres:18), `migrate` (alembic upgrade head, one-shot), `bot`.
+
+## 2. Ключевые решения
+
+| Тема | Решение |
+|---|---|
+| ИИ | chutes.ai, OpenAI-совместимый `POST {base}/chat/completions` через **aiohttp** (без openai SDK). Основная модель `google/gemma-4-31B-turbo-TEE` (текст+картинки, structured outputs, $0.12/$0.37 за 1M). Запасные: `Qwen/Qwen3-32B-TEE` (текст), `Qwen/Qwen3.6-27B-TEE` (картинки). ID — в `.env`. |
+| Structured output | `response_format={"type":"json_schema","json_schema":{"name":..,"schema":..,"strict":true}}`; ответ **всегда** валидируется Pydantic; при ошибке — 1 повтор с текстом ошибки, затем запасная модель. Если API отверг json_schema (400) — повтор с `{"type":"json_object"}`. Thinking выключаем: `chat_template_kwargs={"enable_thinking": false}`; `<think>…</think>` вырезаем из ответа на всякий случай. |
+| Голос | Community-chute AudioDojo: `POST https://vonkaiser-audiodojo.chutes.ai/stt/whisper`, JSON `{"audio_b64", "language"?, "return_timestamps": false}` → `{"text"}`. URL в конфиге. Опционально ffmpeg → WAV (`STT_CONVERT_WAV`). Недоступен → retry-очередь. |
+| Картинки | Отправляются в vision-модель **в том же вызове**, что и разбор: модель возвращает `image.text` (OCR) + `image.description` + items. |
+| Время | LLM описывает время (`When`), Python вычисляет (`domain.timeresolve`). `now` = `message.date` (а не время обработки). Хранение в UTC, повторы — RRULE в локальном времени `rec_tz`. |
+| Очередь | Таблица `jobs`, без Redis. Ошибки ИИ → экспоненциальный backoff `min(2**attempts мин, 6 ч)`. |
+| Планировщик | Свой цикл с опросом БД, без APScheduler. At-least-once доставка, восстановление `sending` → `pending` через 2 мин. |
+| Поиск | Postgres FTS (`to_tsvector('russian', …)` — смешанные RU/EN), `websearch_to_tsquery('russian', q)` + фильтры. Без векторов. |
+| Формат сообщений | HTML parse mode; весь пользовательский/LLM-текст экранировать `html.escape(…, quote=False)`. Даты рендерим сами по-русски (`domain.fmt`). |
+| FSM | `MemoryStorage` (короткие диалоги правки/настроек; потеря при рестарте не критична). |
+| Логи | stdlib `logging`; **никогда** не логировать текст сообщений/транскрипты/OCR на уровне INFO, не логировать токены/URL файлов Telegram. |
+
+## 3. Структура проекта и владельцы
+
+```
+src/dumpbot/
+  __main__.py              main(): logging, Settings, engine, AI clients, Bot, Dispatcher, polling   [bot]
+  logging_setup.py                                                                                    [bot]
+  config.py  clock.py  context.py  dto.py                                                              [foundation ✔]
+  domain/
+    kinds.py  prefs.py                                                                                [foundation ✔]
+    timeresolve.py         When → UTC, план напоминаний, диапазоны запросов                          [domain]
+    recurrence.py          RRULE: нормализация, следующее повторение, описание по-русски             [domain]
+    quiet.py               тихие часы                                                                [domain]
+    fmt.py                 русское форматирование дат/длительностей                                  [domain]
+  ai/
+    schemas.py                                                                                        [foundation ✔]
+    client.py              ChutesClient (chat completions, цены, учёт расходов)                      [ai]
+    prompts.py             системные промпты                                                         [ai]
+    extract.py             extract(), answer_query()                                                 [ai]
+    stt.py                 SpeechToText / ChutesWhisperSTT                                           [ai]
+    linkinfo.py            заголовки страниц по ссылкам                                              [ai]
+  db/ base.py models.py engine.py                                                                     [foundation ✔]
+  services/
+    settings_repo.py                                                                                  [foundation ✔]
+    usage.py               запись ai_usage, траты за месяц, состояние бюджета                        [ai]
+    items.py               жизненный цикл записей/повторений/напоминаний                             [items]
+    query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
+    ingest.py              Message → RawMessage, постановка в очередь                                [workers]
+    processor.py           обработчики задач очереди                                                  [workers]
+    digest.py              данные для дайджестов                                                      [workers]
+  workers/
+    jobs.py                enqueue/claim/JobWorker/RetryLater                                         [workers]
+    scheduler.py           Scheduler                                                                  [workers]
+  bot/
+    app.py                 build_bot(), build_dispatcher(), on_startup/on_shutdown                    [bot]
+    middlewares.py  cbdata.py  keyboards.py  states.py  views.py  sender.py                           [bot]
+    routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
+migrations/  alembic (env.py async, initial migration)                                                [infra]
+Dockerfile  compose.yaml  .dockerignore  .env.example  README.md                                     [infra]
+tests/conftest.py (фикстуры БД)                                                                       [foundation ✔]
+tests/<area>/test_*.py                                                                                [владелец модуля]
+```
+
+Правило: агент меняет **только свои файлы**. Нужна правка чужого контракта — не меняй, опиши в отчёте.
+Публичные сигнатуры ниже — обязательный контракт; приватные хелперы — на усмотрение.
+
+## 4. Контракты
+
+**Общие dataclass-ы контрактов уже определены в `src/dumpbot/dto.py`** (foundation ✔): `ReminderPlan`, `Resolution`,
+`CreatedItem`, `PatchResult`, `Row`, `Agenda`, `UsageSummary`, `BudgetState`, `DigestData`. Модули импортируют их оттуда
+(и могут реэкспортировать: `from dumpbot.dto import Resolution` в `timeresolve.py` и т.п.), а не объявляют заново.
+Ниже их поля приведены для справки.
+
+Общие типы: `Prefs` (`domain/prefs.py`), `Kind`, `SourceKind`, `Precision`, `ACTIONABLE` (`domain/kinds.py`),
+`Extraction`, `ExtractedItem`, `When`, `QuerySpec`, `EditPatch`, `Ask`, `ImageInfo` (`ai/schemas.py`),
+ORM-модели (`db/models.py`), `AppContext` (`context.py`), `utcnow()` (`clock.py`).
+
+Все функции сервисов принимают `AsyncSession` и **не коммитят** (коммитит вызывающий), если не сказано иное.
+Все `datetime` в API — aware UTC, кроме явно помеченных `*_local` (naive локальное время).
+
+### 4.1 domain/timeresolve.py  [domain]
+
+```python
+@dataclass(frozen=True)
+class ReminderPlan:
+    fire_at: datetime          # aware UTC
+    lead_minutes: int          # 0 = ровно в момент
+    auto: bool                 # True → время выбрано автоматически → сдвигается из тихих часов
+
+@dataclass(frozen=True)
+class Resolution:
+    due_at: datetime | None    # aware UTC; None → у записи нет времени и напоминаний
+    precision: Precision       # exact|slot|date|default|relative|fallback|none
+    reminders: tuple[ReminderPlan, ...]
+    rrule: str | None          # нормализованный RRULE (без DTSTART) или None
+    rec_time_local: time | None
+    rec_dtstart_local: datetime | None   # naive, локальное время prefs.tz
+    needs_confirm: bool
+    warnings: tuple[str, ...]  # по-русски, для карточки: "время уже прошло — перенёс на завтра"
+
+def localize(d: date, t: time, tz: ZoneInfo) -> datetime
+    """DST-safe: aware datetime в tz. Несуществующее время (весенний переход) → сдвиг вперёд;
+    неоднозначное (осенний) → первое (fold=0)."""
+
+def resolve_item(item: ExtractedItem, now: datetime, prefs: Prefs, *, source: SourceKind) -> Resolution
+def resolve_when(when: When, now: datetime, prefs: Prefs) -> tuple[datetime | None, Precision, list[str], bool]
+    """(due_at UTC | None, precision, warnings, needs_confirm) — без напоминаний; используется и для правок."""
+def plan_reminders(due_at: datetime, precision: Precision, role: str, lead: list[int] | None,
+                   prefs: Prefs, now: datetime) -> tuple[ReminderPlan, ...]
+def resolve_range(spec_range: str, now: datetime, prefs: Prefs) -> tuple[datetime, datetime]
+    """QuerySpec.range → [start, end) в UTC по локальному календарю prefs.tz.
+    today|tomorrow|yesterday|this_week|next_week|last_week (неделя с понедельника)|this_month|last_month
+    |past:N (последние N дней включая сегодня)|next:N (сегодня + N дней)|YYYY-MM-DD|YYYY-MM-DD..YYYY-MM-DD (включительно)."""
+```
+
+Правила (все времена — из `prefs`; `now` переводится в `prefs.zone`):
+
+| Вход | Результат |
+|---|---|
+| Приоритет полей When | `at` > `in_min` > (`day` и/или `time`). Лишние игнорируются. |
+| `in_min` | `due = now + in_min` (в UTC), precision `relative`, напоминание ровно в `due` (lead 0, auto=False). |
+| только `time` (слот или HH:MM) | сегодня в это время; если ≤ now → **завтра** (без предупреждения). precision `slot`/`exact`. |
+| `day` без `time` | время `bare_date_time` (10:00); для `weekend` — `weekend_time`; precision `date`. |
+| `day` + `time` | дата по `day`, время по `time`. |
+| `+N` / `+Nd` | сегодня + N дней. **night_cutoff**: если локальное now < `night_cutoff` (04:00) и N ≥ 1 → N−1. |
+| `+Nw`, `+Nmo`, `+Ny` | + недели/месяцы (`relativedelta`, 31 → последний день месяца)/годы. |
+| `MO`..`SU` | ближайший такой день; сегодня — если время ещё не прошло, иначе через неделю. |
+| `next XX` | этот день недели **следующей** календарной недели (неделя с понедельника). |
+| `dN` / `d-1` | N-е число этого месяца, если не прошло, иначе следующего (clamp к концу месяца); `d-1` — последний день. |
+| `MM-DD` | в этом году, если не прошло, иначе в следующем. |
+| `YYYY-MM-DD` в прошлом | due_at = эта дата (время по правилам), **без напоминаний**, needs_confirm, warning «дата в прошлом». |
+| `+0`/сегодня + время уже прошло | перенос на завтра, warning «время уже прошло — перенёс на завтра», needs_confirm. |
+| `weekend` | ближайшая суббота (сегодня, если суббота и время не прошло). |
+| `at` | локальное время (`YYYY-MM-DD` → `bare_date_time`), precision `fallback`, needs_confirm. |
+| Нет `when`, kind ∈ ACTIONABLE, нет rrule | `due` = ближайшее `task_default_time` (сегодня, если ещё не прошло, иначе завтра), precision `default`, одно напоминание в `due`, **auto=True**. |
+| Нет `when`, kind не actionable | `due_at=None`, precision `none`, напоминаний нет. |
+| Час 0–6 при precision `exact` без «утра/ночи/am/a.m.» в `when.text` | needs_confirm (не меняем время). |
+| `conf == "low"` или source ∈ {photo, forward} и есть время | needs_confirm. |
+
+Напоминания (`plan_reminders`):
+- precision `exact`/`slot` и role `event`/`deadline` → за `lead` минут (lead = `item.lead` или `[prefs.lead_minutes]`), auto=False.
+- role `remind` → ровно в `due` (lead 0), auto=False. precision `relative` → ровно в `due`, auto=False.
+- precision `date`/`default`/`fallback` → ровно в `due` (lead 0), **auto=True**.
+- lead кратный 1440 вычитается в днях по локальным часам (wall clock), остальные — в UTC.
+- Если `fire_at ≤ now` но `due > now` → `fire_at = now` (сразу). Если `due ≤ now` → напоминаний нет.
+- auto=True → `quiet.shift_out_of_quiet(fire_at, prefs)`.
+- Дубликаты `fire_at` схлопнуть; сортировка по времени.
+
+Повторы (`item.rrule` есть): `normalize_rrule`; время суток = `time` из When (слот/HH:MM) или `task_default_time`;
+`rec_dtstart_local` = сегодня (локально) в это время (naive); `due_at` = `recurrence.next_occurrence(…, after=now, inclusive=True)`;
+precision `slot`/`exact`/`default`; напоминания для этого повторения — как обычно. Невалидный RRULE → запись без повтора +
+warning «не понял правило повтора», needs_confirm.
+
+### 4.2 domain/recurrence.py  [domain]
+
+```python
+ALLOWED_KEYS = {"FREQ","INTERVAL","BYDAY","BYMONTHDAY","BYMONTH","BYSETPOS","COUNT","UNTIL","WKST"}
+def normalize_rrule(rule: str) -> str            # убирает "RRULE:", upper, проверяет ключи и парсинг; ValueError
+def next_occurrence(rule: str, dtstart_local: datetime, tz: ZoneInfo, after: datetime,
+                    *, inclusive: bool = False) -> datetime | None
+    """Следующее повторение (aware UTC) строго после `after` (или ≥ при inclusive). Разворачивает правило
+    в naive локальном времени (сохраняет 09:00 через смену DST), затем localize(). UNTIL приводится к naive local.
+    None — правило исчерпано (COUNT/UNTIL)."""
+def describe_rrule_ru(rule: str) -> str          # "каждый день", "каждый понедельник", "по пн и чт",
+                                                 # "каждые 2 недели", "5-го числа каждого месяца", "каждый год 1 янв"
+```
+
+### 4.3 domain/quiet.py  [domain]
+
+```python
+def in_quiet_hours(t: datetime, prefs: Prefs) -> bool       # окно может пересекать полночь; start==end или
+                                                            # quiet_enabled=False → тихих часов нет
+def shift_out_of_quiet(t: datetime, prefs: Prefs) -> datetime   # если t в тихих часах → ближайший quiet_end (UTC)
+```
+
+### 4.4 domain/fmt.py  [domain]
+
+```python
+def fmt_dt(dt: datetime, tz: ZoneInfo, *, now: datetime | None = None) -> str
+    # "сегодня 13:00", "завтра 09:00", "вчера 18:00", "пт 9 окт 15:00", "9 окт 2027 15:00" (другой год)
+def fmt_date(d: date, *, today: date | None = None) -> str   # "сегодня", "завтра", "пт 9 окт"
+def fmt_time(t: time) -> str                                 # "13:00"
+def fmt_duration(minutes: int) -> str                        # "5 мин", "1 ч", "1 ч 30 мин", "1 дн", "2 дн"
+def plural_ru(n: int, one: str, few: str, many: str) -> str  # plural_ru(5, "задача", "задачи", "задач")
+```
+
+### 4.5 ai/client.py  [ai]
+
+```python
+class AIError(Exception): ...
+class AIUnavailable(AIError):  """Временная: сеть, таймаут, 429, 5xx, 503 'No instances available'. → повторить позже."""
+class AIConfigError(AIError):  """401 (ключ), 402 (нет баланса), 404 (модель/chute не найдены). → нужен пользователь."""
+class AIBadResponse(AIError):  """Модель ответила, но результат непригоден (после всех повторов)."""
+    # у AIUnavailable есть атрибут retry_after: float | None (из заголовка Retry-After)
+
+@dataclass
+class ChatResult:
+    content: str               # без <think>…</think>
+    model: str
+    input_tokens: int
+    output_tokens: int
+    cost_usd: float
+    latency_ms: int
+
+class ChutesClient:
+    def __init__(self, settings: Settings, sessionmaker: async_sessionmaker | None = None,
+                 http: aiohttp.ClientSession | None = None) -> None
+    async def close(self) -> None
+    async def chat(self, *, purpose: str, model: str, messages: list[dict], json_schema: dict | None = None,
+                   schema_name: str = "out", max_tokens: int | None = None, temperature: float = 0.0) -> ChatResult
+        """Один HTTP-вызов. Пишет ai_usage (успех и ошибка) через services.usage.record_usage, если есть sessionmaker.
+        messages могут содержать image-part: {"type":"image_url","image_url":{"url":"data:image/jpeg;base64,..."}}"""
+    async def price(self, model: str) -> tuple[float, float]
+        """USD за 1M (input, output) из GET {base}/models (кэш 6 ч), иначе settings.llm_fallback_price_*"""
+```
+
+### 4.6 ai/stt.py  [ai]
+
+```python
+class SpeechToText(Protocol):
+    async def transcribe(self, audio: bytes, *, mime_type: str | None = None, language: str | None = None) -> str: ...
+
+class ChutesWhisperSTT:
+    def __init__(self, settings: Settings, sessionmaker: async_sessionmaker | None = None,
+                 http: aiohttp.ClientSession | None = None) -> None
+    async def transcribe(...) -> str      # AIUnavailable / AIConfigError; ai_usage(purpose="stt", audio_seconds, cost)
+    async def close(self) -> None
+```
+
+### 4.7 ai/extract.py  [ai]
+
+```python
+PROMPT_VERSION: str  # "v1"
+
+@dataclass
+class ExtractInput:
+    text: str                                  # текст/подпись/транскрипт (может быть пустым для картинки)
+    source: SourceKind
+    now: datetime                              # aware; время сообщения
+    prefs: Prefs
+    images: list[tuple[bytes, str]] = field(default_factory=list)   # (data, mime)
+    forward_from: str | None = None            # "канал «Хабр»"
+    link_titles: dict[str, str] = field(default_factory=dict)
+    force_query: bool = False                  # сообщение начиналось с "?"
+    reply_item: dict | None = None             # снимок записи, на карточку которой ответили → intent=edit
+    clarification: str | None = None           # выбранный вариант на предыдущий Ask
+
+@dataclass
+class ExtractOutput:
+    extraction: Extraction
+    model: str
+    prompt_version: str
+
+async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -> ExtractOutput
+    """Основная модель (vision-модель = settings.llm_model, если есть картинки) → валидация → при ValidationError
+    один повтор с текстом ошибки → запасная модель (vision_fallback_model при картинках, иначе llm_fallback_model).
+    AIUnavailable основной → сразу пробуем запасную; если и она недоступна → AIUnavailable.
+    force_query → intent принудительно query; reply_item → intent принудительно edit (edit.target=None)."""
+
+async def answer_query(client: ChutesClient, settings: Settings, question: str, rows: list[dict],
+                       now: datetime, prefs: Prefs) -> str
+    """Краткий ответ по-русски простым текстом (без HTML), опираясь только на rows."""
+```
+
+Промпт — по мотивам [research/time-parsing.md §5](research/time-parsing.md): статичная часть (инструкции на английском,
+примеры) + динамическая `NOW … / CAL … / SRC … / MSG …`. Обязательно перечислить kinds и их смысл, правила `When`,
+`intent`, `QuerySpec`, `EditPatch`, `image`. Ответ на языке сообщения.
+
+### 4.8 ai/linkinfo.py  [ai]
+
+```python
+async def fetch_titles(urls: list[str], *, http: aiohttp.ClientSession | None = None,
+                       timeout_s: float = 5.0, max_bytes: int = 262144) -> dict[str, str]
+    """Только http/https, не более 5 URL, читает максимум max_bytes, <title>/og:title, html.unescape, ≤200 символов.
+    Ошибки молча пропускаются (ссылки без заголовка просто не попадают в результат)."""
+```
+
+### 4.9 services/usage.py  [ai]
+
+```python
+@dataclass
+class BudgetState:
+    spent_usd: float
+    limit_usd: float
+    ratio: float        # spent/limit (inf если limit == 0 и spent > 0; 0 если оба 0)
+    exhausted: bool     # spent >= limit и limit > 0 ... (limit == 0 → ИИ выключен → exhausted=True)
+
+async def record_usage(sessionmaker, *, purpose: str, model: str, input_tokens: int = 0, output_tokens: int = 0,
+                       audio_seconds: float = 0.0, cost_usd: float = 0.0, ok: bool = True, latency_ms: int = 0,
+                       error: str | None = None) -> None          # своя сессия + commit, ошибки только логируются
+async def month_spend(session, prefs: Prefs, now: datetime) -> float   # текущий календарный месяц в prefs.tz
+async def budget_state(session, prefs: Prefs, now: datetime) -> BudgetState
+def next_month_start(now: datetime, prefs: Prefs) -> datetime         # aware UTC начало следующего месяца по prefs.tz
+```
+
+### 4.10 services/items.py  [items]
+
+```python
+@dataclass
+class CreatedItem:
+    item: Item
+    occurrence: Occurrence | None
+    reminders: list[Reminder]
+    resolution: Resolution
+
+@dataclass
+class PatchResult:
+    item: Item
+    occurrence: Occurrence | None      # текущее открытое
+    reminders: list[Reminder]          # pending текущего occurrence
+    warnings: list[str]
+    deleted: bool = False
+
+async def create_items(session, *, raw: RawMessage | None, extraction: Extraction, source: SourceKind,
+                       source_text: str | None, source_meta: dict | None, urls: list[str], prefs: Prefs,
+                       now: datetime, model: str | None, prompt_version: str | None) -> list[CreatedItem]
+    """Для каждого ExtractedItem: resolve_item → Item (+ Occurrence при due_at, + Reminder по плану).
+    kind=link и пустые urls у item → item.urls = urls сообщения. flush, без commit."""
+async def replace_items_for_raw(session, raw_id: int, ...same kwargs...) -> list[CreatedItem]
+    """Для уточнения (Ask): мягко удалить записи этого raw (status=deleted, напоминания cancelled) и создать заново."""
+async def get_item(session, item_id: int) -> Item | None
+async def item_snapshot(session, item_id: int, prefs: Prefs, now: datetime) -> dict
+    """Для промпта правки: {id, kind, title, details, tags, due_local:"YYYY-MM-DD HH:MM"|None, rrule, lead, status}."""
+async def current_occurrence(session, item_id: int) -> Occurrence | None     # ближайшее open (иначе последнее)
+async def pending_reminders(session, occurrence_id: int) -> list[Reminder]
+async def mark_done(session, occurrence_id: int, now: datetime, prefs: Prefs) -> Occurrence
+    """occurrence.status=done, done_at; pending-напоминания → cancelled. Разовая запись → item.status=done.
+    Повторяющаяся → гарантировать следующее open-повторение (с напоминаниями)."""
+async def mark_undone(session, occurrence_id: int) -> Occurrence   # обратно open; item.status=open
+async def snooze(session, occurrence_id: int, *, minutes: int | None = None, tomorrow: bool = False,
+                 prefs: Prefs, now: datetime) -> Reminder
+    """Отменяет pending-напоминания occurrence и создаёт новое (auto=False): now+minutes, либо завтра в то же
+    локальное время, что и due_at (если due_at в прошлом — завтра в то же время суток)."""
+async def delete_item(session, item_id: int, now: datetime) -> None     # soft: status=deleted, deleted_at, rec_active=False, cancel
+async def restore_item(session, item_id: int, now: datetime, prefs: Prefs) -> Item   # undo; будущие напоминания вернуть в pending
+async def remove_reminders(session, item_id: int) -> int                # cancel все pending; вернуть число
+async def set_kind(session, item_id: int, kind: str) -> Item
+async def set_title(session, item_id: int, title: str) -> Item
+async def set_tags(session, item_id: int, tags: list[str]) -> Item
+async def set_lead(session, item_id: int, lead: list[int], prefs: Prefs, now: datetime) -> PatchResult  # перепланировать
+async def apply_patch(session, item_id: int, patch: EditPatch, prefs: Prefs, now: datetime) -> PatchResult
+    """action: done/undone (текущее occurrence), delete, no_reminder, stop_recurrence, update:
+    title/kind/tags_add/tags_remove; when → resolve_when → перенос текущего open occurrence (или создание нового),
+    перепланировать напоминания (lead из patch.lead, иначе item.lead_minutes, иначе prefs); rrule → включить/заменить повтор;
+    lead без when → перепланировать текущие."""
+async def stop_recurrence(session, item_id: int) -> Item     # rec_active=False; текущее open остаётся
+async def ensure_recurring(session, prefs: Prefs, now: datetime) -> int
+    """Для каждой записи rec_active и status!=deleted: если нет open-повторения с due_at > now → создать следующее
+    (next_occurrence после max(due_at) существующих) с напоминаниями; open-повторения этой записи, у которых
+    due_at < due_at нового и которые старше 12 ч, → status=missed. Возвращает число созданных."""
+async def move_to_tomorrow(session, occurrence_ids: list[int], prefs: Prefs, now: datetime) -> list[Occurrence]
+    """+1 день к локальной дате при том же времени суток (если due в прошлом — завтра в то же время), перепланировать."""
+```
+
+Внутренние правила: при любом перепланировании pending-напоминания текущего occurrence → cancelled, создаются новые
+по `plan_reminders`. `Item.updated_at` обновляется. Повторяющиеся записи: `Item.status` остаётся open, пока активен повтор.
+
+### 4.11 services/query.py  [items]
+
+```python
+@dataclass
+class Row:
+    item_id: int
+    kind: str
+    title: str
+    tags: list[str]
+    status: str                    # статус записи
+    due_at: datetime | None        # due текущего/найденного occurrence
+    occurrence_id: int | None
+    occ_status: str | None
+    rrule: str | None
+    created_at: datetime
+    snippet: str | None            # фрагмент source_text/details (≤200 символов)
+    urls: list[str]
+
+@dataclass
+class Agenda:
+    day: date                      # локальная дата
+    open: list[Row]                # open occurrences с due в этот день (сортировка по времени)
+    overdue: list[Row]             # open occurrences с due < начала дня (только для сегодня), не старше 30 дней
+    done: list[Row]                # done в этот день
+
+@dataclass
+class UsageSummary:
+    month: str                     # "октябрь 2026"
+    spent_usd: float
+    limit_usd: float
+    calls: int
+    by_purpose: dict[str, tuple[int, float]]   # purpose -> (calls, usd)
+
+async def agenda(session, prefs: Prefs, now: datetime, *, day_offset: int = 0) -> Agenda
+async def open_tasks(session, prefs: Prefs, now: datetime, limit: int = 30) -> list[Row]
+    # ACTIONABLE, status open; сначала с due (по возрастанию), потом без
+async def recent(session, limit: int = 15) -> list[Row]           # по created_at desc, без deleted
+async def search(session, text: str, limit: int = 20) -> list[Row]  # FTS + ILIKE-фолбэк по title/tags
+async def run_query(session, spec: QuerySpec, prefs: Prefs, now: datetime) -> list[Row]
+async def recurring(session) -> list[Row]                          # rec_active, с ближайшим open occurrence
+async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, limit: int = 5) -> list[Row]
+    # среди open/недавних (30 дней) не deleted: FTS по hint, приоритет — ближайшие по due
+async def usage_summary(session, prefs: Prefs, now: datetime) -> UsageSummary
+def rows_for_llm(rows: list[Row], prefs: Prefs) -> list[dict]      # компактные dict для answer_query (локальные даты)
+```
+
+### 4.12 workers/jobs.py  [workers]
+
+```python
+Handler = Callable[[AppContext, dict], Awaitable[None]]
+
+class RetryLater(Exception):
+    def __init__(self, delay: timedelta | None = None, reason: str = "", *, at: datetime | None = None,
+                 count_attempt: bool = True) -> None
+
+async def enqueue(session, kind: str, payload: dict, *, dedupe_key: str | None = None,
+                  run_after: datetime | None = None) -> int | None     # ON CONFLICT (dedupe_key) DO NOTHING → None
+async def claim(session, now: datetime, limit: int = 5, lock_for: timedelta = timedelta(minutes=5)) -> list[Job]
+    # UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING; status queued|running с истёкшим lock
+
+class JobWorker:
+    def __init__(self, ctx: AppContext, handlers: dict[str, Handler], *, poll_interval_s: float = 5.0) -> None
+    async def run(self) -> None          # бесконечный цикл; ждёт ctx.jobs_wakeup или poll_interval
+    async def run_once(self) -> int      # одна итерация (для тестов): claim + выполнить; вернуть число задач
+```
+
+Семантика выполнения задачи: обработчик открывает свои сессии через `ctx.sessionmaker`. Успех → `done`.
+`RetryLater` → `queued`, `run_after = at or now+delay` (count_attempt=False — не увеличивать attempts, например бюджет).
+`AIUnavailable` → `run_after = now + min(2**attempts мин, 6 ч)` (или retry_after). Иное исключение → attempts++, backoff;
+при `attempts >= max_attempts` → `dead`, `last_error`, и вызвать `on_dead(ctx, job)` (уведомление владельцу, реакция 😢).
+
+### 4.13 services/ingest.py  [workers]
+
+```python
+def message_to_raw_fields(message: aiogram.types.Message) -> dict
+    """content_type (text|voice|audio|photo|image_document|document|video|video_note|animation|sticker|location|contact|other),
+    text (text or caption), urls (из entities/caption_entities: url и text_link; без дублей),
+    файл (самое большое фото; document с mime image/* → image_document), forward_origin (нормализованный dict:
+    {type, title?, username?, chat_id?, message_id?, url?, sender_name?, date}), media_group_id, reply_to_message_id,
+    tg_date, raw_json (message.model_dump(mode="json", exclude_none=True))."""
+async def save_incoming(session, message: Message, *, force_query: bool = False,
+                        reply_item_id: int | None = None) -> tuple[RawMessage, bool]
+    """INSERT … ON CONFLICT (chat_id, message_id) DO NOTHING; (raw, created)."""
+async def enqueue_processing(session, raw: RawMessage, now: datetime) -> None
+    """reply_item_id → job "edit" {raw_id, item_id}, dedupe "edit:{raw_id}";
+    media_group_id → job "album" {media_group_id}, dedupe "album:{chat_id}:{gid}", run_after now+2s;
+    иначе job "message" {raw_id}, dedupe "msg:{raw_id}"."""
+```
+
+### 4.14 services/processor.py  [workers]
+
+```python
+HANDLERS: dict[str, Handler]   # {"message": handle_message, "album": handle_album, "edit": handle_edit,
+                               #  "clarify": handle_clarify, "edit_time": handle_edit_time}
+async def on_dead(ctx: AppContext, job: Job) -> None
+```
+
+`handle_message(ctx, {"raw_id"})`:
+1. Загрузить raw (status done/ignored → выйти). prefs. `now_msg = raw.tg_date`.
+2. Бюджет: `budget_state` исчерпан → реакция ✍, `raw.status=deferred`, уведомление один раз за месяц
+   (`once_keys` `budget100:YYYY-MM`) → `RetryLater(at=next_month_start, count_attempt=False)`.
+   ≥ 80% → уведомление один раз (`budget80:YYYY-MM`), продолжаем.
+3. Контент: голос/аудио → `bot.download` → `stt.transcribe(language=prefs.stt_language)` → `raw.transcript` (commit сразу,
+   чтобы при повторе не платить снова); фото/image_document → скачать байты (в БД не хранить) → images;
+   urls → `fetch_titles` → `raw.link_titles`. Прочие типы без текста → запись kind=other без ИИ (title по типу:
+   «Видео», «Кружочек», «Стикер», «Геолокация», «Документ: name»), реакция 👌, конец.
+4. `extract(...)` (source: forward > voice > photo > link(если есть urls) > text). `image.text`/`description` → `raw.image_text`.
+5. intent `save`: `create_items` (source_text = текст + транскрипт + image.text). Для каждой записи с напоминаниями
+   или ACTIONABLE или needs_confirm/warnings → `views.item_card` → `sender.send(reply_to=raw.message_id, purpose="card")`.
+   Если карточек нет → реакция 👌; иначе реакция 👌 тоже ставится. `ask` → `views.ask_message` (+ реакция 🤔).
+   Пустой items → реакция 👌 и запись kind=note с исходным текстом (ничего не теряем).
+6. intent `query`: `run_query` → `answer=="list"` → `views.rows_list`; `summary` → `answer_query` → текст.
+7. intent `edit`: `find_edit_candidates(edit.target)`: 1 → `apply_patch` → новая карточка; >1 → `views.edit_candidates`
+   (кнопки PickCb → job "edit" с item_id); 0 → «Не нашёл, что изменить 🤷».
+8. `raw.status=done`, `processed_at`. Разбудить планировщик (`ctx.scheduler_wakeup.set()`).
+Ошибки: `AIUnavailable` → реакция ✍ (один раз), пробросить (очередь повторит). `AIConfigError` → уведомление владельцу
+(один раз в сутки, once_key), `RetryLater(1 ч)`.
+
+`handle_album(ctx, {"media_group_id"})` — все raw с этим media_group_id (по message_id), одна обработка: подпись(и) +
+до 4 картинок; результат привязывается к первому raw; остальные raw → done.
+`handle_edit(ctx, {"raw_id","item_id"})` — `extract(reply_item=item_snapshot)` → `apply_patch` → обновить карточку
+(новое сообщение-карточка reply на правку) + реакция 👌. `edit.action=delete` → карточка «🗑 Удалено» с кнопкой «Вернуть».
+`handle_edit_time(ctx, {"item_id","text"})` — из кнопки «🕒 Время»: текст пользователя → `extract(reply_item=…,
+text="перенеси на: …")` → `apply_patch`.
+`handle_clarify(ctx, {"raw_id","option"})` — повтор `extract(clarification=option)` → `replace_items_for_raw` → карточки.
+
+### 4.15 services/digest.py  [workers]
+
+```python
+@dataclass
+class DigestData:
+    kind: Literal["morning", "evening"]
+    agenda: Agenda
+    recurring_today: int
+async def build_digest(session, kind: str, prefs: Prefs, now: datetime) -> DigestData | None   # None, если пусто
+```
+
+### 4.16 workers/scheduler.py  [workers]
+
+```python
+class Scheduler:
+    def __init__(self, ctx: AppContext) -> None
+    async def run(self) -> None            # цикл: tick(); спать до min(interval, ближайший fire_at) или wake
+    async def tick(self, now: datetime) -> None
+```
+
+`tick`: (1) `sending` с `claimed_at < now-2мин` → `pending`; (2) claim pending `fire_at ≤ now` (SKIP LOCKED, ≤20):
+item deleted / occurrence не open → `cancelled`; `now - fire_at > prefs.missed_grace_minutes` → `missed`; иначе
+`views.reminder_message` → `sender.send(purpose="reminder")` → `sent`, `tg_message_id`; ошибка отправки → attempts++,
+`pending` (после 5 попыток → `failed`); (3) `items.ensure_recurring`; (4) дайджесты: для morning/evening, если включён:
+целевое время = `shift_out_of_quiet(local digest time)`, окно [цель, цель+3ч), ключ `digest:{kind}:{YYYY-MM-DD}` в once_keys
+(вставка ON CONFLICT DO NOTHING → только вставивший отправляет); `build_digest` → None → не отправлять;
+(5) heartbeat: записать время в `settings.heartbeat_file`.
+
+### 4.17 bot/sender.py  [bot]
+
+```python
+async def send(ctx: AppContext, text: str, markup: InlineKeyboardMarkup | None = None, *,
+               reply_to: int | None = None, silent: bool = False, purpose: str,
+               item_id: int | None = None, occurrence_id: int | None = None,
+               raw_message_id: int | None = None) -> int
+    """send_message в ctx.chat_id (HTML), reply_parameters(allow_sending_without_reply=True), повтор при
+    TelegramRetryAfter (до 3 раз), запись BotMessage в своей сессии. Возвращает message_id."""
+async def edit(ctx: AppContext, message_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None
+    # "message is not modified" игнорировать
+async def react(ctx: AppContext, message_id: int, emoji: str) -> None   # best-effort, ошибки глушить
+async def lookup(session, chat_id: int, message_id: int) -> BotMessage | None
+```
+Эмодзи реакций (только из разрешённого списка Telegram): 👀 получено, 👌 сохранено, ✍ отложено (ИИ недоступен/бюджет),
+🤔 нужен ответ, 😢 не смог обработать.
+
+### 4.18 bot/views.py  [bot]
+
+Все функции чистые (без I/O), возвращают `(text_html, markup | None)`.
+
+```python
+def item_card(item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime,
+              warnings: Sequence[str] = ()) -> tuple[str, InlineKeyboardMarkup | None]
+    # "📌 <b>Купить наушники</b>\n⏰ сегодня 13:00 · напомню в 12:55\n🔁 каждый пн\n🏷 Покупка · #электроника\n⚠️ …"
+    # кнопки: [✏️ Изменить] [🔕 Без напоминания] [🗑 Удалить] (+ [⏹ Стоп повтор] если rec_active; + [✅ Готово] если ACTIONABLE)
+def deleted_card(item: Item) -> tuple[str, InlineKeyboardMarkup]          # "🗑 Удалено: …" [↩️ Вернуть]
+def edit_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # [🕒 Время] [🏷 Категория] [#️⃣ Теги]
+                                                                          # [✏️ Название] [⏱ Напомнить за…] [← Назад]
+def kind_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 9 категорий
+def lead_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 0/5/15/30/60/1440 мин
+def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime)
+    # "🔔 <b>Купить наушники</b>\nчерез 5 мин · сегодня 13:00"  [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
+def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
+def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
+def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
+    # вечерний: сделано / не сделано + [📅 Перенести невыполненное на завтра]
+def rows_list(title: str, rows: Sequence[Row], prefs: Prefs, now: datetime, *, empty: str = "Пусто")
+def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
+def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
+def usage_text(summary: UsageSummary) -> str
+def settings_menu(prefs: Prefs) -> tuple[str, InlineKeyboardMarkup]
+def help_text() -> str
+```
+Длинные тексты обрезать до 4096 символов (с «…»). callback_data ≤ 64 байт (только id и короткие коды).
+
+### 4.19 bot/routers  [bot]
+
+Порядок: `commands` → `settings` (FSM-ввод) → `edit` (FSM-ввод) → `callbacks` → `capture` (всё остальное).
+
+Команды (`set_my_commands` со scope владельца): `/today`, `/tasks`, `/recent`, `/search <текст>`, `/ask <вопрос>`,
+`/recurring`, `/settings`, `/usage`, `/help`, `/start`. Неизвестная команда → подсказка.
+`/start` при `OWNER_ID=0`: отвечает любому «Твой Telegram ID: N — впиши его в .env как OWNER_ID и перезапусти».
+
+`capture`: всё, что не команда. `?…` → force_query. Reply на сообщение бота, которое есть в `bot_messages` с item_id →
+`reply_item_id`. `edited_message` — игнорировать. Сохранение → реакция 👀 → enqueue → `ctx.jobs_wakeup.set()`.
+
+`callbacks` (CallbackData в `cbdata.py`): done/undone/snooze (OccCb), edit/del/undel/norem/stoprec/kind/lead/back (ItemCb),
+выбор категории (KindCb), ответ на Ask (AskCb → job "clarify"), выбор записи для правки (PickCb → job "edit"),
+перенос невыполненного (DigestCb), настройки (SetCb). Изменения → `edit` текущего сообщения (карточки) + `answer()` с тостом.
+
+`edit` (FSM): «🕒 Время» → ждём текст → job "edit_time"; «✏️ Название» → текст → `set_title`; «#️⃣ Теги» → текст
+(через пробел/запятую) → `set_tags`. `/cancel` или кнопка — выход.
+
+`settings`: меню (views.settings_menu): часовой пояс (кнопки Europe/Warsaw, Europe/Berlin, Europe/Minsk, Europe/Kyiv +
+ввод IANA), задача без времени, слоты (утро/обед/день/вечер/после работы/ночь, выходные, дата без времени),
+напоминать за (0/5/10/15/30), тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время), бюджет ($),
+язык голосовых (авто/ru/en). Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
+Существующие напоминания при смене настроек не перепланируются (сказать об этом в тексте меню).
+
+### 4.20 bot/app.py и __main__.py  [bot]
+
+`main()`: logging → Settings → engine/sessionmaker → aiohttp ClientSession (общая для ChutesClient/STT/linkinfo) →
+Bot(DefaultBotProperties(parse_mode=HTML, link_preview_options(is_disabled=True))) → Dispatcher(MemoryStorage) →
+middlewares (OwnerOnly на update outer; DI: ctx в data["ctx"]) → routers → startup: set_my_commands, запуск JobWorker и
+Scheduler (`add_done_callback` → при исключении лог + `os._exit(1)`), shutdown: отмена задач, закрытие клиентов, `engine.dispose()`.
+`dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())`, `drop_pending_updates` НЕ использовать.
+
+## 5. Тесты
+
+- `tests/domain/` — чистые unit-тесты: все правила таблицы 4.1, DST (2026-10-25 и 2027-03-28), night_cutoff, повторы, тихие часы.
+- `tests/ai/` — фейковый HTTP (aiohttp test server или подмена метода), валидация, повтор, фолбэк, учёт стоимости.
+- `tests/services/`, `tests/workers/` — интеграционные с Postgres (`TEST_DATABASE_URL`, фикстуры из `tests/conftest.py`).
+- `tests/bot/` — рендер views, cbdata ≤ 64 байт, разбор Message → raw (на собранных вручную aiogram-объектах).
+- Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@localhost:55432/dump_test uv run pytest`.
