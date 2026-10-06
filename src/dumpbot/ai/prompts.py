@@ -1,0 +1,262 @@
+"""Prompts for extraction and query answers.
+
+The extraction system prompt is fully static (instructions + few-shot examples) and goes first so providers can
+cache it; everything that changes per message (NOW, CAL, SRC, ..., MSG) goes into the user message.
+Instructions are in English (fewer tokens); the model answers in the language of the message.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import datetime, timedelta
+from typing import Any
+
+from dumpbot.domain.prefs import Prefs
+
+PROMPT_VERSION = "v1"
+
+# Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
+# this only guards against pathological inputs.
+MAX_MSG_CHARS = 8000
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+# (input as the model would see it, abbreviated; expected output). Every output must validate as Extraction.
+EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
+    (
+        "купить наушники в обед",
+        {
+            "items": [
+                {
+                    "kind": "purchase",
+                    "title": "Купить наушники",
+                    "tags": ["электроника"],
+                    "when": {"text": "в обед", "time": "lunch"},
+                }
+            ]
+        },
+    ),
+    (
+        "напомни за 30 минут до встречи в пятницу в 15",
+        {
+            "items": [
+                {
+                    "kind": "event",
+                    "title": "Встреча",
+                    "when": {"text": "в пятницу в 15", "day": "FR", "time": "15:00"},
+                    "lead": [30],
+                }
+            ]
+        },
+    ),
+    (
+        "каждый понедельник выносить мусор",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Вынести мусор",
+                    "when": {"text": "каждый понедельник"},
+                    "rrule": "FREQ=WEEKLY;BYDAY=MO",
+                }
+            ]
+        },
+    ),
+    (
+        "платить за квартиру 5-го каждого месяца",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Заплатить за квартиру",
+                    "when": {"text": "5-го каждого месяца", "day": "d5"},
+                    "rrule": "FREQ=MONTHLY;BYMONTHDAY=5",
+                }
+            ]
+        },
+    ),
+    (
+        "через 2 часа забрать посылку, а завтра позвонить маме",
+        {
+            "items": [
+                {"kind": "task", "title": "Забрать посылку", "when": {"text": "через 2 часа", "in_min": 120}},
+                {"kind": "task", "title": "Позвонить маме", "when": {"text": "завтра", "day": "+1"}},
+            ]
+        },
+    ),
+    (
+        "buy milk after work",
+        {"items": [{"kind": "purchase", "title": "Buy milk", "when": {"text": "after work", "time": "after_work"}}]},
+    ),
+    (
+        "сегодня звонил Петя, просил перезвонить в четверг вечером",
+        {
+            "items": [
+                {"kind": "note", "title": "Звонил Петя"},
+                {
+                    "kind": "task",
+                    "title": "Перезвонить Пете",
+                    "when": {"text": "в четверг вечером", "day": "TH", "time": "evening"},
+                },
+            ]
+        },
+    ),
+    (
+        "встреча с Олегом в 8",
+        {
+            "items": [
+                {"kind": "event", "title": "Встреча с Олегом", "when": {"text": "в 8", "time": "20:00"}, "conf": "low"}
+            ],
+            "ask": {"q": "В 8 утра или вечера?", "options": ["08:00", "20:00"]},
+        },
+    ),
+    ("что у меня завтра?", {"intent": "query", "query": {"range": "tomorrow"}}),
+    ("когда я записан к стоматологу?", {"intent": "query", "query": {"text": "стоматолог", "answer": "summary"}}),
+    (
+        "перенеси встречу с Олегом на завтра 16:00",
+        {
+            "intent": "edit",
+            "edit": {"target": "встреча с Олегом", "when": {"text": "на завтра 16:00", "day": "+1", "time": "16:00"}},
+        },
+    ),
+    (
+        'REPLYING TO ITEM {"id":7,"title":"Созвон","due_local":"2026-10-09 13:00"} | перенеси на 15:00',
+        {"intent": "edit", "edit": {"when": {"text": "на 15:00", "day": "2026-10-09", "time": "15:00"}}},
+    ),
+    (
+        "SRC photo | (cat meme with the text 'Код заработал с первого раза')",
+        {
+            "image": {"text": "Код заработал с первого раза", "description": "Мем с удивлённым котом"},
+            "items": [{"kind": "meme", "title": "Код заработал с первого раза"}],
+        },
+    ),
+    (
+        "LINKS https://habr.com/p/1/: Как устроен asyncio | почитать https://habr.com/p/1/",
+        {"items": [{"kind": "link", "title": "Как устроен asyncio", "tags": ["python"]}]},
+    ),
+)
+
+
+def _render_examples() -> str:
+    return "\n".join(f"> {src}\n{json.dumps(out, ensure_ascii=False, separators=(',', ':'))}" for src, out in EXAMPLES)
+
+
+SYSTEM_PROMPT = f"""\
+Convert ONE message from the owner of a personal notes/tasks bot into ONE JSON object per the schema. JSON only. \
+Never invent facts. Omit empty, null and default fields.
+
+INPUT lines: NOW, CAL (next 7 days), SRC (text | voice = transcript, may have errors | photo = image attached, \
+MSG is its caption | forward | link | other), FORWARDED FROM, LINKS (url: title), REPLYING TO ITEM, \
+CLARIFICATION (owner's answer to your question: apply it, don't ask again), MODE query, MSG.
+
+INTENT: save (default) | query = asks about OWN saved data or schedule ("что у меня завтра?", \
+"какие идеи я сохранял?"); MODE query → always query | edit = changes an EXISTING item ("перенеси", "отмени", \
+"удали", "готово"), with edit.target naming it; REPLYING TO ITEM → always edit (no target).
+
+ITEMS: split independent things into separate items (one per thing to buy).
+kind: task = something to do | event = meeting, appointment, something happening at a time | purchase = something \
+to buy | idea | note = thought, fact, diary | link = saved link/article | meme = humor, meme image | quote | other.
+title: short, imperative for tasks, in the message language. details: extra info only. tags: 0-4 lowercase, \
+no "#". conf: high|med|low.
+
+TIME: describe it, NEVER compute dates. when = {{text: verbatim phrase, day, time, in_min, at, role}}
+- day: +N days (+0 сегодня, +1 завтра, +2 послезавтра) | +Nw | +Nmo | +Ny | MO TU WE TH FR SA SU = nearest such day | \
+"next FR" only for "на следующей неделе"/"next week" | dN = N-th of month (5-го → d5), d-1 = last day | MM-DD | \
+YYYY-MM-DD | weekend.
+- time: HH:MM (24h) or slot: morning (утром, с утра, in the morning), lunch (в обед, at lunch), afternoon (днём, \
+после обеда, in the afternoon), evening (вечером, tonight), after_work (после работы, after work), \
+night (ночью, перед сном, at night).
+- Hours 1-7 without утра/ночи/am are PM ("в 3" → 15:00). A bare "в 8"/"в 9" is ambiguous: the likelier one, \
+conf low, ask with both options.
+- in_min only for "через N минут/часов" (2 часа → 120); "через 3 дня" → day +3.
+- at: local YYYY-MM-DD[THH:MM] ONLY if day/time can't express it; use CAL.
+- role: remind = the time to ping ("напомни в 15"); deadline = до/к/by; else event.
+- lead, only if stated: за 30 минут → [30], за час → [60], за день → [1440].
+- rrule only for explicit repetition (каждый, по понедельникам, every): RFC 5545 without DTSTART; time of day \
+still in when.time.
+- Past facts (звонил, был) get no when; no time mentioned → no when.
+ask: only if a reminder would likely be wrong; 2-4 options; item = index in items.
+
+IMAGES: image.text = all readable text verbatim ("" if none); image.description = one short sentence in Russian. \
+Memes → kind meme.
+LINKS: kind link, title = page title or a short description.
+FORWARDED posts: usually note, link or idea; dates in them → conf low.
+
+query = {{text: keywords, kinds, status open|done|any, date_field: due (scheduled) or created (when saved), range, \
+tags, answer: list or summary (short answer: когда?, сколько?)}}
+range: today|tomorrow|yesterday|this_week|next_week|last_week|this_month|last_month|past:N|next:N|YYYY-MM-DD\
+|YYYY-MM-DD..YYYY-MM-DD
+
+edit = {{target (which item, only without REPLYING TO ITEM), action: update|done|undone|delete|no_reminder\
+|stop_recurrence, title, kind, tags_add, tags_remove, when (the new time; if only the time changes, keep the \
+date of due_local as day YYYY-MM-DD), rrule, lead}}
+
+EXAMPLES (NOW 2026-10-06T14:05 Tue)
+{_render_examples()}
+/no_think"""
+
+
+ANSWER_SYSTEM_PROMPT = """\
+You answer the owner's question about their own saved notes, tasks, events and reminders.
+Use ONLY the rows given as JSON. Never invent items, dates or details. If the rows don't answer the question, \
+say so briefly.
+Reply in Russian, plain text (no HTML, no Markdown), at most 8 short lines. Dates in rows are local time; \
+write them like "пт 9 окт 15:00" or "завтра 10:00" relative to NOW.
+/no_think"""
+
+
+def _one_line(text: str, limit: int = 300) -> str:
+    return " ".join(str(text).split())[:limit]
+
+
+def calendar_line(local_now: datetime) -> str:
+    """``CAL`` line: the next 7 days with weekdays, so the model never has to do calendar maths."""
+    days = (local_now.date() + timedelta(days=i) for i in range(1, 8))
+    return "CAL " + ", ".join(f"{WEEKDAYS[d.weekday()]} {d.isoformat()}" for d in days)
+
+
+def now_line(now: datetime, prefs: Prefs) -> str:
+    local = now.astimezone(prefs.zone)
+    return f"NOW {local:%Y-%m-%dT%H:%M} {WEEKDAYS[local.weekday()]} {prefs.tz}"
+
+
+def build_user_text(
+    *,
+    text: str,
+    source: str,
+    now: datetime,
+    prefs: Prefs,
+    forward_from: str | None = None,
+    link_titles: dict[str, str] | None = None,
+    reply_item: dict | None = None,
+    clarification: str | None = None,
+    force_query: bool = False,
+) -> str:
+    """Dynamic part of the extraction prompt: NOW, CAL, SRC, optional context lines, then MSG (always last)."""
+    local = now.astimezone(prefs.zone)
+    lines = [now_line(now, prefs), calendar_line(local), f"SRC {source}"]
+    if forward_from:
+        lines.append(f"FORWARDED FROM {_one_line(forward_from)}")
+    if link_titles:
+        lines.append("LINKS")
+        lines.extend(f"{url}: {_one_line(title, 200)}" for url, title in link_titles.items())
+    if reply_item is not None:
+        lines.append("REPLYING TO ITEM " + json.dumps(reply_item, ensure_ascii=False, default=str))
+    if clarification:
+        lines.append(f"CLARIFICATION {_one_line(clarification)}")
+    if force_query:
+        lines.append("MODE query")
+    msg = (text or "").strip()[:MAX_MSG_CHARS]
+    lines.append("MSG")
+    lines.append(msg or "(empty)")
+    return "\n".join(lines)
+
+
+def build_answer_text(question: str, rows: list[dict], now: datetime, prefs: Prefs) -> str:
+    """User message for ``answer_query``: NOW, the question and the rows as compact JSON."""
+    return "\n".join(
+        [
+            now_line(now, prefs),
+            f"QUESTION {_one_line(question, 1000)}",
+            "ROWS " + json.dumps(rows, ensure_ascii=False, default=str, separators=(",", ":")),
+        ]
+    )

@@ -1,0 +1,33 @@
+# Only pyproject.toml, uv.lock, README.md, src/, alembic.ini and migrations/ are needed in the build context.
+
+# Secrets
+.env
+*.env
+.env.*
+
+# Python / tooling
+.venv/
+**/__pycache__/
+**/*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Not part of the image
+.git/
+.gitignore
+.gitattributes
+.claude/
+.idea/
+.vscode/
+tests/
+docs/
+backups/
+*.backup
+*.dump
+Dockerfile
+compose.yaml
+.dockerignore

@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     owner_id: int = 0
 
     # Database (async SQLAlchemy URL, asyncpg driver)
-    database_url: str = "postgresql+asyncpg://dump:dump@localhost:5432/dump"
+    database_url: str = "postgresql+asyncpg://dump:dump@127.0.0.1:5432/dump"
 
     # chutes.ai (OpenAI-compatible chat API)
     chutes_api_key: SecretStr

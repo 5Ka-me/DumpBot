@@ -620,4 +620,9 @@ Scheduler (`add_done_callback` → при исключении лог + `os._exi
 - `tests/ai/` — фейковый HTTP (aiohttp test server или подмена метода), валидация, повтор, фолбэк, учёт стоимости.
 - `tests/services/`, `tests/workers/` — интеграционные с Postgres (`TEST_DATABASE_URL`, фикстуры из `tests/conftest.py`).
 - `tests/bot/` — рендер views, cbdata ≤ 64 байт, разбор Message → raw (на собранных вручную aiogram-объектах).
-- Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@localhost:55432/dump_test uv run pytest`.
+- `tests/botapp/` — диспетчер, middlewares, роутеры, FSM, жизненный цикл (фейковая сессия aiogram).
+- `tests/e2e/` — всё приложение (`build_app` + `__main__.poll`) против локальных фейков Telegram Bot API и chutes.ai
+  на 127.0.0.1: голос → карточка → напоминание → «Готово», запросы, правки, сбой ИИ, фото, альбом, дайджесты,
+  бюджет, мёртвая задача. Время заморожено (`clock.utcnow`), планировщик вызывается через `Scheduler.tick(now)`.
+  Фейк Telegram отклоняет невалидный HTML / слишком длинный текст / callback_data > 64 байт, как настоящий.
+- Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@127.0.0.1:55432/dump_test uv run pytest`.

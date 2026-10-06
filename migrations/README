@@ -1,0 +1,7 @@
+Alembic migrations (async env, asyncpg).
+
+    uv run alembic upgrade head                          # apply
+    uv run alembic revision --autogenerate -m "what"     # new revision -> review it by hand!
+    uv run alembic check                                 # models and migrations in sync?
+
+DATABASE_URL is taken from the environment, then from .env; see env.py.

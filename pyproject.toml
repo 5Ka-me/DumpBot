@@ -44,6 +44,8 @@ filterwarnings = ["ignore::DeprecationWarning:dateparser.*"]
 line-length = 120
 target-version = "py312"
 src = ["src", "tests"]
+# Research notes hold illustrative snippets, not project code (ruff >= 0.16 also formats Markdown code blocks).
+extend-exclude = ["docs"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "RUF"]

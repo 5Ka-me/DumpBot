@@ -1,0 +1,82 @@
+# Dump Bot: PostgreSQL + one-shot migrations + the bot (long polling, no inbound ports).
+#   docker compose up -d --build      # build, migrate, start
+#   docker compose logs -f bot        # logs
+# Secrets and settings come from .env (copy .env.example). Postgres is reachable from the host only on 127.0.0.1.
+
+name: dumpbot
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-app: &app
+  image: dumpbot:local
+  env_file: .env
+  environment:
+    # Same .env works for local runs (127.0.0.1) and here (the db container).
+    DATABASE_URL: postgresql+asyncpg://dump:${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}@db:5432/dump
+    HEARTBEAT_FILE: /tmp/heartbeat
+  logging: *logging
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: dump
+      POSTGRES_DB: dump
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?задайте POSTGRES_PASSWORD в .env}
+    volumes:
+      # PostgreSQL 18+ images keep data under /var/lib/postgresql/<major>/docker: mount the parent.
+      - pgdata:/var/lib/postgresql
+    ports:
+      # Loopback only (DBeaver, local dev). Never 0.0.0.0.
+      - "127.0.0.1:${DB_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dump -d dump"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+      start_interval: 2s
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *app
+    # The image is built once, here; bot reuses it (two builders of one tag race each other).
+    build:
+      context: .
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  bot:
+    <<: *app
+    pull_policy: never  # local image built by the migrate service
+    depends_on:
+      db:
+        condition: service_healthy
+        restart: true
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    init: true
+    healthcheck:
+      # The scheduler rewrites the heartbeat file on every tick (<= 30 s); stale for 120 s = stuck.
+      # Docker only marks the container unhealthy; a crashed loop exits the process and "restart" brings it back.
+      test:
+        - CMD
+        - python
+        - -c
+        - "import os, sys, time; p = os.environ.get('HEARTBEAT_FILE', '/tmp/heartbeat'); sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 120 else 1)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+
+volumes:
+  pgdata:
