@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# Secrets / local
+.env
+*.local.env
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

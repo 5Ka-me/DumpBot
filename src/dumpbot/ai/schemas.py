@@ -1,0 +1,160 @@
+"""Structured output the LLM must return (sent as ``response_format: json_schema``).
+
+The LLM only *describes* time ("day" + "time" slot/HH:MM + offsets); exact datetimes are computed
+deterministically in ``domain.timeresolve`` using the user's preferences and IANA timezone.
+
+Validation is lenient on input (unknown keys ignored, tags normalized) but the generated JSON schema is
+strict (``additionalProperties: false``) to steer constrained decoding.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from dumpbot.domain.kinds import Kind
+
+HHMM = r"([01]\d|2[0-3]):[0-5]\d"
+SLOT_RE = r"morning|lunch|afternoon|evening|after_work|night"
+TIME_RE = rf"^({HHMM}|{SLOT_RE})$"
+# +N days | +Nw | +Nmo | +Ny | MO..SU (nearest upcoming) | "next FR" (weekday of next week)
+# | dN (N-th day of month, d-1 = last day) | MM-DD | YYYY-MM-DD | weekend
+DAY_RE = (
+    r"^(\+\d{1,3}(d|w|mo|y)?"
+    r"|(next )?(MO|TU|WE|TH|FR|SA|SU)"
+    r"|d(-1|[1-9]|[12]\d|3[01])"
+    r"|(\d{4}-)?\d{2}-\d{2}"
+    r"|weekend)$"
+)
+AT_RE = r"^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2})?$"
+RRULE_RE = r"^FREQ=(DAILY|WEEKLY|MONTHLY|YEARLY)(;[A-Z]+=[-+,0-9A-Z]+)*$"
+RANGE_RE = (
+    r"^(today|tomorrow|yesterday|this_week|next_week|last_week|this_month|last_month"
+    r"|past:\d{1,3}|next:\d{1,3}"
+    r"|\d{4}-\d{2}-\d{2}(\.\.\d{4}-\d{2}-\d{2})?)$"
+)
+
+MAX_LEAD_MINUTES = 43200  # 30 days
+
+
+class _S(BaseModel):
+    model_config = ConfigDict(extra="ignore", json_schema_extra={"additionalProperties": False})
+
+
+def _norm_tags(v: Any) -> list[str]:
+    if v is None:
+        return []
+    out: list[str] = []
+    for t in v:
+        t = re.sub(r"\s+", "_", str(t).strip().lstrip("#").lower())[:30]
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+class When(_S):
+    """How the message describes the time. At most one of ``at`` / ``in_min`` / (``day`` and/or ``time``)."""
+
+    text: str = Field("", max_length=80, description="verbatim time phrase from the message")
+    day: str | None = Field(None, pattern=DAY_RE)
+    time: str | None = Field(None, pattern=TIME_RE)
+    in_min: int | None = Field(None, ge=1, le=525600, description="'через N минут/часов' as minutes")
+    at: str | None = Field(None, pattern=AT_RE, description="local wall time, only if inexpressible")
+    role: Literal["event", "remind", "deadline"] = "event"
+
+
+class ExtractedItem(_S):
+    kind: Kind
+    title: str = Field(min_length=1, max_length=120)
+    details: str | None = Field(None, max_length=600)
+    tags: list[str] = Field(default_factory=list, max_length=6)
+    when: When | None = None
+    rrule: str | None = Field(None, pattern=RRULE_RE)
+    lead: list[int] | None = Field(None, max_length=3, description="minutes before the event")
+    conf: Literal["high", "med", "low"] = "high"
+
+    _tags = field_validator("tags", mode="before")(_norm_tags)
+
+    @field_validator("lead")
+    @classmethod
+    def _lead_range(cls, v: list[int] | None) -> list[int] | None:
+        if v is None:
+            return None
+        v = sorted({int(x) for x in v if 0 <= int(x) <= MAX_LEAD_MINUTES}, reverse=True)
+        return v or None
+
+
+class Ask(_S):
+    """A clarifying question with quick-reply options (e.g. "В 8 утра или вечера?")."""
+
+    item: int = Field(0, ge=0, le=7, description="index in items the question is about")
+    q: str = Field(min_length=1, max_length=160)
+    options: list[str] = Field(min_length=2, max_length=4)
+
+
+class QuerySpec(_S):
+    """A question about the user's own saved data, as filters."""
+
+    text: str | None = Field(None, max_length=120, description="keywords for full-text search")
+    kinds: list[Kind] = Field(default_factory=list)
+    status: Literal["open", "done", "any"] = "any"
+    date_field: Literal["due", "created"] = "due"
+    range: str | None = Field(None, pattern=RANGE_RE)
+    tags: list[str] = Field(default_factory=list, max_length=6)
+    answer: Literal["list", "summary"] = "list"
+    limit: int = Field(20, ge=1, le=50)
+
+    _tags = field_validator("tags", mode="before")(_norm_tags)
+
+
+class EditPatch(_S):
+    """A change to an existing item (reply to a bot card, or "перенеси встречу с Олегом на 16")."""
+
+    target: str | None = Field(None, max_length=120, description="which item, when not replying to it")
+    action: Literal["update", "done", "undone", "delete", "no_reminder", "stop_recurrence"] = "update"
+    title: str | None = Field(None, max_length=120)
+    kind: Kind | None = None
+    tags_add: list[str] = Field(default_factory=list, max_length=6)
+    tags_remove: list[str] = Field(default_factory=list, max_length=6)
+    when: When | None = None
+    rrule: str | None = Field(None, pattern=RRULE_RE)
+    lead: list[int] | None = Field(None, max_length=3)
+
+    _tags_add = field_validator("tags_add", mode="before")(_norm_tags)
+    _tags_remove = field_validator("tags_remove", mode="before")(_norm_tags)
+
+    @field_validator("lead")
+    @classmethod
+    def _lead_range(cls, v: list[int] | None) -> list[int] | None:
+        return ExtractedItem._lead_range(v)
+
+
+class ImageInfo(_S):
+    text: str | None = Field(None, max_length=4000, description="all readable text in the image, verbatim")
+    description: str | None = Field(None, max_length=300, description="one short sentence, in Russian")
+
+
+class Extraction(_S):
+    intent: Literal["save", "query", "edit"] = "save"
+    items: list[ExtractedItem] = Field(default_factory=list, max_length=8)
+    query: QuerySpec | None = None
+    edit: EditPatch | None = None
+    image: ImageInfo | None = None
+    ask: Ask | None = None
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Extraction:
+        if self.intent == "query" and self.query is None:
+            self.query = QuerySpec()
+        if self.intent == "edit" and self.edit is None:
+            raise ValueError("intent=edit requires 'edit'")
+        if self.ask is not None and self.ask.item >= max(len(self.items), 1):
+            self.ask = None
+        return self
+
+
+def extraction_json_schema() -> dict[str, Any]:
+    """JSON schema for ``response_format={"type": "json_schema", ...}``."""
+    return Extraction.model_json_schema()
