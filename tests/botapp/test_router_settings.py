@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import time, timedelta
 
 import pytest
+from aiogram.types import Chat, MessageOriginChannel
 
 from dumpbot.bot.cbdata import ItemCb, SetCb
 from dumpbot.bot.routers.settings import parse_money, parse_time, parse_tz, parse_value
@@ -121,6 +122,58 @@ async def test_ask_flow_validation(feed, updates, seed, tg, dp, bot, field, bad,
 
     assert getattr(await _prefs(seed), field) == expected
     assert await _state(dp, bot) is None
+
+
+async def test_a_second_bad_value_is_saved_as_a_note(feed, updates, seed, tg, dp, bot) -> None:
+    # An abandoned "конец тихих часов" prompt: one error, then the owner's notes are saved again.
+    await feed(updates.callback(SetCb(key="ask", v="quiet_end"), message_id=934))
+
+    await feed(updates.message("купить хлеб"))
+    assert "Попробуй ещё раз" in tg.texts[-1]
+    assert await _state(dp, bot) == SettingsStates.value.state
+
+    await feed(updates.message("позвонить маме"))
+
+    [raw] = await seed.raws()
+    assert raw.text == "позвонить маме"
+    assert await _state(dp, bot) is None
+    assert "Тихие часы" in tg.edits[-1].text and tg.edits[-1].message_id == 934
+    assert (await _prefs(seed)).quiet_end == Prefs().quiet_end
+
+
+@pytest.mark.parametrize("kind", ["forward", "reply", "question", "photo", "late"])
+async def test_what_is_not_a_value_is_captured(feed, updates, seed, dp, bot, frozen, kind) -> None:
+    await feed(updates.callback(SetCb(key="ask", v="lead_minutes"), message_id=935))
+    if kind == "forward":
+        origin = MessageOriginChannel(date=frozen.now, chat=Chat(id=-1001, type="channel", title="Хабр"), message_id=7)
+        message = updates.message("15", forward_origin=origin)
+    elif kind == "reply":
+        created = await seed.item()
+        await seed.bot_message(960, item_id=created.item.id)
+        message = updates.message("15", reply_to=960)
+    elif kind == "question":
+        message = updates.message("? 15")
+    elif kind == "photo":
+        message = updates.message(photo=True, caption="15")
+    else:
+        frozen.advance(minutes=6)
+        message = updates.message("15")
+
+    await feed(message)
+
+    assert (await _prefs(seed)).lead_minutes == Prefs().lead_minutes
+    assert len(await seed.raws()) == 1
+    assert await _state(dp, bot) is None
+
+
+async def test_a_late_reply_to_the_prompt_is_still_the_value(feed, updates, seed, dp, bot, frozen) -> None:
+    await feed(updates.callback(SetCb(key="ask", v="lead_minutes"), message_id=936))
+    frozen.advance(minutes=10)
+
+    await feed(updates.message("15", reply_to=936))
+
+    assert (await _prefs(seed)).lead_minutes == 15
+    assert await seed.raws() == []
 
 
 async def test_ask_unknown_field_is_stale(feed, updates, tg, dp, bot) -> None:

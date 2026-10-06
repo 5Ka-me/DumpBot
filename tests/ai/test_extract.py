@@ -8,8 +8,8 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
-from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable, ChutesClient
-from dumpbot.ai.extract import PROMPT_VERSION, ExtractInput, answer_query, extract
+from dumpbot.ai.client import AIBadResponse, AIConfigError, AIModelNotFound, AIUnavailable, ChutesClient
+from dumpbot.ai.extract import LONG_MAX_TOKENS, PROMPT_VERSION, ExtractInput, answer_query, extract
 from dumpbot.ai.prompts import ANSWER_SYSTEM_PROMPT, SYSTEM_PROMPT
 from dumpbot.db.models import AiUsage
 from dumpbot.domain.prefs import Prefs
@@ -23,6 +23,7 @@ GOOD = {
     "items": [{"kind": "purchase", "title": "Купить наушники", "when": {"text": "в обед", "time": "lunch"}}],
 }
 UNAVAILABLE = "No instances available (yet) for chute_id=abc"
+NOT_FOUND = '{"detail":"model not found: google/gemma-4-31B-turbo-TEE"}'
 
 
 def make_input(**overrides) -> ExtractInput:
@@ -138,6 +139,94 @@ async def test_config_error_is_not_masked_by_fallback(fake, client, settings):
     with pytest.raises(AIConfigError):
         await extract(client, settings, make_input())
     assert fake.chat_models == [GEMMA]
+
+
+async def test_primary_model_not_found_goes_to_fallback(fake, client, settings):
+    # chutes retired / renamed the primary model: the fallback keeps the bot working (and the owner is told).
+    fake.chat_error(404, NOT_FOUND)
+    fake.chat_json(GOOD)
+    out = await extract(client, settings, make_input())
+    assert (out.model, out.missing_model) == (QWEN, GEMMA)
+    assert fake.chat_models == [GEMMA, QWEN]
+
+
+async def test_fallback_used_for_other_reasons_reports_no_missing_model(fake, client, settings):
+    fake.chat_error(503, UNAVAILABLE)
+    fake.chat_json(GOOD)
+    out = await extract(client, settings, make_input())
+    assert (out.model, out.missing_model) == (QWEN, None)
+
+
+async def test_both_models_not_found_is_a_config_error(fake, client, settings):
+    fake.chat_error(404, NOT_FOUND)
+    fake.chat_error(404, "No matching cord found!")
+    with pytest.raises(AIModelNotFound) as ei:
+        await extract(client, settings, make_input())
+    assert isinstance(ei.value, AIConfigError) and "gemma" in str(ei.value)
+    assert fake.chat_models == [GEMMA, QWEN]
+
+
+async def test_primary_not_found_without_fallback_is_a_config_error(fake, make_settings):
+    settings = make_settings(llm_fallback_model="")
+    client = ChutesClient(settings)
+    fake.chat_error(404, NOT_FOUND)
+    try:
+        with pytest.raises(AIModelNotFound):
+            await extract(client, settings, make_input())
+    finally:
+        await client.close()
+    assert fake.chat_models == [GEMMA]
+
+
+async def test_paid_primary_answers_and_missing_fallback_are_not_a_config_error(fake, client, settings):
+    # A config error would retry the job hourly forever, paying for both primary calls every time.
+    fake.chat_ok("garbage")
+    fake.chat_ok("garbage again")
+    fake.chat_error(404, NOT_FOUND)
+    with pytest.raises(AIBadResponse):
+        await extract(client, settings, make_input())
+    assert fake.chat_models == [GEMMA, GEMMA, QWEN]
+
+
+async def test_primary_unavailable_and_fallback_not_found_raises_unavailable(fake, client, settings):
+    fake.chat_error(503, UNAVAILABLE, headers={"Retry-After": "30"})
+    fake.chat_error(404, NOT_FOUND)
+    with pytest.raises(AIUnavailable) as ei:
+        await extract(client, settings, make_input())
+    assert ei.value.retry_after == 30.0
+
+
+async def test_primary_not_found_and_fallback_invalid_is_bad_response(fake, client, settings):
+    fake.chat_error(404, NOT_FOUND)
+    fake.chat_ok("garbage")
+    with pytest.raises(AIBadResponse):
+        await extract(client, settings, make_input())
+
+
+async def test_output_cut_at_max_tokens_is_asked_again_with_more_room(fake, client, settings):
+    # A long OCR text: asking to "fix the JSON" with the same cap would be cut at the same place.
+    fake.chat_ok('{"image": {"text": "Длинный текст скриншота, обрезанный посере', finish_reason="length")
+    fake.chat_json(GOOD)
+
+    out = await extract(client, settings, make_input())
+
+    assert out.model == GEMMA
+    assert [r["max_tokens"] for r in fake.chat_requests] == [settings.llm_max_tokens, LONG_MAX_TOKENS]
+    assert fake.chat_requests[1]["messages"] == fake.chat_requests[0]["messages"]
+
+
+async def test_cut_output_gets_more_room_once_per_model(fake, client, settings):
+    for _ in range(4):
+        fake.chat_ok('{"items": [{"kind": "note", "title": "обре', finish_reason="length")
+    fake.chat_json(GOOD)
+
+    out = await extract(client, settings, make_input())
+
+    assert out.model == QWEN
+    assert fake.chat_models == [GEMMA, GEMMA, GEMMA, QWEN, QWEN]
+    cap, long = settings.llm_max_tokens, LONG_MAX_TOKENS
+    assert [r["max_tokens"] for r in fake.chat_requests] == [cap, long, long, cap, long]
+    assert "invalid" in fake.chat_requests[2]["messages"][-1]["content"]  # then the usual "fix your JSON" retry
 
 
 async def test_images_are_routed_to_vision_models(fake, client, settings):
@@ -282,6 +371,32 @@ async def test_answer_query_uses_fallback_when_primary_unavailable(fake, client,
     fake.chat_ok("Ничего на завтра нет.")
     answer = await answer_query(client, settings, "что завтра?", [{"title": "x"}], NOW, warsaw)
     assert answer == "Ничего на завтра нет."
+    assert fake.chat_models == [GEMMA, QWEN]
+
+
+async def test_answer_query_uses_fallback_when_primary_not_found(fake, client, settings, warsaw):
+    fake.chat_error(404, NOT_FOUND)
+    fake.chat_ok("Завтра созвон.")
+    answer = await answer_query(client, settings, "что завтра?", [{"title": "x"}], NOW, warsaw)
+    assert answer == "Завтра созвон."
+    assert fake.chat_models == [GEMMA, QWEN]
+
+
+@pytest.mark.parametrize(
+    ("primary", "exc"),
+    [((404, NOT_FOUND), AIModelNotFound), ((503, UNAVAILABLE), AIUnavailable), ((200, "  "), AIBadResponse)],
+)
+async def test_answer_query_with_missing_fallback_raises_the_primarys_error(
+    fake, client, settings, warsaw, primary, exc
+):
+    status, body = primary
+    if status == 200:
+        fake.chat_ok(body)
+    else:
+        fake.chat_error(status, body)
+    fake.chat_error(404, NOT_FOUND)
+    with pytest.raises(exc):
+        await answer_query(client, settings, "что завтра?", [{"title": "x"}], NOW, warsaw)
     assert fake.chat_models == [GEMMA, QWEN]
 
 

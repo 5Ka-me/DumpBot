@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from dumpbot.domain.prefs import Prefs
-from dumpbot.domain.timeresolve import ReminderPlan, plan_reminders
+from dumpbot.domain.timeresolve import ReminderPlan, lead_applies, plan_reminders
 
 TZ = ZoneInfo("Europe/Warsaw")
 
@@ -54,11 +54,38 @@ def test_lead_list_sorted_by_time(now: datetime, prefs: Prefs):
 
 @pytest.mark.parametrize("precision", ["exact", "slot"])
 def test_remind_role_fires_at_due(precision: str, now: datetime, prefs: Prefs):
-    assert fires(plan_reminders(DUE, precision, "remind", [30], prefs, now)) == [(DUE, 0, False)]
+    assert fires(plan_reminders(DUE, precision, "remind", None, prefs, now)) == [(DUE, 0, False)]
 
 
 def test_relative_fires_at_due(now: datetime, prefs: Prefs):
-    assert fires(plan_reminders(DUE, "relative", "event", [30], prefs, now)) == [(DUE, 0, False)]
+    assert fires(plan_reminders(DUE, "relative", "event", None, prefs, now)) == [(DUE, 0, False)]
+
+
+@pytest.mark.parametrize(("precision", "role"), [("relative", "event"), ("exact", "remind"), ("slot", "remind")])
+def test_explicit_lead_is_honoured_for_relative_and_remind(precision: str, role: str, now: datetime, prefs: Prefs):
+    # "через 2 часа созвон, напомни за 30 минут": the stated lead wins over "at the moment itself".
+    assert fires(plan_reminders(DUE, precision, role, [30], prefs, now)) == [(L(2026, 10, 9, 14, 30), 30, False)]
+
+
+@pytest.mark.parametrize(
+    ("precision", "minutes", "applies"),
+    [
+        ("exact", 30, True),
+        ("slot", 30, True),
+        ("relative", 30, True),
+        ("date", 30, False),
+        ("date", 1440, True),
+        ("date", 0, True),
+        ("fallback", 60, False),
+        ("default", 30, False),
+        ("default", 1440, False),
+        ("default", 0, True),
+    ],
+)
+def test_lead_applies_matches_the_plan(precision: str, minutes: int, applies: bool, now: datetime, prefs: Prefs):
+    assert lead_applies(precision, minutes) is applies
+    leads = [p.lead_minutes for p in plan_reminders(DUE, precision, "event", [minutes], prefs, now)]
+    assert (minutes in leads) is applies
 
 
 @pytest.mark.parametrize("precision", ["date", "default", "fallback"])

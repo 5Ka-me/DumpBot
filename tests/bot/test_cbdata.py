@@ -87,7 +87,8 @@ def test_ask_pick_digest():
     assert _roundtrip(AskCb(raw=BIG, n=3)) == f"a:{BIG}:3"
     assert _roundtrip(PickCb(raw=BIG, item=BIG)) == f"p:{BIG}:{BIG}"
     for action in DIGEST_ACTIONS:
-        assert _roundtrip(DigestCb(a=action)) == f"d:{action}"
+        assert _roundtrip(DigestCb(a=action, d="20261006")) == f"d:{action}:20261006"
+        assert _roundtrip(DigestCb(a=action)) == f"d:{action}:"
 
 
 def test_unpacked_ids_are_ints():

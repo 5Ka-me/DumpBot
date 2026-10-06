@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 from aiogram.enums import ParseMode
@@ -18,6 +19,7 @@ from dumpbot.bot.middlewares import InFlight, OwnerOnly
 from dumpbot.bot.routers.commands import BOT_COMMANDS
 from dumpbot.context import AppContext
 from dumpbot.services import ingest, items
+from dumpbot.watchdog import Watchdog
 
 OWNER = 4242
 SECRET = "купить подарок Ане"  # stands for message text that must never reach the logs
@@ -254,6 +256,55 @@ async def test_background_task_that_returns_exits_too(settings_factory, tg) -> N
     await lifecycle.shutdown()
 
     assert exits == [1]
+
+
+async def test_blocked_event_loop_exits_the_process(settings_factory, tg, caplog) -> None:
+    settings = settings_factory()
+    bot = build_bot(settings, session=tg)
+    ctx = _ctx(settings, bot)
+    ctx.watchdog = Watchdog(check_every_s=0.01)
+    exits: list[int] = []
+
+    def runners(ctx_: AppContext) -> dict[str, Any]:
+        async def stuck() -> None:
+            ctx_.watchdog.watch("scheduler", 0.1)
+            time.sleep(0.5)  # noqa: ASYNC251  (on purpose: the whole event loop is stuck, no task ever ends)
+            await asyncio.Event().wait()
+
+        return {"scheduler": stuck}
+
+    lifecycle = Lifecycle(ctx, runners=runners, exit_func=exits.append)
+    with caplog.at_level(logging.CRITICAL):
+        await lifecycle.startup(bot)
+        await _settle()
+
+    assert exits == [1]  # from the watchdog thread, while the loop was blocked
+    assert "background loop made no progress (scheduler for " in caplog.text
+    await lifecycle.shutdown()
+    assert exits == [1]
+
+
+async def test_hung_await_exits_the_process(settings_factory, tg) -> None:
+    settings = settings_factory()
+    bot = build_bot(settings, session=tg)
+    ctx = _ctx(settings, bot)
+    clock = [0.0]
+    ctx.watchdog = Watchdog(check_every_s=0.01, monotonic=lambda: clock[0])
+    exits: list[int] = []
+    lifecycle = Lifecycle(ctx, runners=Runners(), exit_func=exits.append)
+
+    await lifecycle.startup(bot)
+    ctx.watchdog.watch("jobs", 60)  # the fake loops never beat, like an await that never returns
+    clock[0] += 30
+    await asyncio.sleep(0.05)
+    assert exits == []
+    clock[0] += 31
+    for _ in range(100):
+        if exits:
+            break
+        await asyncio.sleep(0.01)
+    assert exits == [1]
+    await lifecycle.shutdown()
 
 
 async def test_setup_mode_skips_the_command_menu(settings_factory, tg) -> None:

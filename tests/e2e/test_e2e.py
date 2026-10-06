@@ -11,8 +11,10 @@ from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+import pytest
 from sqlalchemy import select
 
+from dumpbot.ai import linkinfo
 from dumpbot.db.models import AiUsage, Item, Job, OnceKey, RawMessage
 
 WARSAW = ZoneInfo("Europe/Warsaw")
@@ -94,7 +96,7 @@ async def test_voice_note_to_reminder_to_done(e2e: Any) -> None:
     assert card.text.startswith("🛒 <b>Купить наушники</b>")
     assert "⏰ сегодня 13:00 · напомню в 12:55" in card.text
     assert "#электроника" in card.text
-    assert [text for text, _ in card.buttons] == ["✅ Готово", "✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить"]
+    assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить"]
 
     raw = await e2e.raw(message_id)
     assert (raw.status, raw.content_type, raw.transcript) == ("done", "voice", "Купить наушники в обед")
@@ -351,7 +353,7 @@ async def test_morning_and_evening_digests(e2e: Any) -> None:
     [evening] = e2e.tg.sent[sent_before + 1 :]
     assert evening.text.startswith("🌙 <b>Итоги дня</b>")
     assert "<b>Не сделано</b>" in evening.text and "10:00 · 📌 Позвонить маме" in evening.text
-    move = evening.button("d:tmr")
+    move = evening.button("d:tmr:20261007")  # the digest's own day travels with the button
     async with e2e.ctx.sessionmaker() as s:
         keys = sorted(k for k in (await s.scalars(select(OnceKey.key))).all() if k.startswith("digest:"))
     assert keys == ["digest:evening:2026-10-07", "digest:morning:2026-10-07"]
@@ -469,9 +471,9 @@ async def test_edit_time_through_the_card_buttons(e2e: Any) -> None:
     prompt = (await e2e.wait(lambda: e2e.tg.edits_of(card.message_id)[1:], "time prompt"))[0]
     assert prompt.text.startswith("🕒 Когда?")
 
-    # the answer (within the prompt's 15 minutes) goes to the AI as an edit of this item; the new card arrives as
-    # a reply to it
-    e2e.clock.set(local(2026, 10, 6, 10, 20))
+    # the answer (typed within 5 minutes of the prompt, states.ANSWER_TTL) goes to the AI as an edit of this item;
+    # the new card arrives as a reply to it
+    e2e.clock.set(local(2026, 10, 6, 10, 15))
 
     def reschedule(req: Any) -> dict[str, Any]:
         assert req.line("REPLYING TO ITEM ") is not None
@@ -518,7 +520,9 @@ async def test_clarifying_question(e2e: Any) -> None:
     assert [(i.title, i.status) for i in items] == [("Встреча с Олегом", "deleted"), ("Встреча с Олегом", "open")]
 
 
-async def test_forwarded_channel_post_with_a_link(e2e: Any) -> None:
+async def test_forwarded_channel_post_with_a_link(e2e: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The fake web lives on 127.0.0.1, which link titles never fetch otherwise (tests/ai/test_linkinfo_safety.py).
+    monkeypatch.setattr(linkinfo, "address_allowed", lambda host: host == "127.0.0.1")
     url = f"{e2e.ai_url}/pages/habr"
     e2e.ai.pages["habr"] = "<html><head><title>Как мы ускорили Postgres &amp; asyncpg</title></head></html>"
     text = f"Годная статья {url}"
@@ -618,7 +622,8 @@ async def test_budget_exhausted_then_raised(e2e: Any) -> None:
     assert e2e.ai.chat_requests == []
     await e2e.idle()
     job = await the_job(e2e)
-    assert job.status == "queued" and wall(job.run_after) == "2026-11-01 00:00"
+    # the new month starts at 00:00, inside the quiet hours: the deferred cards come at 08:00
+    assert job.status == "queued" and wall(job.run_after) == "2026-11-01 08:00"
     assert (await e2e.raw(message_id)).status == "deferred"
 
     # raising the budget makes the deferred message run now
@@ -688,31 +693,23 @@ async def test_delete_and_restore_from_the_card(e2e: Any) -> None:
     assert reminder_msg.text.startswith("🔔 <b>Купить наушники</b>")
 
 
-async def test_unusable_model_output_ends_in_a_dead_job(e2e: Any) -> None:
+async def test_unusable_model_output_is_saved_as_a_note_without_retries(e2e: Any) -> None:
     text = "что-то непонятное"
     e2e.ai.script(text, {"intent": "edit"})  # invalid: "edit" without a patch, every time
     message_id = e2e.tg.push_message(text)
 
-    async def attempts_done(n: int) -> Job | None:
-        job = await the_job_if_any(e2e)
-        return job if job is not None and job.attempts >= n and job.status in ("queued", "dead") else None
-
-    job = await e2e.wait_db(lambda: attempts_done(1), "first attempt")
-    assert job.status == "queued" and job.last_error is not None
-    assert "непонятное" not in job.last_error  # no message text in errors
-    for n in range(2, job.max_attempts + 1):  # let every retry come due
-        e2e.clock.set(job.run_after)
-        e2e.wake_jobs()
-        job = await e2e.wait_db(lambda n=n: attempts_done(n), f"attempt {n}")
-    assert job.status == "dead"
-
     await e2e.reaction(message_id, "😢")
     notice = await e2e.card_for(message_id)
-    assert notice.text.startswith("😢 Не смог обработать сообщение")
-    raw = await e2e.raw(message_id)
-    assert raw.status == "failed"
-    assert len(e2e.ai.chat_requests) == 3 * job.max_attempts  # primary + its retry + fallback per attempt
-    assert await e2e.all(Item) == []
+    assert notice.text.startswith("😢 Не смог обработать сообщение — оно сохранено")
+    await e2e.idle()
+
+    # temperature 0 + a fixed seed: every retry would pay for the same unusable answer, so there are none.
+    job = await the_job_if_any(e2e)
+    assert (job.status, job.attempts) == ("done", 1)
+    assert len(e2e.ai.chat_requests) == 3  # primary + its retry + fallback, once
+    assert (await e2e.raw(message_id)).status == "done"
+    [item] = await e2e.all(Item)
+    assert (item.kind, item.title, item.source_text, item.ai_model) == ("note", text, text, None)
 
 
 async def test_edit_by_description_with_candidates(e2e: Any) -> None:

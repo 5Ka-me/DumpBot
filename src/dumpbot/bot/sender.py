@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Final
 
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
-from aiogram.types import InlineKeyboardMarkup, ReactionTypeEmoji, ReplyParameters
+from aiogram.types import ForceReply, InlineKeyboardMarkup, ReactionTypeEmoji, ReplyParameters
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -37,6 +37,13 @@ REACT_SAVED: Final = "👌"  # saved
 REACT_DEFERRED: Final = "✍"  # saved, AI unavailable / budget exhausted -> processed later
 REACT_ASK: Final = "🤔"  # needs an answer
 REACT_FAILED: Final = "😢"  # could not be processed
+
+# bot_messages.purpose of messages that wait for the owner's answer: a text reply to them is routed by the capture
+# router (not saved as a new note).
+PURPOSE_ASK: Final = "ask"  # clarifying question 🤔 (raw_message_id = the asked message; its raw_json[ASK_KEY])
+PURPOSE_PICK: Final = "pick"  # "Какую запись изменить?" (raw_message_id = the edit; its raw_json[CANDIDATES_KEY])
+PURPOSE_SEARCH: Final = "search_prompt"  # /search without text: the reply is the search text
+PURPOSE_QUESTION: Final = "ask_prompt"  # /ask without text: the reply is the question
 
 _NOT_MODIFIED: Final = "message is not modified"
 _CANT_EDIT: Final[tuple[str, ...]] = (
@@ -69,7 +76,7 @@ async def _with_retry[T](call: Callable[[], Awaitable[T]], what: str) -> T:
 async def send(
     ctx: AppContext,
     text: str,
-    markup: InlineKeyboardMarkup | None = None,
+    markup: InlineKeyboardMarkup | ForceReply | None = None,
     *,
     reply_to: int | None = None,
     silent: bool = False,
@@ -81,6 +88,7 @@ async def send(
     """Send an HTML message to the owner and record it in ``bot_messages``. Returns the Telegram message_id.
 
     ``reply_to`` is a Telegram message_id in the owner's chat; the message is still sent if it was deleted.
+    ``markup`` is inline buttons, or ``ForceReply`` for a prompt whose answer is a reply to it.
     """
     reply = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
     msg = await _with_retry(

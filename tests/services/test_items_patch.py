@@ -7,7 +7,7 @@ from datetime import datetime, time
 import pytest
 
 from dumpbot.ai.schemas import EditPatch
-from dumpbot.services import items
+from dumpbot.services import items, query
 
 DAILY_9 = {"kind": "task", "title": "Зарядка", "rrule": "FREQ=DAILY", "when": {"time": "09:00"}}
 WEEKLY_MO_9 = {"kind": "task", "title": "Вынести мусор", "rrule": "FREQ=WEEKLY;BYDAY=MO", "when": {"time": "09:00"}}
@@ -296,6 +296,37 @@ async def test_kind_to_non_actionable_keeps_reminders(session, make, now, prefs)
     result = await items.apply_patch(session, c.item.id, patch(kind="note"), prefs, now)
     assert c.item.kind == "note"
     assert [r.id for r in result.reminders] == before
+
+
+async def test_task_without_time_to_idea_drops_the_default_reminder(
+    session, make, reminders_of, occurrences_of, local, now, prefs
+):
+    # «Открыть кофейню» filed as a task without a time (today 19:00), then «это идея»: no 19:00 ping, not overdue.
+    [c] = await make({"kind": "task", "title": "Открыть кофейню"}, now=now)
+    assert (c.occurrence.precision, len(c.reminders)) == ("default", 1)
+
+    result = await items.apply_patch(session, c.item.id, patch(kind="idea"), prefs, now)
+
+    assert (c.item.kind, c.item.status) == ("idea", "open")
+    [occ] = await occurrences_of(c.item.id)
+    assert occ.status == "cancelled"
+    assert await reminders_of(occ.id) == [(local(2026, 10, 6, 19, 0), "cancelled", 0, True)]
+    assert result.reminders == []
+    agenda = await query.agenda(session, prefs, local(2026, 10, 8, 10, 0))
+    assert (agenda.open, agenda.overdue) == ([], [])
+
+    # Back to a task: a fresh default reminder.
+    again = await items.apply_patch(session, c.item.id, patch(kind="task"), prefs, now)
+    assert (again.occurrence.status, again.occurrence.precision) == ("open", "default")
+    assert fires(again) == [(local(2026, 10, 6, 19, 0), 0, True)]
+
+
+async def test_kind_change_with_a_new_time_keeps_it(session, make, local, now, prefs):
+    [c] = await make({"kind": "task", "title": "Открыть кофейню"}, now=now)
+    result = await items.apply_patch(
+        session, c.item.id, patch(kind="idea", when={"day": "+1", "time": "12:00"}), prefs, now
+    )
+    assert (result.occurrence.status, result.occurrence.due_at) == ("open", local(2026, 10, 7, 12, 0))
 
 
 async def test_kind_to_actionable_gets_default_reminder(session, make, local, now, prefs):

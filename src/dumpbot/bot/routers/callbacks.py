@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING, Final
 
 from aiogram import F, Router
@@ -24,6 +24,7 @@ from dumpbot.ai.schemas import EditPatch
 from dumpbot.bot import views
 from dumpbot.bot.cbdata import (
     DIGEST_ACTIONS,
+    DIGEST_DAY_FMT,
     OCC_ACTIONS,
     SNOOZE_MINUTES,
     AskCb,
@@ -37,6 +38,7 @@ from dumpbot.bot.cbdata import (
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
 from dumpbot.db.models import Occurrence, RawMessage
+from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import fmt_date, fmt_dt, fmt_duration
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
 from dumpbot.services import digest, items, query
@@ -54,6 +56,8 @@ log = logging.getLogger(__name__)
 
 MAX_LEAD: Final = 43200  # same cap as the AI schema / items service
 MAX_ASK_OPTIONS: Final = 8
+# Digest buttons sent before the digest day was part of the callback data ("d:tmr").
+OLD_DIGEST_DATA: Final = frozenset(f"{DigestCb.__prefix__}:{a}" for a in DIGEST_ACTIONS)
 
 
 @dataclass
@@ -78,6 +82,7 @@ def make_router() -> Router:
     router.callback_query.register(on_ask, AskCb.filter())
     router.callback_query.register(on_pick, PickCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
+    router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     router.callback_query.register(on_stale)  # buttons of an older version, garbage data
     return router
 
@@ -166,8 +171,10 @@ async def _snooze(
         return Outcome(None, "Напоминание уже неактуально")
     minutes = SNOOZE_MINUTES[action]
     reminder = await items.snooze(session, occ.id, minutes=minutes, tomorrow=minutes is None, prefs=prefs, now=now)
+    # A series instance snoozed to tomorrow may have been merged into tomorrow's: [✅ Готово] must point there.
+    target = await session.get(Occurrence, reminder.occurrence_id) or occ
     toast = f"⏰ Напомню {fmt_dt(reminder.fire_at, prefs.zone, now=now)}"
-    return Outcome(views.reminder_snoozed(item, occ, reminder, prefs, now), toast, wake_scheduler=True)
+    return Outcome(views.reminder_snoozed(item, target, reminder, prefs, now), toast, wake_scheduler=True)
 
 
 # --- item cards ----------------------------------------------------------------------------------------------------
@@ -216,7 +223,7 @@ async def _no_reminders(c: ItemCall) -> Outcome:
 
 
 async def _stop_recurrence(c: ItemCall) -> Outcome:
-    await items.stop_recurrence(c.session, c.item.id)
+    await items.stop_recurrence(c.session, c.item.id, c.now)
     if await common.purpose_of(c.session, c.ctx, c.message_id) == common.PURPOSE_RECURRING:
         view = common.recurring_view(await query.recurring(c.session), c.prefs, c.now)
     else:
@@ -225,7 +232,7 @@ async def _stop_recurrence(c: ItemCall) -> Outcome:
 
 
 async def _item_done(c: ItemCall) -> Outcome:
-    """[✅ Готово] of a card without an occurrence (an actionable item without a time)."""
+    """[✅ Готово] from the edit menu: closes the current occurrence (or the item when it has none)."""
     result = await items.apply_patch(c.session, c.item.id, EditPatch(action="done"), c.prefs, c.now)
     return Outcome(patch_view(result, c.prefs, c.now), "✅ Готово", wake_scheduler=True)
 
@@ -290,10 +297,20 @@ async def on_lead(callback: CallbackQuery, callback_data: LeadCb, ctx: AppContex
         if item.status == "deleted":
             return Outcome(views.deleted_card(item), common.DELETED)
         result = await items.set_lead(session, item.id, [minutes], prefs, now)
-        toast = "⏱ Напомню в момент события" if minutes == 0 else f"⏱ Напомню за {fmt_duration(minutes)}"
-        return Outcome(patch_view(result, prefs, now), toast, wake_scheduler=True)
+        return Outcome(patch_view(result, prefs, now), _lead_toast(result, minutes, prefs, now), wake_scheduler=True)
 
     await run(callback, ctx, op)
+
+
+def _lead_toast(result: PatchResult, minutes: int, prefs: Prefs, now: datetime) -> str:
+    """What the reminder will really do: a time the bot chose itself ("завтра" = 10:00, a task without a time)
+    takes only whole-day leads, so "за 30 мин" is stored for later but does not move today's reminder."""
+    occ = result.occurrence
+    if occ is not None and occ.status == "open" and not timeresolve.lead_applies(occ.precision, minutes):
+        if not result.reminders:
+            return "⏱ У записи нет точного времени — напомню в срок"
+        return f"⏱ У записи нет точного времени — напомню {fmt_dt(result.reminders[0].fire_at, prefs.zone, now=now)}"
+    return "⏱ Напомню в момент события" if minutes == 0 else f"⏱ Напомню за {fmt_duration(minutes)}"
 
 
 def patch_view(result: PatchResult, prefs: Prefs, now: datetime) -> views.View:
@@ -365,20 +382,42 @@ def _button_text(message: Message, data: str | None) -> str | None:
 
 
 async def on_digest(callback: CallbackQuery, callback_data: DigestCb, ctx: AppContext) -> None:
-    # The digest's day is the day the digest was sent, not the day the button is pressed.
+    """[📅 Перенести невыполненное на завтра]: what is already due and not done on the digest's day (+ overdue)
+    goes to that day + 1. Items still ahead that evening keep their time and reminder.
+
+    The digest's day comes from the button (a digest delayed by quiet hours arrives the next morning), else
+    (older buttons) from the day the digest was sent — never from the day the button is pressed.
+    """
     sent_at = callback.message.date if isinstance(callback.message, Message) else None
 
     async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
-        day_of = sent_at or now
+        day = _digest_day(callback_data.d) or (sent_at or now).astimezone(prefs.zone).date()
+        day_of = timeresolve.localize(day, time(12, 0), prefs.zone)  # a moment of that local day
         agenda = await query.agenda(session, prefs, day_of)
-        ids = [r.occurrence_id for r in (*agenda.open, *agenda.overdue) if r.occurrence_id is not None]
-        moved = await items.move_to_tomorrow(session, ids, prefs, now) if ids else []
+        ids = [
+            r.occurrence_id
+            for r in (*agenda.open, *agenda.overdue)
+            if r.occurrence_id is not None and r.due_at is not None and r.due_at <= now
+        ]
+        moved = await items.move_to_tomorrow(session, ids, prefs, now, day=day + timedelta(days=1)) if ids else []
         await session.flush()
         view = await _evening_after_move(session, prefs, day_of, now, len(moved))
         toast = f"📅 Перенёс на завтра: {len(moved)}" if moved else "Нечего переносить"
         return Outcome(view, toast, wake_scheduler=bool(moved))
 
     await run(callback, ctx, op)
+
+
+async def on_old_digest(callback: CallbackQuery, ctx: AppContext) -> None:
+    """A digest button sent before the day was in its data ("d:tmr")."""
+    await on_digest(callback, DigestCb(a=(callback.data or "").partition(":")[2]), ctx)
+
+
+def _digest_day(value: str) -> date | None:
+    try:
+        return datetime.strptime(value, DIGEST_DAY_FMT).date() if value else None
+    except ValueError:
+        return None
 
 
 async def _evening_after_move(

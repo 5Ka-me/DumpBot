@@ -101,6 +101,24 @@ def test_boundaries(now: datetime, spec: str, expected: tuple[datetime, datetime
     assert resolve_range(spec, now, prefs) == expected
 
 
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("tomorrow", span((2026, 10, 7), (2026, 10, 8))),  # the day "завтра в 10" was saved for at this hour
+        ("today", span((2026, 10, 7), (2026, 10, 8))),  # calendar days, like the day spec "+0"
+        ("yesterday", span((2026, 10, 6), (2026, 10, 7))),
+    ],
+)
+def test_tomorrow_before_night_cutoff_is_the_day_that_has_just_started(
+    spec: str, expected: tuple[datetime, datetime], prefs: Prefs
+):
+    now = datetime(2026, 10, 7, 1, 30, tzinfo=TZ)  # Wed 01:30, before night_cutoff (04:00)
+    assert resolve_range(spec, now, prefs) == expected
+    assert resolve_range("tomorrow", datetime(2026, 10, 7, 4, 0, tzinfo=TZ), prefs) == span(
+        (2026, 10, 8), (2026, 10, 9)
+    )
+
+
 def test_other_timezone(prefs: Prefs):
     prefs = Prefs(tz="America/New_York")
     start, end = resolve_range("today", NOW, prefs)  # 08:05 in New York

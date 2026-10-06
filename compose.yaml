@@ -41,6 +41,8 @@ services:
       start_period: 30s
       start_interval: 2s
     restart: unless-stopped
+    # Time for the shutdown checkpoint before SIGKILL (Docker Desktop may default to 1 s).
+    stop_grace_period: 60s
     logging: *logging
 
   migrate:
@@ -65,14 +67,17 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     init: true
+    # SIGTERM -> up to 10 s for updates being handled (DRAIN_TIMEOUT_S), job release, closing; then SIGKILL.
+    stop_grace_period: 30s
     healthcheck:
-      # The scheduler rewrites the heartbeat file on every tick (<= 30 s); stale for 120 s = stuck.
-      # Docker only marks the container unhealthy; a crashed loop exits the process and "restart" brings it back.
+      # The scheduler rewrites the heartbeat file on every tick (<= SCHEDULER_INTERVAL_S); stale for
+      # max(120 s, 4 intervals) = behind. Docker only marks the container unhealthy: the bot itself exits when a
+      # loop crashes or stops making progress (watchdog), and "restart" brings it back.
       test:
         - CMD
         - python
         - -c
-        - "import os, sys, time; p = os.environ.get('HEARTBEAT_FILE', '/tmp/heartbeat'); sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < 120 else 1)"
+        - "import os, sys, time; p = os.environ.get('HEARTBEAT_FILE', '/tmp/heartbeat'); limit = max(120.0, 4 * float(os.environ.get('SCHEDULER_INTERVAL_S') or 30)); sys.exit(0 if os.path.exists(p) and time.time() - os.path.getmtime(p) < limit else 1)"
       interval: 60s
       timeout: 10s
       retries: 3

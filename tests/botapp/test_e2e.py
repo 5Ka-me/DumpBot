@@ -173,13 +173,10 @@ async def test_message_to_card_to_done(servers, engine, db_url, settings_factory
         [commands] = telegram.calls_of("setMyCommands")
         assert commands["scope"] == {"type": "chat", "chat_id": OWNER}
 
-        # the card's [✅ Готово] button
-        done = next(
-            b["callback_data"]
-            for row in card["reply_markup"]["inline_keyboard"]
-            for b in row
-            if b["callback_data"].startswith("o:done:")
-        )
+        # the card has no [✅ Готово]; the same action sits in its ✏️ menu (i:done:<item id>)
+        callbacks = [b["callback_data"] for row in card["reply_markup"]["inline_keyboard"] for b in row]
+        assert not any(cb.startswith(("o:done:", "i:done:")) for cb in callbacks)
+        done = next(cb for cb in callbacks if cb.startswith("i:edit:")).replace("i:edit:", "i:done:")
         card_id = telegram.sent_ids[0]
         telegram.push(
             callback_query={

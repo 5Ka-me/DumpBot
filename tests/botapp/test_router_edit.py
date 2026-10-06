@@ -1,6 +1,9 @@
-"""Edit dialogs: 🕒 Время -> job edit_time, ✏️ Название -> set_title, #️⃣ Теги -> set_tags, /cancel, expiry."""
+"""Edit dialogs: 🕒 Время -> job edit_time, ✏️ Название -> set_title, #️⃣ Теги -> set_tags, /cancel, expiry, and
+messages that are not the answer (forwards, replies to other cards, "?" questions, voice, late notes)."""
 
 from __future__ import annotations
+
+from aiogram.types import Chat, MessageOriginChannel, Voice
 
 from dumpbot.bot.cbdata import ItemCb
 from dumpbot.bot.sender import REACT_SAVED, REACT_SEEN
@@ -60,6 +63,10 @@ async def test_title_dialog(feed, updates, seed, tg, dp, bot) -> None:
 
     assert (await _item(seed, created.item.id)).title == "Купить наушники Sony"
     assert tg.edits[-1].text.startswith("📌 <b>Купить наушники Sony</b>")
+    # The prompt may be far up the chat: the change is confirmed right under the answer.
+    [done] = tg.sent
+    assert done.text == "✏️ Название изменено: <b>Купить наушники Sony</b>"
+    assert done.reply_parameters.message_id == answer.message.message_id
     assert tg.reactions == [(answer.message.message_id, REACT_SAVED)]
     assert await _state(dp, bot) is None
     assert await seed.raws() == []
@@ -85,6 +92,7 @@ async def test_tags_dialog_normalizes(feed, updates, seed, tg) -> None:
 
     assert (await _item(seed, created.item.id)).tags == ["дом", "работа", "срочно"]
     assert "#дом" in tg.edits[-1].text
+    assert tg.texts == ["#️⃣ Теги для <b>Купить наушники</b>: #дом #работа #срочно"]
 
 
 async def test_tags_dash_clears(feed, updates, seed) -> None:
@@ -140,6 +148,95 @@ async def test_non_text_inside_a_dialog_is_captured(feed, updates, seed, dp, bot
     [raw] = await seed.raws()
     assert raw.content_type == "photo"
     assert (await _item(seed, created.item.id)).title == "Купить наушники"
+    assert await _state(dp, bot) is None  # the dialog is over: the next note is not taken for the title
+
+    await feed(updates.message("купить молоко"))
+    assert (await _item(seed, created.item.id)).title == "Купить наушники"
+    assert len(await seed.raws()) == 2
+
+
+async def test_forwarded_post_is_not_a_title(feed, updates, seed, tg, dp, bot, frozen) -> None:
+    created = await seed.item("Созвон")
+    await feed(updates.callback(ItemCb(a="title", id=created.item.id), message_id=930))
+    frozen.advance(minutes=1)
+
+    origin = MessageOriginChannel(date=frozen.now, chat=Chat(id=-1001, type="channel", title="Хабр"), message_id=7)
+    await feed(updates.message("Длинный пост из канала про asyncio, сохранить почитать", forward_origin=origin))
+
+    assert (await _item(seed, created.item.id)).title == "Созвон"
+    [raw] = await seed.raws()
+    assert raw.forward_origin["type"] == "channel"
+    assert [j.kind for j in await seed.jobs()] == ["message"]
+    assert await _state(dp, bot) is None
+    assert tg.edits[-1].message_id == 930 and tg.edits[-1].text.startswith("📌 <b>Созвон</b>")
+
+
+async def test_reply_to_another_card_edits_that_card(feed, updates, seed, dp, bot) -> None:
+    first = await seed.item("Первая")
+    second = await seed.item("Вторая")
+    await seed.bot_message(950, item_id=second.item.id, occurrence_id=second.occurrence.id)
+    await feed(updates.callback(ItemCb(a="title", id=first.item.id), message_id=949))
+
+    await feed(updates.message("перенеси на пятницу", reply_to=950))
+
+    assert (await _item(seed, first.item.id)).title == "Первая"
+    [raw] = await seed.raws()
+    assert raw.reply_item_id == second.item.id
+    [job] = await seed.jobs()
+    assert (job.kind, job.payload) == ("edit", {"raw_id": raw.id, "item_id": second.item.id})
+    assert await _state(dp, bot) is None
+
+
+async def test_question_is_not_tags(feed, updates, seed, dp, bot) -> None:
+    created = await seed.item()
+    await feed(updates.callback(ItemCb(a="tags", id=created.item.id)))
+
+    await feed(updates.message("? что у меня завтра"))
+
+    assert (await _item(seed, created.item.id)).tags == []
+    [raw] = await seed.raws()
+    assert raw.force_query is True
+    assert await _state(dp, bot) is None
+
+
+async def test_a_note_sent_minutes_later_is_not_the_answer_but_a_reply_to_the_prompt_is(
+    feed, updates, seed, dp, bot, frozen
+) -> None:
+    created = await seed.item()
+    await feed(updates.callback(ItemCb(a="title", id=created.item.id), message_id=931))
+    frozen.advance(minutes=6)
+    await feed(updates.message("хлеб купить"))
+
+    assert (await _item(seed, created.item.id)).title == "Купить наушники"
+    [raw] = await seed.raws()
+    assert raw.text == "хлеб купить"
+    assert await _state(dp, bot) is None
+
+    await feed(updates.callback(ItemCb(a="title", id=created.item.id), message_id=931))
+    frozen.advance(minutes=10)
+    await feed(updates.message("Наушники Sony", reply_to=931))  # an explicit reply to the prompt still counts
+
+    assert (await _item(seed, created.item.id)).title == "Наушники Sony"
+    assert len(await seed.raws()) == 1
+
+
+async def test_voice_answer_to_the_time_prompt_is_an_edit_of_the_item(feed, updates, seed, tg, dp, bot) -> None:
+    created = await seed.item("Созвон")
+    await feed(updates.callback(ItemCb(a="time", id=created.item.id), message_id=932))
+
+    voice = updates.message(voice=Voice(file_id="v1", file_unique_id="uv1", duration=2))
+    await feed(voice)
+
+    [raw] = await seed.raws()
+    assert (raw.content_type, raw.reply_item_id) == ("voice", created.item.id)
+    [job] = await seed.jobs()
+    assert (job.kind, job.payload) == ("edit", {"raw_id": raw.id, "item_id": created.item.id})
+    assert await _state(dp, bot) is None
+    assert tg.edits[-1].message_id == 932 and tg.edits[-1].text.startswith("📌 <b>Созвон</b>")
+    assert tg.reactions == [(voice.message.message_id, REACT_SEEN)]
+
+    await feed(updates.message("хлеб купить"))  # the dialog is closed: a new note, not "перенеси на: хлеб купить"
+    assert [j.kind for j in await seed.jobs()] == ["edit", "message"]
 
 
 async def test_expired_prompt_lets_the_text_through(feed, updates, seed, tg, dp, bot, frozen) -> None:

@@ -4,12 +4,20 @@
 1. reminders stuck in ``sending`` for over 2 min (the process died mid-send) -> ``pending``;
 2. claim due ``pending`` reminders (SKIP LOCKED, <= 20): item deleted / occurrence not open -> ``cancelled``;
    older than ``prefs.missed_grace_minutes`` -> ``missed`` (it shows up in the evening digest instead);
-   otherwise send ``views.reminder_message`` -> ``sent`` + ``tg_message_id``; a send error -> attempts + 1 and back
-   to ``pending`` (``failed`` after 5);
+   an automatic one (``auto``) that comes due late, inside quiet hours (the bot was down) -> back to ``pending`` at
+   the end of quiet hours, or ``missed`` if that is beyond the grace;
+   otherwise send ``views.reminder_message`` -> ``sent`` + ``tg_message_id``. A transient send error (network,
+   Telegram 5xx or flood control, a dropped DB connection) -> back to ``pending`` without using up an attempt, and
+   the rest of the claimed batch waits for the next tick: it is retried every tick until it is sent or missed. Any
+   other error -> attempts + 1 and back to ``pending`` (``failed`` after 5);
 3. ``items.ensure_recurring`` (next instances of series);
-4. digests: target = ``shift_out_of_quiet(local digest time)``, window [target, target + 3 h), at most once per
-   kind and day via ``once_keys`` ``digest:{kind}:{YYYY-MM-DD}``; an empty digest is not sent;
+4. digests: target = ``shift_out_of_quiet(local digest time)``, window [target, target + 3 h), never sent inside
+   quiet hours (a digest that is late into them is dropped once its window closes), at most once per kind and
+   day via ``once_keys`` ``digest:{kind}:{YYYY-MM-DD}``; an empty digest is not sent;
 5. heartbeat file (its mtime feeds the Docker healthcheck).
+
+``run`` registers with ``ctx.watchdog`` and beats before every tick, step and reminder. Silence for
+``stall_limit_s`` means the loop is stuck (no single step legitimately takes that long): the process exits.
 
 Delivery is at-least-once: a crash between Telegram's answer and the commit resends after recovery.
 Each step is isolated: a failure is logged and the next step still runs.
@@ -24,7 +32,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 
+from aiogram.exceptions import TelegramEntityTooLarge, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import InterfaceError, OperationalError
 
 from dumpbot import clock
 from dumpbot.bot import sender, views
@@ -35,7 +45,7 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.services import digest, items
 from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, try_once
 
-__all__ = ["CLAIM_LIMIT", "DIGEST_WINDOW", "MAX_SEND_ATTEMPTS", "STUCK_AFTER", "Scheduler"]
+__all__ = ["CLAIM_LIMIT", "DIGEST_WINDOW", "MAX_SEND_ATTEMPTS", "STALL_AFTER", "STUCK_AFTER", "Scheduler"]
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +55,19 @@ MAX_SEND_ATTEMPTS: Final = 5
 DIGEST_WINDOW: Final = timedelta(hours=3)
 DIGEST_KINDS: Final = ("morning", "evening")
 MIN_SLEEP_S: Final = 0.2
+# Watchdog limit (at least 3 intervals). The longest legitimate step is one send under flood control: 4 requests
+# that may each take 60 s to time out, with flood waits of up to 60 s between them (about 7 min).
+STALL_AFTER: Final = timedelta(minutes=15)
+WATCH_NAME: Final = "scheduler"
+# Errors that say nothing about the reminder itself: retried until it is sent or missed, never counted.
+TRANSIENT_ERRORS: Final = (
+    TelegramNetworkError,
+    TelegramServerError,
+    TelegramRetryAfter,
+    OSError,
+    OperationalError,
+    InterfaceError,
+)
 
 
 class Scheduler:
@@ -52,10 +75,16 @@ class Scheduler:
         self._ctx = ctx
         self._backlog = False  # more due reminders than one claim takes: tick again right away
 
+    @property
+    def stall_limit_s(self) -> float:
+        return max(STALL_AFTER.total_seconds(), 3 * float(self._ctx.settings.scheduler_interval_s))
+
     async def run(self) -> None:
         """Forever: tick, then sleep until min(interval, next pending fire_at) or ``ctx.scheduler_wakeup``."""
         log.info("scheduler started")
+        self._ctx.watchdog.watch(WATCH_NAME, self.stall_limit_s)
         while True:
+            self._alive()
             self._ctx.scheduler_wakeup.clear()  # before the tick: a wakeup during it is not lost
             try:
                 await self.tick(clock.utcnow())
@@ -83,7 +112,11 @@ class Scheduler:
 
     # --- steps ------------------------------------------------------------------------------------------------
 
+    def _alive(self) -> None:
+        self._ctx.watchdog.beat(WATCH_NAME)
+
     async def _step(self, name: str, step: Awaitable[None]) -> None:
+        self._alive()
         try:
             await step
         except Exception as e:
@@ -111,8 +144,26 @@ class Scheduler:
     async def _send_due(self, now: datetime, prefs: Prefs) -> None:
         ids = await self._claim(now)
         self._backlog = len(ids) >= CLAIM_LIMIT
-        for reminder_id in ids:
-            await self._deliver(reminder_id, now, prefs)
+        for n, reminder_id in enumerate(ids):
+            self._alive()
+            if not await self._deliver(reminder_id, now, prefs):
+                # Telegram is unreachable: the others would fail too (each send may take a minute to time out),
+                # and an immediate backlog tick would spin. They wait for the next regular tick.
+                self._backlog = False
+                await self._unclaim(ids[n + 1 :])
+                return
+
+    async def _unclaim(self, ids: list[int]) -> None:
+        if not ids:
+            return
+        async with self._ctx.sessionmaker() as session:
+            await session.execute(
+                update(Reminder)
+                .where(Reminder.id.in_(ids), Reminder.status == "sending")
+                .values(status="pending", claimed_at=None)
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
 
     async def _claim(self, now: datetime) -> list[int]:
         due = (
@@ -135,8 +186,12 @@ class Scheduler:
             await session.commit()
         return [row.id for row in sorted(rows, key=lambda r: (r.fire_at, r.id))]
 
-    async def _deliver(self, reminder_id: int, now: datetime, prefs: Prefs) -> None:
-        """One claimed reminder: cancel / miss / send. Never raises (a failure counts as a send attempt)."""
+    async def _deliver(self, reminder_id: int, now: datetime, prefs: Prefs) -> bool:
+        """One claimed reminder: cancel / miss / send. Returns False after a transient send failure.
+
+        Only raises when the outcome cannot be recorded (the DB is down): the reminder then stays ``sending`` and
+        is recovered after ``STUCK_AFTER``.
+        """
         try:
             async with self._ctx.sessionmaker() as session:
                 stmt = (
@@ -147,15 +202,26 @@ class Scheduler:
                 )
                 row = (await session.execute(stmt)).one_or_none()
                 if row is None:
-                    return
+                    return True
                 reminder, occ, item = row
                 if item.status == "deleted" or occ.status != "open":
                     await self._finish(reminder_id, status="cancelled")
-                    return
-                if now - reminder.fire_at > timedelta(minutes=prefs.missed_grace_minutes):
+                    return True
+                grace = timedelta(minutes=prefs.missed_grace_minutes)
+                if now - reminder.fire_at > grace:
                     log.info("reminder %s missed (fire_at %s)", reminder_id, reminder.fire_at.isoformat())
                     await self._finish(reminder_id, status="missed")
-                    return
+                    return True
+                if reminder.auto and quiet.in_quiet_hours(now, prefs):
+                    # Planned outside quiet hours but due late (downtime, a sleeping PC): automatic messages
+                    # wait for the end of quiet hours, unless they would be too stale by then.
+                    later = quiet.shift_out_of_quiet(now, prefs)
+                    if later - reminder.fire_at > grace:
+                        await self._finish(reminder_id, status="missed")
+                    else:
+                        await self._finish(reminder_id, status="pending", fire_at=later)
+                    log.info("automatic reminder %s not sent in quiet hours", reminder_id)
+                    return True
                 text, markup = views.reminder_message(item, occ, reminder, prefs, now)
                 item_id, occ_id = item.id, occ.id
             # No transaction is held while waiting for Telegram.
@@ -163,24 +229,36 @@ class Scheduler:
                 self._ctx, text, markup, purpose="reminder", item_id=item_id, occurrence_id=occ_id
             )
         except Exception as e:
-            await self._send_failed(reminder_id, e)
-            return
+            return await self._send_failed(reminder_id, e)
         await self._finish(reminder_id, status="sent", sent_at=now, tg_message_id=message_id)
         log.info("reminder %s sent", reminder_id)
+        return True
 
-    async def _send_failed(self, reminder_id: int, error: Exception) -> None:
+    async def _send_failed(self, reminder_id: int, error: Exception) -> bool:
+        """Back to ``pending``. Only an error that is not transient uses up an attempt (``failed`` after
+        ``MAX_SEND_ATTEMPTS``): outages are waited out up to ``missed_grace_minutes``. Returns False if transient."""
+        transient = _is_transient(error)
         async with self._ctx.sessionmaker() as session:
             reminder = await session.get(Reminder, reminder_id)
             if reminder is None:
-                return
-            reminder.attempts = (reminder.attempts or 0) + 1
+                return not transient
+            if not transient:
+                reminder.attempts = (reminder.attempts or 0) + 1
             reminder.status = "failed" if reminder.attempts >= MAX_SEND_ATTEMPTS else "pending"
             reminder.claimed_at = None
             attempts, status = reminder.attempts, reminder.status
             await session.commit()
-        log.warning(
-            "reminder %s: send failed (attempt %d, now %s): %s", reminder_id, attempts, status, describe_error(error)
-        )
+        if transient:
+            log.warning("reminder %s: send failed, retrying on the next tick: %s", reminder_id, describe_error(error))
+        else:
+            log.warning(
+                "reminder %s: send failed (attempt %d, now %s): %s",
+                reminder_id,
+                attempts,
+                status,
+                describe_error(error),
+            )
+        return not transient
 
     async def _finish(self, reminder_id: int, **values: object) -> None:
         async with self._ctx.sessionmaker() as session:
@@ -211,7 +289,8 @@ class Scheduler:
                 nominal = timeresolve.localize(day, at, tz).astimezone(UTC)
                 target = quiet.shift_out_of_quiet(nominal, prefs)
                 if target <= now < target + DIGEST_WINDOW:
-                    await self._send_digest(kind, day.isoformat(), nominal, now, prefs)
+                    if not quiet.in_quiet_hours(now, prefs):  # late into quiet hours (the bot was down): dropped
+                        await self._send_digest(kind, day.isoformat(), nominal, now, prefs)
                     break
 
     async def _send_digest(self, kind: str, day: str, nominal: datetime, now: datetime, prefs: Prefs) -> None:
@@ -253,6 +332,11 @@ class Scheduler:
         if nxt is None:
             return interval
         return max(MIN_SLEEP_S, min(interval, (nxt - now).total_seconds()))
+
+
+def _is_transient(error: BaseException) -> bool:
+    """Telegram, the network or the DB connection is temporarily unavailable (a 413 is about the content)."""
+    return isinstance(error, TRANSIENT_ERRORS) and not isinstance(error, TelegramEntityTooLarge)
 
 
 def _write_heartbeat(path: str, now: datetime) -> None:

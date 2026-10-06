@@ -28,9 +28,10 @@ AskCb     ``a:<raw id>:<n>``            Answer option ``n`` (index in ``Ask.opti
                                         about raw message ``raw`` (-> job "clarify")
 PickCb    ``p:<raw id>:<item id>``      The user picked ``item`` among edit candidates for raw message ``raw``
                                         (-> job "edit")
-DigestCb  ``d:<a>``                     Digest actions: ``tmr`` = move the not-done occurrences of the digest's
-                                        day to tomorrow. The digest day is the local date of the digest message
-                                        (``callback.message.date``), not the time of the button press.
+DigestCb  ``d:<a>:<YYYYMMDD>``          Digest actions: ``tmr`` = move the not-done occurrences of the digest's
+                                        day ``d`` (already due) to the day after. A digest delayed by quiet hours
+                                        arrives the next morning, so the day is in the data; buttons sent before
+                                        it was (``d:tmr``) use the local date of the digest message.
 SetCb     ``s:<key>:<v>``               Settings menu; every key/value is documented in ``bot.views``.
 ========  ============================  =============================================================================
 """
@@ -50,6 +51,7 @@ OCC_ACTIONS: Final[frozenset[str]] = frozenset({"done", "undone", "s15", "s60", 
 # Snooze actions -> minutes (None = tomorrow, same local time).
 SNOOZE_MINUTES: Final[dict[str, int | None]] = {"s15": 15, "s60": 60, "tmr": None}
 DIGEST_ACTIONS: Final[frozenset[str]] = frozenset({"tmr"})
+DIGEST_DAY_FMT: Final = "%Y%m%d"  # DigestCb.d
 
 
 class ItemCb(CallbackData, prefix="i"):
@@ -84,6 +86,7 @@ class PickCb(CallbackData, prefix="p"):
 
 class DigestCb(CallbackData, prefix="d"):
     a: str
+    d: str = ""  # the digest's local day, DIGEST_DAY_FMT
 
 
 class SetCb(CallbackData, prefix="s"):

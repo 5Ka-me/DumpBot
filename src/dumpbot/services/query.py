@@ -33,6 +33,7 @@ __all__ = [
     "UsageSummary",
     "agenda",
     "find_edit_candidates",
+    "items_of_raw",
     "open_tasks",
     "recent",
     "recurring",
@@ -140,6 +141,16 @@ async def recurring(session: AsyncSession) -> list[Row]:
     return await _item_rows(session, stmt)
 
 
+async def items_of_raw(session: AsyncSession, raw_ids: Sequence[int]) -> list[Row]:
+    """Not deleted items saved from these raw messages (a message or the parts of an album), oldest first, with
+    their current occurrence."""
+    if not raw_ids:
+        return []
+    occ = _occ_subquery(open_only=False)
+    stmt = _item_select(occ).where(Item.raw_message_id.in_(list(raw_ids)), Item.status != "deleted").order_by(Item.id)
+    return await _item_rows(session, stmt)
+
+
 # --- search ----------------------------------------------------------------------------------------------------
 
 
@@ -161,26 +172,28 @@ async def search(session: AsyncSession, text: str, limit: int = 20) -> list[Row]
 
 
 async def find_edit_candidates(
-    session: AsyncSession, hint: str, prefs: Prefs, now: datetime, limit: int = 5
+    session: AsyncSession, hint: str, prefs: Prefs, now: datetime, limit: int = 5, *, exact: bool = False
 ) -> list[Row]:
     """Items an edit like "перенеси встречу с Олегом" may refer to: open or touched in the last 30 days, not
     deleted, matching ``hint``; the nearest open occurrence (by |due - now|) first, then rank.
 
-    All words must match; if nothing does, any word may (stop words are ignored by the FTS config).
+    All words must match (or a tag equals one of them); if nothing does, any word may (stop words are ignored by
+    the FTS config). ``exact=True`` (an optional extension of the contract): only items that match every word
+    (full text) or whose title contains the hint — no tag-only match, no any-word fallback.
     """
     hint = (hint or "").strip()
     if not hint:
         return []
     now = _utc(now)
-    rows = await _edit_candidates(session, hint, _tsquery(hint), now, limit)
+    rows = await _edit_candidates(session, hint, _tsquery(hint), now, limit, tags=not exact)
     words = [w for w in _WORD_RE.findall(hint) if w.lower() != "or"]
-    if not rows and len(words) > 1:
+    if not rows and len(words) > 1 and not exact:
         rows = await _edit_candidates(session, hint, _tsquery(" or ".join(words)), now, limit)
     return rows
 
 
 async def _edit_candidates(
-    session: AsyncSession, hint: str, tsq: ColumnElement[Any], now: datetime, limit: int
+    session: AsyncSession, hint: str, tsq: ColumnElement[Any], now: datetime, limit: int, *, tags: bool = True
 ) -> list[Row]:
     cutoff = now - timedelta(days=EDIT_WINDOW_DAYS)
     occ = _occ_subquery(open_only=True)
@@ -190,7 +203,7 @@ async def _edit_candidates(
         .where(
             Item.status != "deleted",
             or_(Item.status == "open", Item.created_at >= cutoff, Item.updated_at >= cutoff),
-            _matches(hint, tsq),
+            _matches(hint, tsq, tags=tags),
         )
         .order_by(
             distance.asc().nulls_last(),
@@ -407,15 +420,15 @@ def _tsquery(text: str) -> ColumnElement[Any]:
     return func.websearch_to_tsquery(_RU, text)
 
 
-def _matches(text: str, tsq: ColumnElement[Any]) -> ColumnElement[bool]:
-    """FTS match OR title contains the phrase OR a tag equals one of the words."""
+def _matches(text: str, tsq: ColumnElement[Any], *, tags: bool = True) -> ColumnElement[bool]:
+    """FTS match OR title contains the phrase OR (``tags``) a tag equals one of the words."""
     conds: list[ColumnElement[bool]] = [
         Item.search_tsv.op("@@", is_comparison=True)(tsq),
         Item.title.ilike(f"%{_escape_like(text)}%", escape="\\"),
     ]
-    tags = list(dict.fromkeys(w.lower() for w in re.findall(r"#?(\w+)", text)))
-    if tags:
-        conds.append(Item.tags.overlap(tags))
+    words = list(dict.fromkeys(w.lower() for w in re.findall(r"#?(\w+)", text))) if tags else []
+    if words:
+        conds.append(Item.tags.overlap(words))
     return or_(*conds)
 
 

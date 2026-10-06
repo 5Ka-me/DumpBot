@@ -3,8 +3,9 @@
 The LLM only *describes* time ("day" + "time" slot/HH:MM + offsets); exact datetimes are computed
 deterministically in ``domain.timeresolve`` using the user's preferences and IANA timezone.
 
-Validation is lenient on input (unknown keys ignored, tags normalized) but the generated JSON schema is
-strict (``additionalProperties: false``) to steer constrained decoding.
+Validation is lenient on input (unknown keys ignored, tags normalized, over-long strings and lists clipped to their
+``max_length``) but the generated JSON schema is strict (``additionalProperties: false``, ``maxLength`` /
+``maxItems``) to steer constrained decoding. One long link title or an extra tag must never fail the whole message.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic.fields import FieldInfo
 
 from dumpbot.domain.kinds import Kind
 
@@ -37,10 +39,30 @@ RANGE_RE = (
 )
 
 MAX_LEAD_MINUTES = 43200  # 30 days
+MAX_ITEMS = 20  # the prompt asks to merge long shopping lists into one item well before this
 
 
 class _S(BaseModel):
     model_config = ConfigDict(extra="ignore", json_schema_extra={"additionalProperties": False})
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clip_overlong(cls, data: Any) -> Any:
+        """Strings over a field's ``max_length`` end with "…", lists keep their first ``max_length`` elements."""
+        if not isinstance(data, dict):
+            return data
+        clipped = dict(data)
+        for name, info in cls.model_fields.items():
+            value, limit = clipped.get(name), _max_length(info)
+            if limit is None or not isinstance(value, str | list) or len(value) <= limit:
+                continue
+            clipped[name] = value[: limit - 1].rstrip() + "…" if isinstance(value, str) else value[:limit]
+        return clipped
+
+
+def _max_length(info: FieldInfo) -> int | None:
+    """The ``max_length`` constraint of a string / list field, if any."""
+    return next((m.max_length for m in info.metadata if isinstance(getattr(m, "max_length", None), int)), None)
 
 
 def _norm_tags(v: Any) -> list[str]:
@@ -89,7 +111,7 @@ class ExtractedItem(_S):
 class Ask(_S):
     """A clarifying question with quick-reply options (e.g. "В 8 утра или вечера?")."""
 
-    item: int = Field(0, ge=0, le=7, description="index in items the question is about")
+    item: int = Field(0, ge=0, le=MAX_ITEMS - 1, description="index in items the question is about")
     q: str = Field(min_length=1, max_length=160)
     options: list[str] = Field(min_length=2, max_length=4)
 
@@ -138,7 +160,7 @@ class ImageInfo(_S):
 
 class Extraction(_S):
     intent: Literal["save", "query", "edit"] = "save"
-    items: list[ExtractedItem] = Field(default_factory=list, max_length=8)
+    items: list[ExtractedItem] = Field(default_factory=list, max_length=MAX_ITEMS)
     query: QuerySpec | None = None
     edit: EditPatch | None = None
     image: ImageInfo | None = None

@@ -10,10 +10,11 @@ from typing import TYPE_CHECKING, Any, Final
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import CallbackQuery, Message
 
+from dumpbot import clock
 from dumpbot.bot import sender, views
 from dumpbot.bot.cbdata import ItemCb
 from dumpbot.bot.keyboards import button, markup
-from dumpbot.bot.states import EditStates, SettingsStates
+from dumpbot.bot.states import ANSWER_TTL, PROMPT_TTL, EditStates, SettingsStates, expired
 from dumpbot.domain.recurrence import describe_rrule_ru
 from dumpbot.services import items
 
@@ -113,6 +114,30 @@ def command_args(message: Message) -> str:
     """Text after the command (``/search  foo bar`` -> ``foo bar``)."""
     parts = (message.text or message.caption or "").split(maxsplit=1)
     return parts[1].strip() if len(parts) > 1 else ""
+
+
+def is_answer(message: Message, data: dict[str, Any]) -> bool:
+    """Whether ``message`` answers the prompt of the open input dialog (``data``): written by the owner (not
+    forwarded), not a "?" question, and a reply to the prompt within ``PROMPT_TTL`` or a message that replies to
+    nothing within ``ANSWER_TTL``. A reply to another message (a card, the owner's own note) is never the answer."""
+    if message.forward_origin is not None or (message.text or message.caption or "").lstrip().startswith("?"):
+        return False
+    replied = message.reply_to_message
+    if replied is None:
+        return not expired(data, ANSWER_TTL)
+    return replied.message_id == data.get("prompt_id") and not expired(data, PROMPT_TTL)
+
+
+async def leave_dialog(ctx: AppContext, state: FSMContext) -> bool:
+    """Close the input dialog because the message is not its answer (the prompt turns back into the card / menu);
+    the caller then lets the message go on to capture. False when it was closed already (by an earlier handler of
+    the same message: the routers' fallbacks still see the state the update came in with)."""
+    if await state.get_state() is None:
+        return False
+    async with ctx.sessionmaker() as session:
+        prefs = await ctx.prefs(session)
+        await session.commit()
+    return await restore_prompt(ctx, state, prefs, clock.utcnow())
 
 
 async def is_prompt(state: FSMContext, message_id: int | None, group: type[StatesGroup]) -> bool:

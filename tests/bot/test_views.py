@@ -78,14 +78,13 @@ def test_item_card_purchase_with_reminder(prefs, now, at, make_item, make_occ, m
         "⏰ сегодня 15:00 · напомню в 14:55",
         "🏷 Покупка · #электроника #sony",
     ]
+    # no [✅ Готово] on the "saved" card: it is on reminders and in the edit menu
     assert buttons(kb) == [
-        ("✅ Готово", "o:done:10"),
         ("✏️ Изменить", "i:edit:1"),
         ("🔕 Без напоминания", "i:norem:1"),
         ("🗑 Удалить", "i:del:1"),
     ]
-    assert kb.inline_keyboard[0][0].style == "success"
-    assert kb.inline_keyboard[1][-1].style == "danger"
+    assert kb.inline_keyboard[0][-1].style == "danger"
 
 
 def test_item_card_several_reminders(prefs, now, at, make_item, make_occ, make_reminder, check_view):
@@ -136,6 +135,13 @@ def test_item_card_default_time(prefs, now, at, make_item, make_occ, make_remind
     assert "⏰ без срока · напомню сегодня в 19:00" in text
 
 
+def test_item_card_cancelled_default_time_shows_no_time(prefs, now, at, make_item, make_occ):
+    # A task without a time turned into an idea: its 19:00 default occurrence is cancelled.
+    occ = make_occ(at(2026, 10, 6, 19, 0), precision="default", status="cancelled")
+    text, _ = views.item_card(make_item(kind="idea"), occ, [], prefs, now)
+    assert "⏰" not in text
+
+
 def test_item_card_date_precision(prefs, now, at, make_item, make_occ, make_reminder):
     occ = make_occ(at(2026, 10, 12, 10, 0), precision="date")
     text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 0, auto=True)], prefs, now)
@@ -170,9 +176,20 @@ def test_item_card_done_item_without_occurrence(prefs, now, make_item, buttons):
     assert all(label not in ("✅ Готово", "↩️ Не сделано") for label, _ in buttons(kb))
 
 
-def test_item_card_actionable_without_occurrence_uses_item_done(prefs, now, make_item, buttons):
-    _, kb = views.item_card(make_item(id=BIG), None, [], prefs, now)
+def test_item_card_has_no_done_button(prefs, now, at, make_item, make_occ, buttons):
+    occ = make_occ(at(2026, 10, 6, 15, 0))
+    for o in (occ, None):
+        _, kb = views.item_card(make_item(id=BIG), o, [], prefs, now)
+        assert all(label != "✅ Готово" for label, _ in buttons(kb))
+
+
+def test_edit_menu_has_done_for_open_actionable(make_item, buttons):
+    _, kb = views.edit_menu(make_item(id=BIG))
     assert buttons(kb)[0] == ("✅ Готово", f"i:done:{BIG}")
+    assert kb.inline_keyboard[0][0].style == "success"
+    for item in (make_item(status="done"), make_item(kind="note", title="Мысль")):
+        _, kb = views.edit_menu(item)
+        assert all(label != "✅ Готово" for label, _ in buttons(kb))
 
 
 def test_item_card_note_has_no_done_button(prefs, now, make_item, check_view, buttons):
@@ -263,9 +280,10 @@ def test_deleted_card(make_item, check_view, buttons):
 def test_edit_menu(make_item, check_view, buttons):
     _, kb = check_view(views.edit_menu(make_item(id=BIG)))
     assert [cb for _, cb in buttons(kb)] == [
-        ItemCb(a=a, id=BIG).pack() for a in ("time", "kind", "tags", "title", "lead", "back")
+        ItemCb(a=a, id=BIG).pack() for a in ("done", "time", "kind", "tags", "title", "lead", "back")
     ]
     assert [label for label, _ in buttons(kb)] == [
+        "✅ Готово",
         "🕒 Время",
         "🏷 Категория",
         "#️⃣ Теги",
@@ -290,6 +308,7 @@ def test_lead_menu(make_item, check_view, buttons):
     assert [cb for _, cb in flat[:-1]] == [LeadCb(id=BIG, m=m).pack() for m in (0, 5, 15, 30, 60, 1440)]
     assert ("✓ 1 ч", f"l:{BIG}:60") in flat and ("✓ 1 дн", f"l:{BIG}:1440") in flat
     assert "как в настройках" in views.lead_menu(make_item())[0]
+    assert "Сейчас: напоминания выключены" in views.lead_menu(make_item(lead_minutes=[]))[0]  # after 🔕
 
 
 # --- reminders ---------------------------------------------------------------------------------------------------
@@ -475,7 +494,45 @@ def test_evening_digest(prefs, at, make_row, check_view, buttons):
         "<b>Просрочено</b>",
         "⬜ ср 7 окт 19:00 · 📌 Сдать отчёт",
     ]
-    assert buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr").pack())]
+    assert buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261009").pack())]
+
+
+def test_evening_digest_keeps_items_still_ahead_tonight_apart(prefs, at, make_row, check_view, buttons):
+    now = at(2026, 10, 9, 21, 0)
+    agenda = _agenda(
+        done=[make_row(title="Отчёт", occ_status="done", due_at=at(2026, 10, 9, 13, 0))],
+        open=[
+            make_row(title="Позвонить маме", due_at=at(2026, 10, 9, 19, 0)),
+            make_row(title="Таблетки", due_at=at(2026, 10, 9, 22, 0), rrule="FREQ=DAILY"),
+        ],
+    )
+    text, kb = check_view(views.evening_digest(DigestData(kind="evening", agenda=agenda), prefs, now))
+    assert lines(text) == [
+        "🌙 <b>Итоги дня</b>, пт 9 окт",
+        "Сделано 1 из 2",
+        "",
+        "<b>Сделано</b>",
+        "✅ 📌 <s>Отчёт</s>",
+        "",
+        "<b>Не сделано</b>",
+        "⬜ 19:00 · 📌 Позвонить маме",
+        "",
+        "<b>Ещё сегодня</b>",
+        "🕒 22:00 · 📌 Таблетки 🔁",
+    ]
+    assert buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261009").pack())]
+
+
+def test_evening_digest_with_only_items_ahead_has_no_button(prefs, at, make_row, check_view):
+    now = at(2026, 10, 9, 21, 0)
+    agenda = _agenda(
+        done=[make_row(title="Отчёт", occ_status="done", due_at=at(2026, 10, 9, 13, 0))],
+        open=[make_row(title="Таблетки", due_at=at(2026, 10, 9, 22, 0))],
+    )
+    text, kb = check_view(views.evening_digest(DigestData(kind="evening", agenda=agenda), prefs, now))
+    assert lines(text)[1] == "Сделано 1 из 1"
+    assert "<b>Ещё сегодня</b>" in text and "Не сделано" not in text
+    assert kb is None
 
 
 def test_evening_digest_all_done_has_no_button(prefs, at, make_row, check_view):

@@ -110,12 +110,13 @@ async def test_undone_on_a_reminder_shows_the_reminder_again(feed, updates, seed
 
 @pytest.mark.parametrize(("action", "delta"), [("s15", timedelta(minutes=15)), ("s60", timedelta(hours=1))])
 async def test_snooze_minutes(feed, updates, seed, tg, frozen, ctx, action, delta) -> None:
-    created = await seed.item()
+    created = await seed.item()  # tomorrow 13:00, reminder tomorrow 12:55
 
     await feed(updates.callback(OccCb(a=action, id=created.occurrence.id)))
 
-    [reminder] = await _pending(seed, created.occurrence.id)
-    assert reminder.fire_at == frozen.now + delta
+    snoozed, planned = await _pending(seed, created.occurrence.id)
+    assert snoozed.fire_at == frozen.now + delta
+    assert planned.fire_at == created.reminders[0].fire_at  # a later reminder is not replaced by the snooze
     assert tg.toasts[0].startswith("⏰ Напомню сегодня")
     assert "💤 отложено" in tg.edits[0].text
     assert ctx.scheduler_wakeup.is_set()
@@ -129,6 +130,25 @@ async def test_snooze_to_tomorrow(feed, updates, seed, tg, frozen) -> None:
     [reminder] = await _pending(seed, created.occurrence.id)
     assert reminder.fire_at == created.occurrence.due_at + timedelta(days=1)
     assert tg.toasts[0].startswith("⏰ Напомню завтра")
+
+
+async def test_snooze_to_tomorrow_of_a_daily_instance_points_done_at_tomorrows(
+    feed, updates, seed, tg, frozen, get_buttons
+) -> None:
+    created = await seed.item("Таблетки", when=When(text="каждый день в 11", time="11:00"), rrule="FREQ=DAILY")
+    frozen.advance(hours=1, minutes=1)  # Tue 11:01: the reminder was sent, Wednesday's instance exists
+    async with seed.sessionmaker() as s:
+        await items.ensure_recurring(s, Prefs(), frozen.now)
+        await s.commit()
+    await seed.bot_message(903, purpose="reminder", item_id=created.item.id, occurrence_id=created.occurrence.id)
+
+    await feed(updates.callback(OccCb(a="tmr", id=created.occurrence.id), message_id=903))
+
+    tuesday, wednesday = await _occurrences(seed, created.item.id)
+    assert (tuesday.status, wednesday.status) == ("cancelled", "open")
+    [reminder] = await _pending(seed, wednesday.id)
+    assert reminder.fire_at == wednesday.due_at
+    assert get_buttons(tg.edits[0].reply_markup) == [("✅ Готово", OccCb(a="done", id=wednesday.id).pack())]
 
 
 async def test_snooze_of_a_done_occurrence_does_not_add_reminders(feed, updates, seed, tg, frozen) -> None:
@@ -262,6 +282,19 @@ async def test_kind_change_to_actionable_adds_the_default_reminder(feed, updates
     assert ctx.scheduler_wakeup.is_set()
 
 
+async def test_kind_change_of_a_task_without_time_to_idea_drops_its_19_reminder(feed, updates, seed, tg) -> None:
+    created = await seed.item("Открыть кофейню", timed=False)  # task without a time: today 19:00
+    assert created.occurrence.precision == "default"
+
+    await feed(updates.callback(KindCb(id=created.item.id, k="idea")))
+
+    assert await _pending(seed, created.occurrence.id) == []
+    assert (await _occ(seed, created.occurrence.id)).status == "cancelled"
+    [card] = tg.edits
+    assert card.text.startswith("💡 <b>Открыть кофейню</b>")
+    assert "⏰" not in card.text and "19:00" not in card.text
+
+
 async def test_unknown_kind_is_stale(feed, updates, seed, tg) -> None:
     created = await seed.item()
     await feed(updates.callback(KindCb(id=created.item.id, k="banana")))
@@ -286,6 +319,26 @@ async def test_lead_zero(feed, updates, seed, tg) -> None:
     [reminder] = await _pending(seed, created.occurrence.id)
     assert reminder.fire_at == created.occurrence.due_at
     assert tg.toasts == ["⏱ Напомню в момент события"]
+
+
+async def test_lead_on_an_item_without_an_exact_time_tells_the_real_reminder(feed, updates, seed, tg) -> None:
+    created = await seed.item("Позвонить маме", when=When(text="завтра", day="+1"))  # bare date: 10:00, auto
+
+    await feed(updates.callback(LeadCb(id=created.item.id, m=30)))
+
+    [reminder] = await _pending(seed, created.occurrence.id)
+    assert reminder.fire_at == created.occurrence.due_at
+    assert tg.toasts == ["⏱ У записи нет точного времени — напомню завтра 10:00"]
+
+
+async def test_lead_on_a_relative_time_is_honoured(feed, updates, seed, tg) -> None:
+    created = await seed.item("Созвон", kind="event", when=When(text="через 2 часа", in_min=120))
+
+    await feed(updates.callback(LeadCb(id=created.item.id, m=30)))
+
+    [reminder] = await _pending(seed, created.occurrence.id)
+    assert reminder.fire_at == created.occurrence.due_at - timedelta(minutes=30)
+    assert tg.toasts == ["⏱ Напомню за 30 мин"]
 
 
 async def test_item_done_without_occurrence(feed, updates, seed, tg) -> None:
@@ -393,7 +446,7 @@ async def test_digest_moves_not_done_to_tomorrow(feed, updates, seed, tg, frozen
     async with seed.sessionmaker() as s:
         data = await digest.build_digest(s, "evening", Prefs(), evening)
     text, kb = views.evening_digest(data, Prefs(), evening)
-    assert get_buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr").pack())]
+    assert get_buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261006").pack())]
 
     await feed(updates.callback(DigestCb(a="tmr"), text=text, date=evening, reply_markup=kb))
 
@@ -408,6 +461,59 @@ async def test_digest_moves_not_done_to_tomorrow(feed, updates, seed, tg, frozen
     assert "Сделанное" in edit.text
     assert edit.reply_markup is None
     assert ctx.scheduler_wakeup.is_set()
+
+
+async def test_digest_leaves_items_still_ahead_tonight(feed, updates, seed, tg, frozen) -> None:
+    # 21:05: "Перенести невыполненное" postpones the afternoon task, not tonight's 22:00 pills and their reminder.
+    afternoon = await seed.item("Позвонить", when=When(text="сегодня в 15", time="15:00"))
+    pills = await seed.item("Таблетки", when=When(text="перед сном", time="night"), rrule="FREQ=DAILY")
+    frozen.advance(hours=11, minutes=5)
+
+    await feed(updates.callback(DigestCb(a="tmr", d="20261006"), date=frozen.now - timedelta(minutes=5)))
+
+    assert (await _occ(seed, afternoon.occurrence.id)).due_at == afternoon.occurrence.due_at + timedelta(days=1)
+    tonight = await _occ(seed, pills.occurrence.id)
+    assert (tonight.due_at, tonight.status) == (pills.occurrence.due_at, "open")
+    [reminder] = await _pending(seed, tonight.id)
+    assert reminder.fire_at == pills.occurrence.due_at - timedelta(minutes=5)  # 21:55 tonight
+    assert tg.toasts == ["📅 Перенёс на завтра: 1"]
+    assert "Ещё сегодня" in tg.edits[0].text and "Таблетки" in tg.edits[0].text
+
+
+async def test_digest_delayed_by_quiet_hours_moves_its_own_day(feed, updates, seed, tg, frozen) -> None:
+    # Tuesday's digest arrives Wed 08:00 (evening digest time inside quiet hours): Wednesday's meeting stays put.
+    tuesday = await seed.item("Задача вторника", when=When(text="сегодня в 15", time="15:00"))
+    wednesday = await seed.item("Встреча", when=When(text="завтра в 11", day="+1", time="11:00"))
+    wed_8 = frozen.advance(hours=22)
+
+    await feed(updates.callback(DigestCb(a="tmr", d="20261006"), date=wed_8))
+
+    moved = await _occ(seed, tuesday.occurrence.id)
+    assert moved.due_at == tuesday.occurrence.due_at + timedelta(days=1)  # Wed 15:00
+    meeting = await _occ(seed, wednesday.occurrence.id)
+    assert meeting.due_at == wednesday.occurrence.due_at
+    assert [r.fire_at for r in await _pending(seed, meeting.id)] == [wednesday.reminders[0].fire_at]
+    assert tg.toasts == ["📅 Перенёс на завтра: 1"]
+    assert tg.edits[0].text.startswith("🌙 <b>Итоги дня</b>, вт 6 окт")
+
+
+async def test_digest_pressed_after_midnight_moves_to_the_day_that_has_started(feed, updates, seed, frozen) -> None:
+    task = await seed.item("Позвонить", when=When(text="сегодня в 15", time="15:00"))
+    frozen.advance(hours=14, minutes=30)  # Wed 00:30
+
+    await feed(updates.callback(DigestCb(a="tmr", d="20261006"), date=frozen.now - timedelta(hours=3, minutes=30)))
+
+    assert (await _occ(seed, task.occurrence.id)).due_at == task.occurrence.due_at + timedelta(days=1)  # Wed 15:00
+
+
+async def test_old_digest_button_without_a_day_uses_the_message_date(feed, updates, seed, tg, frozen) -> None:
+    task = await seed.item("Позвонить", when=When(text="сегодня в 12", time="12:00"))
+    evening = frozen.advance(hours=11)
+
+    await feed(updates.callback("d:tmr", date=evening))
+
+    assert (await _occ(seed, task.occurrence.id)).due_at == task.occurrence.due_at + timedelta(days=1)
+    assert tg.toasts == ["📅 Перенёс на завтра: 1"]
 
 
 async def test_digest_with_nothing_to_move(feed, updates, seed, tg) -> None:

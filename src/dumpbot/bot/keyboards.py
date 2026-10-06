@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
+from datetime import date
 from typing import Final, Literal
 
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import DigestCb, ItemCb, OccCb
+from dumpbot.bot.cbdata import DIGEST_DAY_FMT, DigestCb, ItemCb, OccCb
 
 # Button colours (Bot API 9.4); clients that do not support them show a normal button.
 Style = Literal["success", "danger", "primary"]
@@ -48,13 +49,14 @@ def item_card_keyboard(
     has_reminders: bool,
     recurring: bool,
 ) -> InlineKeyboardMarkup:
-    """[✅ Готово | ↩️ Не сделано] / [✏️ Изменить] [🔕 Без напоминания] [🗑 Удалить] / [⏹ Стоп повтор]."""
+    """[↩️ Не сделано] / [✏️ Изменить] [🔕 Без напоминания] [🗑 Удалить] / [⏹ Стоп повтор].
+
+    No [✅ Готово] here: the card is the "saved" confirmation, and a big done button right under it gets in the way.
+    Done lives on reminder messages and in the edit menu.
+    """
     first: list[InlineKeyboardButton] = []
     if actionable and done and occurrence_id is not None:
         first.append(button("↩️ Не сделано", OccCb(a="undone", id=occurrence_id)))
-    elif actionable and not done:
-        cb = OccCb(a="done", id=occurrence_id) if occurrence_id is not None else ItemCb(a="done", id=item_id)
-        first.append(button("✅ Готово", cb, style="success"))
     second = [button("✏️ Изменить", ItemCb(a="edit", id=item_id))]
     if has_reminders:
         second.append(button("🔕 Без напоминания", ItemCb(a="norem", id=item_id)))
@@ -87,5 +89,7 @@ def back_to_card_row(item_id: int) -> list[InlineKeyboardButton]:
     return [button(BACK, ItemCb(a="back", id=item_id))]
 
 
-def digest_move_keyboard() -> InlineKeyboardMarkup:
-    return markup([button("📅 Перенести невыполненное на завтра", DigestCb(a="tmr"), style="primary")])
+def digest_move_keyboard(day: date) -> InlineKeyboardMarkup:
+    """[📅 Перенести невыполненное на завтра] for the evening digest of local ``day``."""
+    cb = DigestCb(a="tmr", d=day.strftime(DIGEST_DAY_FMT))
+    return markup([button("📅 Перенести невыполненное на завтра", cb, style="primary")])

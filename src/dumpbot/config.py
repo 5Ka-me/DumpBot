@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     # Speech-to-text (community Whisper chute on chutes.ai, JSON body with base64 audio)
     stt_url: str = "https://vonkaiser-audiodojo.chutes.ai/stt/whisper"
     stt_timeout_s: float = 60.0
+    stt_max_duration_s: int = 300  # longer voice/audio is saved without a transcript (STT is billed per GPU second)
     stt_convert_wav: bool = False  # convert OGG/Opus -> 16 kHz mono WAV with ffmpeg before sending
     stt_usd_per_second: float = 0.0005  # billed per started second of GPU time (estimate)
 

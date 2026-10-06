@@ -28,17 +28,25 @@ from dumpbot.workers import jobs
 
 __all__ = [
     "ALBUM_DELAY",
+    "ASK_KEY",
+    "CANDIDATES_KEY",
     "enqueue_processing",
     "extract_urls",
+    "message_raw_ids",
     "message_to_raw_fields",
     "normalize_origin",
+    "picked_item",
     "save_incoming",
+    "was_asked",
 ]
 
 log = logging.getLogger(__name__)
 
 # Album parts arrive as separate updates; the album job waits this long after the latest part (debounce).
 ALBUM_DELAY: Final = timedelta(seconds=2)
+# RawMessage.raw_json keys written by the processor and read when the owner answers by replying with text:
+ASK_KEY: Final = "_ask"  # the clarifying question asked about the message (AskCb only carries the option index)
+CANDIDATES_KEY: Final = "_candidates"  # item ids of the "Какую запись изменить?" list, in list order
 _FILE_FIELDS: Final = (
     "file_id",
     "file_unique_id",
@@ -258,6 +266,40 @@ async def save_incoming(
         raise RuntimeError(f"message {fields['message_id']} neither inserted nor found")
     log.info("message %s already saved", existing.message_id)
     return existing, False
+
+
+async def message_raw_ids(session: AsyncSession, chat_id: int, message_id: int) -> list[int]:
+    """Raw ids of a saved message, or of every part of its album (the album's items belong to its first part);
+    [] when the message was never saved."""
+    raw = await session.scalar(
+        select(RawMessage).where(RawMessage.chat_id == chat_id, RawMessage.message_id == message_id)
+    )
+    if raw is None:
+        return []
+    if not raw.media_group_id:
+        return [raw.id]
+    stmt = select(RawMessage.id).where(RawMessage.chat_id == chat_id, RawMessage.media_group_id == raw.media_group_id)
+    return list((await session.scalars(stmt.order_by(RawMessage.message_id))).all())
+
+
+async def was_asked(session: AsyncSession, raw_id: int) -> bool:
+    """True when the bot asked a clarifying question about raw ``raw_id`` (``ASK_KEY`` in its raw_json)."""
+    raw = await session.get(RawMessage, raw_id)
+    return raw is not None and ASK_KEY in (raw.raw_json or {})
+
+
+async def picked_item(session: AsyncSession, raw_id: int, text: str) -> int | None:
+    """The item a reply "2" to the "Какую запись изменить?" list of raw ``raw_id`` picks (``CANDIDATES_KEY``);
+    None for anything but a listed number."""
+    text = text.strip().rstrip(".)")
+    if not text.isdecimal():
+        return None
+    raw = await session.get(RawMessage, raw_id)
+    ids = (raw.raw_json or {}).get(CANDIDATES_KEY) if raw is not None else None
+    number = int(text)
+    if not isinstance(ids, list) or not 1 <= number <= len(ids):
+        return None
+    return int(ids[number - 1])
 
 
 async def enqueue_processing(session: AsyncSession, raw: RawMessage, now: datetime) -> None:

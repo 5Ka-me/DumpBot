@@ -6,8 +6,9 @@ fake background runners and a fake exit function.
 
 Lifecycle (``dp.startup`` / ``dp.shutdown``): at startup the owner's command menu is set and the job worker and the
 scheduler start as tasks. A task that stops unexpectedly is logged and the process exits with code 1 (Docker
-restarts it). At shutdown updates still being handled may finish (``InFlight``), the tasks are cancelled and
-awaited, then the resources are closed.
+restarts it). So does a task that stops making progress (a hung await, a blocked event loop): ``ctx.watchdog``
+watches the loops from a thread. At shutdown updates still being handled may finish (``InFlight``), the tasks are
+cancelled and awaited, then the resources are closed.
 """
 
 from __future__ import annotations
@@ -97,11 +98,13 @@ class Lifecycle:
             task = asyncio.create_task(runner(), name=f"dumpbot-{name}")
             task.add_done_callback(self._on_done)
             self.tasks[name] = task
+        self._ctx.watchdog.start(self._on_stall)
         log.info("started background tasks: %s", ", ".join(self.tasks) or "none")
 
     async def shutdown(self) -> None:
         """Let running update handlers finish, stop the background tasks, close the resources."""
         self._stopping = True
+        self._ctx.watchdog.stop()
         await self.in_flight.wait_idle(DRAIN_TIMEOUT_S)
         tasks = list(self.tasks.values())
         self.tasks.clear()
@@ -135,6 +138,15 @@ class Lifecycle:
             log.critical(
                 "background task %s crashed: %s; exiting\n%s", task.get_name(), describe_error(exc), safe_traceback(exc)
             )
+        logging_setup.flush()
+        self._exit(CRASH_EXIT_CODE)
+
+    def _on_stall(self, stalled: dict[str, float]) -> None:
+        """Called from the watchdog thread: the event loop may be blocked, so this exits directly."""
+        if self._stopping:
+            return
+        details = ", ".join(f"{name} for {age:.0f} s" for name, age in sorted(stalled.items()))
+        log.critical("background loop made no progress (%s); exiting", details)
         logging_setup.flush()
         self._exit(CRASH_EXIT_CODE)
 

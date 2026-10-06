@@ -166,14 +166,14 @@ class FakeAI:
     """Scripted ``extract`` / ``answer_query`` / ``fetch_titles`` (patched into the processor module)."""
 
     def __init__(self) -> None:
-        self.outputs: list[Extraction | BaseException] = []
+        self.outputs: list[Extraction | ExtractOutput | BaseException] = []
         self.inputs: list[ExtractInput] = []
         self.answers: list[str | BaseException] = []
         self.answer_calls: list[dict[str, Any]] = []
         self.titles: dict[str, str] = {}
         self.title_calls: list[list[str]] = []
 
-    def push(self, *outputs: Extraction | dict[str, Any] | BaseException) -> None:
+    def push(self, *outputs: Extraction | ExtractOutput | dict[str, Any] | BaseException) -> None:
         for out in outputs:
             self.outputs.append(Extraction.model_validate(out) if isinstance(out, dict) else out)
 
@@ -182,6 +182,8 @@ class FakeAI:
         out = self.outputs.pop(0) if self.outputs else Extraction()
         if isinstance(out, BaseException):
             raise out
+        if isinstance(out, ExtractOutput):
+            return out
         return ExtractOutput(extraction=out, model="fake-model", prompt_version="v1")
 
     async def answer_query(

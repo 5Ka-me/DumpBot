@@ -14,7 +14,7 @@ from dumpbot.ai.prompts import (
     build_answer_text,
     build_user_text,
 )
-from dumpbot.ai.schemas import Extraction, extraction_json_schema
+from dumpbot.ai.schemas import MAX_ITEMS, Extraction, extraction_json_schema
 from dumpbot.domain.kinds import KINDS
 from dumpbot.domain.prefs import SLOT_NAMES, Prefs
 
@@ -99,6 +99,53 @@ def test_json_schema_is_serializable():
     schema = extraction_json_schema()
     text = json.dumps(schema)
     assert json.loads(text)["additionalProperties"] is False
+
+
+def test_overlong_model_output_is_clipped_not_rejected():
+    # Without constrained decoding one long link title or a long list must not fail the whole message.
+    out = Extraction.model_validate(
+        {
+            "items": [{"kind": "purchase", "title": f"Купить {n}"} for n in range(1, 26)],
+            "image": {"text": "OCR " * 1500, "description": "Скриншот статьи " * 30},
+            "ask": {"item": 12, "q": "Когда?", "options": ["a", "b", "c", "d", "e"]},
+        }
+    )
+    assert len(out.items) == MAX_ITEMS == 20 and out.items[-1].title == "Купить 20"
+    assert len(out.image.text) <= 4000 and out.image.description.endswith("…")
+    assert out.ask.item == 12 and out.ask.options == ["a", "b", "c", "d"]
+
+    link = Extraction.model_validate(
+        {
+            "items": [
+                {
+                    "kind": "link",
+                    "title": "Очень длинный заголовок страницы " * 6,  # linkinfo keeps up to 200 chars
+                    "details": "д" * 700,
+                    "tags": list("abcdefg"),
+                    "when": {"text": "когда-нибудь потом " * 6},
+                }
+            ]
+        }
+    )
+    [item] = link.items
+    assert len(item.title) <= 120 and item.title.startswith("Очень длинный") and item.title.endswith("…")
+    assert len(item.details) == 600 and item.tags == ["a", "b", "c", "d", "e", "f"]
+    assert len(item.when.text) <= 80
+
+
+def test_json_schema_keeps_the_limits_as_decoding_hints():
+    schema = extraction_json_schema()
+    item = schema["$defs"]["ExtractedItem"]["properties"]
+    assert schema["properties"]["items"]["maxItems"] == MAX_ITEMS
+    assert item["title"]["maxLength"] == 120 and item["tags"]["maxItems"] == 6
+    assert schema["$defs"]["ImageInfo"]["properties"]["text"]["anyOf"][0]["maxLength"] == 4000
+
+
+def test_static_prompt_states_the_limits():
+    # json_object / plain requests carry no schema: the prompt is the only place the model learns them.
+    items_line = _line("ITEMS:")
+    assert f"at most {MAX_ITEMS}" in items_line and "ONE purchase item with the list in details" in items_line
+    assert "max 120 chars" in SYSTEM_PROMPT and "max 4000 chars" in SYSTEM_PROMPT
 
 
 def test_build_user_text_with_all_context_lines():

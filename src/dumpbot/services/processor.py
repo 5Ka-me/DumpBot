@@ -3,18 +3,24 @@
 Pipeline of a message (an album is processed as one message, attached to its first part):
 1. load the raw message(s) (done/ignored -> nothing to do) and prefs; "now" is the message date;
 2. media without any text (stickers, videos, …) -> one "other" item without AI, reaction 👌;
-3. budget: exhausted -> ✍, raw ``deferred``, notice once a month, ``RetryLater(next month, count_attempt=False)``;
-   >= 80 % -> notice once a month;
-4. content: voice/audio -> download -> STT (the transcript is committed at once, so a retry does not pay again);
-   pictures -> download (the bytes are never stored); links -> page titles (no AI);
+3. budget: exhausted -> ✍, raw ``deferred``, notice once a month, ``RetryLater(next month after its quiet hours,
+   count_attempt=False)``; >= 80 % -> notice once a month;
+4. content: voice/audio up to ``stt_max_duration_s`` -> download -> STT (the transcript is committed at once, so a
+   retry does not pay again); pictures up to ``MAX_IMAGE_BYTES`` (``MAX_REQUEST_IMAGE_BYTES`` together) -> download
+   (the bytes are never stored); links -> page titles (no AI);
 5. ``extract()`` -> save (items, cards, 👌 / clarifying question 🤔), query (list or prose answer) or edit;
 6. raw ``done``, scheduler woken.
 
 Errors: ``AIUnavailable`` -> ✍ once (raw ``deferred``) and re-raised so the queue backs off; ``AIConfigError`` ->
-notice once a day + ``RetryLater(1 h, count_attempt=False)``; Telegram download errors -> ``RetryLater(5 min)``.
+notice once a day + ``RetryLater(1 h, count_attempt=False)``; ``AIBadResponse`` (the models answered, nothing usable:
+the same request gives the same result) -> no retries: the message is saved without AI (its text as a note), an
+edit is reported as failed, 😢; Telegram download errors -> ``RetryLater(5 min)``. The fallback model standing in
+for a missing (404) primary -> notice once a day.
 
 Data changes are committed before their cards are sent (a lost card never duplicates items); replies that change
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
+Everything sent in quiet hours is silent (a deferred message can be processed at night); the final reaction goes on
+every part of an album.
 Message text, transcripts and OCR are never logged at INFO or above.
 """
 
@@ -34,19 +40,21 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dumpbot import clock
-from dumpbot.ai.client import AIConfigError, AIUnavailable
+from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
 from dumpbot.ai.extract import ExtractInput, ExtractOutput, answer_query, extract
 from dumpbot.ai.linkinfo import fetch_titles
 from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QuerySpec
 from dumpbot.bot import sender, views
 from dumpbot.context import AppContext
 from dumpbot.db.models import Job, OnceKey, RawMessage
+from dumpbot.domain import quiet, timeresolve
 from dumpbot.domain.fmt import fmt_date
 from dumpbot.domain.kinds import ACTIONABLE, SourceKind
 from dumpbot.domain.prefs import Prefs
-from dumpbot.dto import BudgetState, CreatedItem, PatchResult
+from dumpbot.dto import BudgetState, CreatedItem, PatchResult, Row
 from dumpbot.services import items as items_svc
 from dumpbot.services import query, usage
+from dumpbot.services.ingest import ASK_KEY, CANDIDATES_KEY
 from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, try_once
 
 __all__ = [
@@ -65,6 +73,9 @@ DOWNLOAD_RETRY: Final = timedelta(minutes=5)
 CONFIG_RETRY: Final = timedelta(hours=1)
 BUDGET_WARN_RATIO: Final = 0.8
 MAX_IMAGES: Final = 4
+# Bigger pictures are not sent to the model: the upload counts against llm_timeout_s, and the models downscale anyway.
+MAX_IMAGE_BYTES: Final = 8 * 1024 * 1024
+MAX_REQUEST_IMAGE_BYTES: Final = 12 * 1024 * 1024  # all pictures of one message / album together
 TITLE_MAX: Final = 120  # ExtractedItem.title limit
 VOICE_TYPES: Final = frozenset({"voice", "audio"})
 IMAGE_TYPES: Final = frozenset({"photo", "image_document"})
@@ -76,11 +87,12 @@ VISION_MIME: Final[dict[str, str]] = {
     "image/webp": "image/webp",
     "image/gif": "image/gif",
 }
-# raw_json key holding the last clarifying question: AskCb only carries the option index.
-ASK_KEY: Final = "_ask"
 _FINISHED: Final = ("done", "ignored")
+# Edits by target that wait for the owner to pick the item even when the search found only one.
+CONFIRM_ACTIONS: Final = frozenset({"delete", "done", "no_reminder", "stop_recurrence"})
 
-NOT_FOUND_TEXT: Final = "Не нашёл, что изменить 🤷"
+NOT_FOUND_TEXT: Final = "🤷 Не нашёл, что изменить — сохранил как запись."
+TIME_NOT_UNDERSTOOD_TEXT: Final = "🤷 Не понял время — напиши, например, «завтра в 15:00»."
 ITEM_GONE_TEXT: Final = "🤷 Не нашёл эту запись — возможно, её уже нет."
 NOTHING_FOUND: Final = "Ничего не нашёл 🤷"
 FAILED_MESSAGE_TEXT: Final = "😢 Не смог обработать сообщение — оно сохранено, но разобрать его не получилось."
@@ -144,10 +156,12 @@ async def handle_clarify(ctx: AppContext, payload: dict[str, Any]) -> None:
     """Job "clarify" ``{raw_id, option}``: extract again with the chosen answer and replace the raw's items.
 
     ``option`` is the option text, or its index (int) in the stored question; ``n`` (int) is accepted too.
+    Applied at most once per raw message: a once-key is committed together with the new items, so a re-run of
+    the job (a restart after that commit) neither pays the AI again nor replaces the items a second time.
     """
     async with ctx.sessionmaker() as session:
         raw = await session.get(RawMessage, int(payload["raw_id"]))
-        if raw is None:
+        if raw is None or await session.get(OnceKey, _clarified_key(raw.id)) is not None:
             return
         raws = [raw]
         if raw.media_group_id:
@@ -185,12 +199,12 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         content = await _gather(ctx, [raw], prefs, with_images=not raw.image_text)
         async with ctx.sessionmaker() as session:
             snapshot = await items_svc.item_snapshot(session, item_id, prefs, now)
-        out = await extract(ctx.ai, ctx.settings, _extract_input(content, raw, prefs, reply_item=snapshot))
+        out = await _extract(ctx, prefs, _extract_input(content, raw, prefs, reply_item=snapshot))
         if out.extraction.intent == "query" and out.extraction.query is not None:  # "?…" wins over the reply
             await _reply_query(ctx, [raw], content, out.extraction.query, prefs, _image_text(out.extraction))
             return
     except items_svc.NotFoundError:
-        await _send(ctx, ITEM_GONE_TEXT, reply_to=raw.message_id, purpose="answer", raw_message_id=raw.id)
+        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=raw.message_id, purpose="answer", raw_message_id=raw.id)
         await _mark_done(ctx, [raw], None)
         return
     except AIUnavailable:
@@ -199,6 +213,9 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     except AIConfigError as e:
         await _config_problem(ctx, prefs, e, [raw])
         raise RetryLater(CONFIG_RETRY, "AI config error", count_attempt=False) from e
+    except AIBadResponse as e:
+        await _give_up(ctx, prefs, [raw], FAILED_EDIT_TEXT, e, reply_to=raw.message_id)
+        return
 
     patch = out.extraction.edit or EditPatch()
     async with ctx.sessionmaker() as session:
@@ -208,7 +225,7 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         view = _patch_view(result, prefs)
         _finish(await _reload(session, [raw]), _image_text(out.extraction))
         await session.commit()
-    await _send_patch_card(ctx, view, result, reply_to=raw.message_id, raw_message_id=raw.id)
+    await _send_patch_card(ctx, prefs, view, result, reply_to=raw.message_id, raw_message_id=raw.id)
     await sender.react(ctx, raw.message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
 
@@ -217,13 +234,22 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
     """Job "edit_time" ``{item_id, text, message_id?, now?}`` from the card's "🕒 Время" button.
 
     ``message_id`` (the user's text message) gets the reply card and reactions; ``now`` (ISO time the text was
-    sent) keeps "завтра" right when the job runs late. Both are optional.
+    sent) keeps "завтра" right when the job runs late. Both are optional. With ``message_id`` the patch is applied
+    at most once (a once-key is committed together with it).
+
+    Only the time changes (when / repetition / lead of the model's patch; a title, category or "удали" read into
+    the answer is dropped). An answer without a usable time changes nothing: "🤷 Не понял время…" and 🤔.
     """
     item_id = int(payload["item_id"])
     text = str(payload.get("text") or "").strip()
     message_id = _opt_int(payload.get("message_id"))
     if not text:
         return
+    key = f"edit-time-done:{item_id}:{message_id}" if message_id is not None else None
+    if key is not None:
+        async with ctx.sessionmaker() as session:
+            if await session.get(OnceKey, key) is not None:
+                return
     prefs = await _prefs(ctx)
     await _check_budget(ctx, prefs, [], message_id=message_id)
     now = _payload_time(payload.get("now")) or clock.utcnow()
@@ -231,9 +257,9 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
         async with ctx.sessionmaker() as session:
             snapshot = await items_svc.item_snapshot(session, item_id, prefs, now)
         inp = ExtractInput(text=f"перенеси на: {text}", source="text", now=now, prefs=prefs, reply_item=snapshot)
-        out = await extract(ctx.ai, ctx.settings, inp)
+        out = await _extract(ctx, prefs, inp)
     except items_svc.NotFoundError:
-        await _send(ctx, ITEM_GONE_TEXT, reply_to=message_id, purpose="answer")
+        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=message_id, purpose="answer")
         return
     except AIUnavailable:
         await _defer(ctx, [], message_id=message_id)
@@ -241,16 +267,36 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
     except AIConfigError as e:
         await _config_problem(ctx, prefs, e, [], message_id=message_id)
         raise RetryLater(CONFIG_RETRY, "AI config error", count_attempt=False) from e
+    except AIBadResponse as e:
+        await _give_up(ctx, prefs, [], FAILED_EDIT_TEXT, e, reply_to=message_id)
+        return
 
-    patch = out.extraction.edit or EditPatch()
+    patch = _time_patch(out.extraction.edit, now, prefs)
+    if patch is None:
+        await _send(ctx, TIME_NOT_UNDERSTOOD_TEXT, prefs=prefs, reply_to=message_id, purpose="answer")
+        if message_id:
+            await sender.react(ctx, message_id, sender.REACT_ASK)
+        return
     async with ctx.sessionmaker() as session:
+        if key is not None and not await try_once(session, key):
+            return  # applied by an earlier run of this job
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
         view = _patch_view(result, prefs)
         await session.commit()
-    await _send_patch_card(ctx, view, result, reply_to=message_id)
+    await _send_patch_card(ctx, prefs, view, result, reply_to=message_id)
     if message_id:
         await sender.react(ctx, message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
+
+
+def _time_patch(edit: EditPatch | None, now: datetime, prefs: Prefs) -> EditPatch | None:
+    """The time part of the model's patch for a "🕒 Время" answer; None when it has no usable time."""
+    if edit is None:
+        return None
+    when = edit.when if edit.when is not None and timeresolve.resolve_when(edit.when, now, prefs)[0] else None
+    if when is None and not edit.rrule and not edit.lead:
+        return None
+    return EditPatch(when=when, rrule=edit.rrule, lead=edit.lead)
 
 
 HANDLERS: dict[str, Handler] = {
@@ -270,7 +316,8 @@ async def on_dead(ctx: AppContext, job: Job) -> None:
         if job.kind not in HANDLERS:
             text = f"😢 Не смог выполнить фоновую задачу «{views.esc(job.kind)}»."
         reply_to = raw.message_id if raw is not None else _opt_int((job.payload or {}).get("message_id"))
-        await _send(ctx, text, reply_to=reply_to, purpose="notice", raw_message_id=raw.id if raw else None)
+        prefs = await _prefs(ctx)
+        await _send(ctx, text, prefs=prefs, reply_to=reply_to, purpose="notice", raw_message_id=raw.id if raw else None)
         if reply_to:
             await sender.react(ctx, reply_to, sender.REACT_FAILED)
     except Exception as e:
@@ -288,13 +335,14 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
         await _save_without_ai(ctx, raws, prefs)
         return
     await _check_budget(ctx, prefs, raws)
+    content: _Content | None = None
     try:
         # A clarification reuses the stored OCR text instead of paying for the pictures again.
         content = await _gather(ctx, raws, prefs, with_images=not (replace and primary.image_text))
         if content.empty and not replace:
             await _save_without_ai(ctx, raws, prefs)
             return
-        out = await extract(ctx.ai, ctx.settings, _extract_input(content, primary, prefs, clarification=clarification))
+        out = await _extract(ctx, prefs, _extract_input(content, primary, prefs, clarification=clarification))
         await _dispatch(ctx, raws, content, out, prefs, replace=replace)
     except AIUnavailable:
         await _defer(ctx, raws)
@@ -302,7 +350,30 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
     except AIConfigError as e:
         await _config_problem(ctx, prefs, e, raws)
         raise RetryLater(CONFIG_RETRY, "AI config error", count_attempt=False) from e
+    except AIBadResponse as e:
+        if replace:  # the items of the first pass stay as they are
+            await _give_up(ctx, prefs, raws, FAILED_MESSAGE_TEXT, e, reply_to=primary.message_id)
+        else:
+            await _save_unparsed(ctx, raws, prefs, content or _plain_content(raws), e)
+        return
     ctx.scheduler_wakeup.set()
+
+
+async def _extract(ctx: AppContext, prefs: Prefs, inp: ExtractInput) -> ExtractOutput:
+    """``extract()``; when the fallback stood in for a missing (404) primary model, tell the owner once a day."""
+    out = await extract(ctx.ai, ctx.settings, inp)
+    if out.missing_model:
+        async with ctx.sessionmaker() as session:
+            first = await try_once(session, f"aimodel:{clock.utcnow().astimezone(prefs.zone).date().isoformat()}")
+            await session.commit()
+        if first:
+            text = (
+                f"⚠️ Модели <code>{views.esc(out.missing_model)}</code> нет на chutes.ai (404), "
+                f"пока работаю на запасной <code>{views.esc(out.model)}</code>.\n"
+                "Проверь LLM_MODEL в .env."
+            )
+            await _send(ctx, text, prefs=prefs, purpose="notice")
+    return out
 
 
 async def _dispatch(
@@ -312,25 +383,40 @@ async def _dispatch(
     log.info("message %s: intent=%s items=%d (%s)", raws[0].message_id, ext.intent, len(ext.items), out.model)
     if ext.intent == "query" and ext.query is not None:
         await _reply_query(ctx, raws, content, ext.query, prefs, _image_text(ext))
-    elif ext.intent == "edit" and ext.edit is not None:
-        await _edit_by_target(ctx, raws, ext.edit, prefs, _image_text(ext))
+    elif ext.intent == "edit" and ext.edit is not None and not content.forward_origin:
+        await _edit_by_target(ctx, raws, content, out, prefs, replace=replace)
     else:
+        # A forwarded post is someone else's words ("встреча отменяется, удали"): it is saved, never applied to the
+        # owner's items; edits come from replies to cards and the ✏️ menu.
         await _save(ctx, raws, content, out, prefs, replace=replace)
 
 
 async def _save(
-    ctx: AppContext, raws: list[RawMessage], content: _Content, out: ExtractOutput, prefs: Prefs, *, replace: bool
+    ctx: AppContext,
+    raws: list[RawMessage],
+    content: _Content,
+    out: ExtractOutput,
+    prefs: Prefs,
+    *,
+    replace: bool,
+    note: str | None = None,
 ) -> None:
-    """Create the items (or replace them after a clarification), then cards / question and the reaction."""
+    """Create the items (or replace them after a clarification), then cards / question and the reaction.
+
+    ``note`` (why the message was saved, e.g. an edit whose item was not found) goes above the cards, and then
+    every item gets a card, so that it can be fixed with its buttons.
+    """
     primary = raws[0]
     ext = out.extraction
     image_text = _image_text(ext)
     extraction = ext if ext.items else _fallback_note(content.text, image_text)
-    ask = ext.ask if not replace else None  # no question loops after a clarification
+    ask = ext.ask if not replace and note is None else None  # no question loops after a clarification
     now_view = clock.utcnow()
     async with ctx.sessionmaker() as session:
         fresh = await _reload(session, raws)
         head = fresh[0]
+        if replace and not await try_once(session, _clarified_key(head.id)):
+            return  # this answer was applied by an earlier run of the job
         kwargs: dict[str, Any] = {
             "extraction": extraction,
             "source": content.source,
@@ -346,44 +432,50 @@ async def _save(
             created = await items_svc.replace_items_for_raw(session, head.id, raw=head, **kwargs)
         else:
             created = await items_svc.create_items(session, raw=head, **kwargs)
-        cards = [] if ask is not None else _cards(created, prefs, now_view)
+        cards = [] if ask is not None else _cards(created, prefs, now_view, every=note is not None)
         if ask is not None:
             head.raw_json = {**(head.raw_json or {}), ASK_KEY: ask.model_dump(mode="json")}
         _finish(fresh, image_text)
         await session.commit()
 
     if ask is not None:
-        await _send_ask(ctx, primary, ask)
+        await _send_ask(ctx, prefs, raws, ask)
         return
     for created_item, (text, markup) in cards:
         occ = created_item.occurrence
         await _send(
             ctx,
-            text,
+            views.fit(f"{note}\n\n{text}") if note else text,
             markup,
+            prefs=prefs,
             reply_to=primary.message_id,
             purpose="card",
             item_id=created_item.item.id,
             occurrence_id=occ.id if occ is not None else None,
             raw_message_id=primary.id,
         )
-    await sender.react(ctx, primary.message_id, sender.REACT_SAVED)
+    await _react(ctx, raws, sender.REACT_SAVED)
 
 
-def _cards(created: Sequence[CreatedItem], prefs: Prefs, now: datetime) -> list[tuple[CreatedItem, View]]:
-    """Cards for items with reminders, actionable kinds, or something to confirm; the rest only get 👌."""
+def _cards(
+    created: Sequence[CreatedItem], prefs: Prefs, now: datetime, *, every: bool = False
+) -> list[tuple[CreatedItem, View]]:
+    """Cards for items with reminders, actionable kinds, or something to confirm (``every``: all items); the rest
+    only get 👌."""
     out: list[tuple[CreatedItem, View]] = []
     for c in created:
         res = c.resolution
-        if c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or res.warnings:
+        if every or c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or res.warnings:
             out.append((c, views.item_card(c.item, c.occurrence, c.reminders, prefs, now, warnings=res.warnings)))
     return out
 
 
-async def _send_ask(ctx: AppContext, primary: RawMessage, ask: Ask) -> None:
+async def _send_ask(ctx: AppContext, prefs: Prefs, raws: list[RawMessage], ask: Ask) -> None:
+    primary = raws[0]
     text, markup = views.ask_message(ask, primary.id)
-    await _send(ctx, text, markup, reply_to=primary.message_id, purpose="ask", raw_message_id=primary.id)
-    await sender.react(ctx, primary.message_id, sender.REACT_ASK)
+    reply_to, raw_id = primary.message_id, primary.id
+    await _send(ctx, text, markup, prefs=prefs, reply_to=reply_to, purpose=sender.PURPOSE_ASK, raw_message_id=raw_id)
+    await _react(ctx, raws, sender.REACT_ASK)
 
 
 async def _reply_query(
@@ -394,50 +486,101 @@ async def _reply_query(
     prefs: Prefs,
     image_text: str | None,
 ) -> None:
-    """Rows for the QuerySpec as a list, or a short prose answer. Sent before the raw is marked done."""
+    """Rows for the QuerySpec as a list, or a short prose answer (the list when no answer comes). Sent before the raw
+    is marked done."""
     primary = raws[0]
     now = _msg_now(primary)
     async with ctx.sessionmaker() as session:
         rows = await query.run_query(session, spec, prefs, now)
     markup: InlineKeyboardMarkup | None = None
+    text: str | None = None
     if spec.answer == "summary":
         question = content.text.strip() or spec.text or ""
-        answer = await answer_query(ctx.ai, ctx.settings, question, query.rows_for_llm(rows, prefs), now, prefs)
-        text = views.fit(views.esc(answer))
-    else:
+        try:
+            answer = await answer_query(ctx.ai, ctx.settings, question, query.rows_for_llm(rows, prefs), now, prefs)
+        except (AIUnavailable, AIBadResponse) as e:
+            # The rows are found already: the list beats a retry that would pay for the extraction again.
+            log.warning("message %s: no prose answer (%s), sending the list", primary.message_id, describe_error(e))
+        else:
+            text = views.fit(views.esc(answer))
+    if text is None:
         title = f"🔎 По запросу «{spec.text}»" if spec.text else "🔎 Вот что нашёл"
         text, markup = views.rows_list(title, rows, prefs, clock.utcnow(), empty=NOTHING_FOUND)
-    await sender.send(ctx, text, markup, reply_to=primary.message_id, purpose="answer", raw_message_id=primary.id)
+    await sender.send(
+        ctx,
+        text,
+        markup,
+        reply_to=primary.message_id,
+        silent=_quiet(prefs),
+        purpose="answer",
+        raw_message_id=primary.id,
+    )
     await _mark_done(ctx, raws, image_text)
-    await sender.react(ctx, primary.message_id, sender.REACT_SAVED)
+    await _react(ctx, raws, sender.REACT_SAVED)
 
 
 async def _edit_by_target(
-    ctx: AppContext, raws: list[RawMessage], patch: EditPatch, prefs: Prefs, image_text: str | None
+    ctx: AppContext,
+    raws: list[RawMessage],
+    content: _Content,
+    out: ExtractOutput,
+    prefs: Prefs,
+    *,
+    replace: bool,
 ) -> None:
-    """ "перенеси встречу с Олегом на 16": one candidate -> apply; several -> pick buttons; none -> say so."""
+    """ "перенеси встречу с Олегом на 16": the item is looked up by ``edit.target``. Only an exact match (every word
+    of the target) of a non-destructive change is applied at once; a loose match (some word, a tag), several
+    matches, or delete / done / no_reminder / stop_recurrence -> the owner picks the item (buttons, or a reply with
+    its number), even when there is one. Nothing found -> the message is kept as a note and its card says so: it may
+    be a new task worded like an edit («удалить приложение банка»)."""
     primary = raws[0]
+    patch = out.extraction.edit or EditPatch()
+    image_text = _image_text(out.extraction)
     now = _msg_now(primary)
+    target = patch.target or ""
     async with ctx.sessionmaker() as session:
-        rows = await query.find_edit_candidates(session, patch.target or "", prefs, now)
-    if len(rows) == 1:
-        async with ctx.sessionmaker() as session:
-            result = await items_svc.apply_patch(session, rows[0].item_id, patch, prefs, now)
-            view = _patch_view(result, prefs)
-            _finish(await _reload(session, raws), image_text)
-            await session.commit()
-        await _send_patch_card(ctx, view, result, reply_to=primary.message_id, raw_message_id=primary.id)
-        await sender.react(ctx, primary.message_id, sender.REACT_SAVED)
+        rows = await query.find_edit_candidates(session, target, prefs, now, exact=True)
+        exact = bool(rows)
+        if not exact:
+            rows = await query.find_edit_candidates(session, target, prefs, now)
+    if not rows:
+        await _save(ctx, raws, content, out, prefs, replace=replace, note=NOT_FOUND_TEXT)
         return
-    if rows:
-        text, markup = views.edit_candidates(rows, primary.id, prefs, clock.utcnow())
-        await sender.send(ctx, text, markup, reply_to=primary.message_id, purpose="ask", raw_message_id=primary.id)
-        await _mark_done(ctx, raws, image_text)
-        await sender.react(ctx, primary.message_id, sender.REACT_ASK)
+    if len(rows) > 1 or not exact or patch.action in CONFIRM_ACTIONS:
+        await _send_candidates(ctx, prefs, raws, rows, image_text)
         return
-    await sender.send(ctx, NOT_FOUND_TEXT, reply_to=primary.message_id, purpose="answer", raw_message_id=primary.id)
+    async with ctx.sessionmaker() as session:
+        result = await items_svc.apply_patch(session, rows[0].item_id, patch, prefs, now)
+        view = _patch_view(result, prefs)
+        _finish(await _reload(session, raws), image_text)
+        await session.commit()
+    await _send_patch_card(ctx, prefs, view, result, reply_to=primary.message_id, raw_message_id=primary.id)
+    await _react(ctx, raws, sender.REACT_SAVED)
+
+
+async def _send_candidates(
+    ctx: AppContext, prefs: Prefs, raws: list[RawMessage], rows: Sequence[Row], image_text: str | None
+) -> None:
+    """ "✏️ Какую запись изменить?" with a button per item (PickCb -> job "edit"); the ids are kept with the raw so
+    that a text reply "2" picks the second one. Sent before the raw is marked done."""
+    primary = raws[0]
+    rows = list(rows)[: views.CANDIDATES_MAX]
+    async with ctx.sessionmaker() as session:
+        [head] = await _reload(session, [primary])
+        head.raw_json = {**(head.raw_json or {}), CANDIDATES_KEY: [r.item_id for r in rows]}
+        await session.commit()
+    text, markup = views.edit_candidates(rows, primary.id, prefs, clock.utcnow())
+    await sender.send(
+        ctx,
+        text,
+        markup,
+        reply_to=primary.message_id,
+        silent=_quiet(prefs),
+        purpose=sender.PURPOSE_PICK,
+        raw_message_id=primary.id,
+    )
     await _mark_done(ctx, raws, image_text)
-    await sender.react(ctx, primary.message_id, sender.REACT_SAVED)
+    await _react(ctx, raws, sender.REACT_ASK)
 
 
 def _patch_view(result: PatchResult, prefs: Prefs) -> View:
@@ -449,13 +592,20 @@ def _patch_view(result: PatchResult, prefs: Prefs) -> View:
 
 
 async def _send_patch_card(
-    ctx: AppContext, view: View, result: PatchResult, *, reply_to: int | None, raw_message_id: int | None = None
+    ctx: AppContext,
+    prefs: Prefs,
+    view: View,
+    result: PatchResult,
+    *,
+    reply_to: int | None,
+    raw_message_id: int | None = None,
 ) -> None:
     occ = result.occurrence
     await _send(
         ctx,
         view[0],
         view[1],
+        prefs=prefs,
         reply_to=reply_to,
         purpose="card",
         item_id=result.item.id,
@@ -467,22 +617,49 @@ async def _send_patch_card(
 async def _save_without_ai(ctx: AppContext, raws: list[RawMessage], prefs: Prefs) -> None:
     """Media without text: one "other" item titled by type («Видео», «Стикер 😀», «Документ: a.pdf»), 👌."""
     primary = raws[0]
-    title = _media_title(primary)
-    if len(raws) > 1:
-        title = f"{title} ×{len(raws)}"
-    origin = next((r.forward_origin for r in raws if r.forward_origin), None)
-    urls = list(dict.fromkeys(u for r in raws for u in (r.urls or [])))
-    extraction = Extraction(items=[ExtractedItem(kind="other", title=_clip(title, TITLE_MAX))])
+    await _store_without_ai(ctx, raws, prefs, _plain_content(raws))
+    log.info("message %s (%s) saved without AI", primary.message_id, primary.content_type)
+    await _react(ctx, raws, sender.REACT_SAVED)
+    ctx.scheduler_wakeup.set()
+
+
+async def _save_unparsed(
+    ctx: AppContext, raws: list[RawMessage], prefs: Prefs, content: _Content, error: AIBadResponse
+) -> None:
+    """``AIBadResponse`` for a new message: the same request would give the same (temperature 0, fixed seed), so
+    instead of retrying it is kept without AI — its text as a note, media without text as an item titled by type —
+    and the owner is told (😢)."""
+    primary = raws[0]
+    log.warning("message %s: no usable AI result (%s), saved without AI", primary.message_id, describe_error(error))
+    await _store_without_ai(ctx, raws, prefs, content)
+    await _send(
+        ctx, FAILED_MESSAGE_TEXT, prefs=prefs, reply_to=primary.message_id, purpose="notice", raw_message_id=primary.id
+    )
+    await _react(ctx, raws, sender.REACT_FAILED)
+
+
+async def _store_without_ai(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, content: _Content) -> None:
+    """One item and raws ``done``: a note with the text of ``content``, or an "other" item titled by type."""
+    text = content.text.strip()
+    if text:
+        extraction = _fallback_note(text, None)
+        source = content.source
+    else:
+        title = _media_title(raws[0])
+        if len(raws) > 1:
+            title = f"{title} ×{len(raws)}"
+        extraction = Extraction(items=[ExtractedItem(kind="other", title=_clip(title, TITLE_MAX))])
+        source = "forward" if content.forward_origin else "other"
     async with ctx.sessionmaker() as session:
         fresh = await _reload(session, raws)
         await items_svc.create_items(
             session,
             raw=fresh[0],
             extraction=extraction,
-            source="forward" if origin else "other",
-            source_text=None,
-            source_meta={"forward_origin": origin} if origin else None,
-            urls=urls,
+            source=source,
+            source_text=text or None,
+            source_meta=_source_meta(content),
+            urls=content.urls,
             prefs=prefs,
             now=_msg_now(fresh[0]),
             model=None,
@@ -490,9 +667,17 @@ async def _save_without_ai(ctx: AppContext, raws: list[RawMessage], prefs: Prefs
         )
         _finish(fresh, None)
         await session.commit()
-    log.info("message %s (%s) saved without AI", primary.message_id, primary.content_type)
-    await sender.react(ctx, primary.message_id, sender.REACT_SAVED)
-    ctx.scheduler_wakeup.set()
+
+
+def _plain_content(raws: Sequence[RawMessage]) -> _Content:
+    """What the raws carry without downloads, STT or AI: their texts, URLs and forward origin."""
+    urls = list(dict.fromkeys(u for r in raws for u in (r.urls or [])))
+    return _Content(
+        text=_join(*(r.text for r in raws)),
+        source=_source_kind(raws, urls),
+        urls=urls,
+        forward_origin=next((r.forward_origin for r in raws if r.forward_origin), None),
+    )
 
 
 # --- content ----------------------------------------------------------------------------------------------------
@@ -515,7 +700,8 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
             if transcript:
                 texts.append(transcript)
         elif raw.content_type in IMAGE_TYPES and with_images and len(images) < MAX_IMAGES:
-            image = await _image(ctx, raw)
+            room = MAX_REQUEST_IMAGE_BYTES - sum(len(data) for data, _ in images)
+            image = await _image(ctx, raw, max_bytes=min(MAX_IMAGE_BYTES, room))
             if image is not None:
                 images.append(image)
     if not with_images and primary.image_text:
@@ -536,9 +722,16 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
 
 
 async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs) -> str:
-    """Stored transcript, or download + STT and commit it right away (a retry must not pay twice)."""
+    """Stored transcript, or download + STT and commit it right away (a retry must not pay twice).
+
+    Audio longer than ``stt_max_duration_s`` is not transcribed (STT is billed per GPU second and a long file can
+    outlast the STT timeout): it is saved by its caption, or as «Аудио: name».
+    """
     if raw.transcript is not None:
         return raw.transcript
+    if raw.duration is not None and raw.duration > ctx.settings.stt_max_duration_s:
+        log.info("message %s: %d s of audio is over the STT limit, not transcribed", raw.message_id, raw.duration)
+        return ""
     audio = await _download(ctx, raw)
     if audio is None:
         return ""
@@ -551,12 +744,20 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs) -> str:
     return text
 
 
-async def _image(ctx: AppContext, raw: RawMessage) -> tuple[bytes, str] | None:
+async def _image(ctx: AppContext, raw: RawMessage, *, max_bytes: int) -> tuple[bytes, str] | None:
+    """Picture bytes for the vision model; None when its type is not supported or it is over ``max_bytes``."""
     mime = "image/jpeg" if raw.content_type == "photo" else VISION_MIME.get((raw.mime_type or "").lower())
     if mime is None:
         log.info("message %s: picture type not supported by the vision model, not sent", raw.message_id)
         return None
+    too_big = "message %s: picture of %d bytes is too large for the vision model, not sent"
+    if raw.file_size is not None and raw.file_size > max_bytes:
+        log.info(too_big, raw.message_id, raw.file_size)
+        return None
     data = await _download(ctx, raw)
+    if data and len(data) > max_bytes:  # the size was not known before the download
+        log.info(too_big, raw.message_id, len(data))
+        return None
     return (data, mime) if data else None
 
 
@@ -719,7 +920,11 @@ def _option_text(raw: RawMessage, payload: dict[str, Any]) -> str | None:
 async def _check_budget(
     ctx: AppContext, prefs: Prefs, raws: list[RawMessage], *, message_id: int | None = None
 ) -> None:
-    """Exhausted -> defer until next month (notice once a month); >= 80 % -> notice once a month."""
+    """Exhausted -> defer until next month (notice once a month); >= 80 % -> notice once a month.
+
+    The deferred messages are processed when the new month starts, but not before the quiet hours of that night end
+    (their cards must not arrive at 00:00 on the 1st).
+    """
     now = clock.utcnow()
     month = now.astimezone(prefs.zone).strftime("%Y-%m")
     notify = False
@@ -731,14 +936,14 @@ async def _check_budget(
             notify = await try_once(session, f"budget80:{month}")
         await session.commit()
     if state.exhausted:
-        resume = usage.next_month_start(now, prefs)
+        resume = quiet.shift_out_of_quiet(usage.next_month_start(now, prefs), prefs)
         if notify:
-            await _send(ctx, _budget_exhausted_text(state, resume, prefs), purpose="notice")
+            await _send(ctx, _budget_exhausted_text(state, resume, prefs), prefs=prefs, purpose="notice")
         await _defer(ctx, raws, message_id=message_id)
         log.info("AI budget exhausted: job deferred to %s", resume.isoformat())
         raise RetryLater(reason=BUDGET_REASON, at=resume, count_attempt=False)
     if notify:
-        await _send(ctx, _budget_warning_text(state), purpose="notice")
+        await _send(ctx, _budget_warning_text(state), prefs=prefs, purpose="notice")
 
 
 def _budget_warning_text(state: BudgetState) -> str:
@@ -758,10 +963,8 @@ def _budget_exhausted_text(state: BudgetState, resume: datetime, prefs: Prefs) -
 
 async def _defer(ctx: AppContext, raws: list[RawMessage], *, message_id: int | None = None) -> None:
     """Mark the raws deferred and react ✍ (once: not again while they stay deferred)."""
-    target = message_id
     first = True
     if raws:
-        target = raws[0].message_id
         async with ctx.sessionmaker() as session:
             fresh = await _reload(session, raws)
             first = bool(fresh) and fresh[0].status != "deferred"
@@ -769,8 +972,12 @@ async def _defer(ctx: AppContext, raws: list[RawMessage], *, message_id: int | N
                 if raw.status not in _FINISHED:
                     raw.status = "deferred"
             await session.commit()
-    if first and target:
-        await sender.react(ctx, target, sender.REACT_DEFERRED)
+    if not first:
+        return
+    if raws:
+        await _react(ctx, raws, sender.REACT_DEFERRED)
+    elif message_id:
+        await sender.react(ctx, message_id, sender.REACT_DEFERRED)
 
 
 async def _config_problem(
@@ -789,8 +996,31 @@ async def _config_problem(
             + (f": <code>{views.esc(reason)}</code>" if reason else "")
             + ".\nПроверь ключ, баланс и ID моделей в .env. Сообщения сохранены — разберу их, как только заработает."
         )
-        await _send(ctx, text, purpose="notice")
+        await _send(ctx, text, prefs=prefs, purpose="notice")
     await _defer(ctx, raws, message_id=message_id)
+
+
+async def _give_up(
+    ctx: AppContext, prefs: Prefs, raws: list[RawMessage], text: str, error: AIBadResponse, *, reply_to: int | None
+) -> None:
+    """``AIBadResponse``: the same request would give the same result, so the job ends now (no retries) like
+    ``on_dead`` would end it: unfinished raws -> failed, ``text`` to the owner, 😢."""
+    reason = describe_error(error)
+    log.warning("AI result unusable, giving up without retries: %s", reason)
+    if raws:
+        async with ctx.sessionmaker() as session:
+            for raw in await _reload(session, raws):
+                if raw.status not in _FINISHED:
+                    raw.status = "failed"
+                    raw.error = reason[:500]
+            await session.commit()
+    await _send(
+        ctx, text, prefs=prefs, reply_to=reply_to, purpose="notice", raw_message_id=raws[0].id if raws else None
+    )
+    if raws:
+        await _react(ctx, raws, sender.REACT_FAILED)
+    elif reply_to:
+        await sender.react(ctx, reply_to, sender.REACT_FAILED)
 
 
 # --- small helpers ----------------------------------------------------------------------------------------------
@@ -855,13 +1085,33 @@ async def _fail_raws(ctx: AppContext, job: Job) -> RawMessage | None:
     return raws[0] if raws else None
 
 
-async def _send(ctx: AppContext, text: str, markup: InlineKeyboardMarkup | None = None, **kwargs: Any) -> int | None:
-    """Best-effort send for messages that follow committed data: a failure is logged, not retried."""
+async def _send(
+    ctx: AppContext, text: str, markup: InlineKeyboardMarkup | None = None, *, prefs: Prefs, **kwargs: Any
+) -> int | None:
+    """Best-effort send for messages that follow committed data: a failure is logged, not retried. Silent in quiet
+    hours (``_quiet``)."""
     try:
-        return await sender.send(ctx, text, markup, **kwargs)
+        return await sender.send(ctx, text, markup, silent=_quiet(prefs), **kwargs)
     except Exception as e:
         log.warning("could not send %s message: %s", kwargs.get("purpose"), describe_error(e))
         return None
+
+
+def _quiet(prefs: Prefs) -> bool:
+    """Messages of the processor go out without a sound in quiet hours: a message deferred by the budget or an AI
+    outage can be processed at night, and its card / question / answer must not ring then."""
+    return quiet.in_quiet_hours(clock.utcnow(), prefs)
+
+
+async def _react(ctx: AppContext, raws: Sequence[RawMessage], emoji: str) -> None:
+    """The final reaction on every part of the message (the capture router put 👀 on each album part)."""
+    for raw in raws:
+        await sender.react(ctx, raw.message_id, emoji)
+
+
+def _clarified_key(raw_id: int) -> str:
+    """once_keys marker of an applied clarification (not the job's dedupe key ``clarify:{raw_id}``)."""
+    return f"clarify-done:{raw_id}"
 
 
 def _msg_now(raw: RawMessage) -> datetime:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import socket
 import sys
 from decimal import Decimal
 
@@ -124,6 +125,36 @@ async def test_stt_timeout_is_unavailable(fake, make_settings):
             await stt.transcribe(AUDIO)
     finally:
         await stt.close()
+
+
+async def test_stt_timeout_is_billed_for_the_time_waited(fake, make_settings, sessionmaker):
+    # The chute keeps transcribing (and billing) after we stop waiting: the budget guard must see that spend.
+    fake.stt_ok("late", delay=1.0)
+    stt = ChutesWhisperSTT(make_settings(stt_timeout_s=0.2, stt_usd_per_second=0.001), sessionmaker)
+    try:
+        with pytest.raises(AIUnavailable):
+            await stt.transcribe(AUDIO)
+    finally:
+        await stt.close()
+    async with sessionmaker() as s:
+        row = await s.scalar(select(AiUsage))
+    assert (row.ok, row.audio_seconds, row.cost_usd) == (False, Decimal("1.00"), Decimal("0.001000"))
+    assert "Timeout" in row.error
+
+
+async def test_stt_connection_error_is_not_billed(make_settings, sessionmaker):
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    stt = ChutesWhisperSTT(make_settings(stt_url=f"http://127.0.0.1:{port}/stt/whisper"), sessionmaker)
+    try:
+        with pytest.raises(AIUnavailable):
+            await stt.transcribe(AUDIO)
+    finally:
+        await stt.close()
+    async with sessionmaker() as s:
+        row = await s.scalar(select(AiUsage))
+    assert (row.ok, row.cost_usd) == (False, Decimal("0"))
 
 
 async def test_convert_flag_without_ffmpeg_is_config_error(fake, make_settings, monkeypatch):

@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from dumpbot.config import Settings
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services.settings_repo import load_prefs
+from dumpbot.watchdog import Watchdog
 
 if TYPE_CHECKING:
     from aiogram import Bot
@@ -29,6 +30,8 @@ class AppContext:
     # Set to make the job worker / scheduler run immediately instead of waiting for their poll interval.
     jobs_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     scheduler_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
+    # The job worker and the scheduler report progress here; ``bot.app.Lifecycle`` exits the process on a stall.
+    watchdog: Watchdog = field(default_factory=Watchdog)
 
     @property
     def owner_id(self) -> int:

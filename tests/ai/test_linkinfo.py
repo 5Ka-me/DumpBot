@@ -3,8 +3,17 @@ from __future__ import annotations
 import socket
 
 import aiohttp
+import pytest
 
+from dumpbot.ai import linkinfo
 from dumpbot.ai.linkinfo import fetch_titles, parse_title
+
+
+@pytest.fixture(autouse=True)
+def local_pages_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fake pages are served from 127.0.0.1, which fetch_titles never contacts otherwise
+    (see test_linkinfo_safety.py)."""
+    monkeypatch.setattr(linkinfo, "address_allowed", lambda host: True)
 
 
 async def test_title_and_og_title(fake):

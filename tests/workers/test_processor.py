@@ -10,7 +10,9 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import GetFile
 from sqlalchemy import select
 
-from dumpbot.ai.client import AIConfigError, AIUnavailable
+from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
+from dumpbot.ai.extract import ExtractOutput
+from dumpbot.ai.schemas import Extraction
 from dumpbot.bot.cbdata import AskCb, PickCb
 from dumpbot.db.models import AiUsage, Item, Job, OnceKey, RawMessage
 from dumpbot.services import processor
@@ -18,7 +20,8 @@ from dumpbot.workers import jobs
 from dumpbot.workers.jobs import JobWorker, RetryLater
 
 OWNER = 4242
-WARSAW_NEXT_MONTH = datetime(2026, 10, 31, 23, 0, tzinfo=UTC)  # 2026-11-01 00:00 Europe/Warsaw (CET)
+# 2026-11-01 08:00 Europe/Warsaw (CET): the new month starts at 00:00, inside the default 23:00-08:00 quiet hours.
+WARSAW_NEXT_MONTH = datetime(2026, 11, 1, 7, 0, tzinfo=UTC)
 
 
 def buttons(call: dict) -> list[tuple[str, str]]:
@@ -74,7 +77,7 @@ async def test_task_message_gets_card_and_reaction(
     [card] = bot.sent
     assert "Созвон с Олегом" in card["text"]
     assert reply_to(card) == raw.message_id
-    assert any(text.startswith("✅") for text, _ in buttons(card))
+    assert not any(text.startswith("✅") for text, _ in buttons(card))  # done lives in the reminder and ✏️ menu
     assert bot.reactions == [(raw.message_id, "👌")]
     [msg] = await bot_messages()
     assert (msg.purpose, msg.item_id, msg.occurrence_id, msg.raw_message_id) == ("card", item.id, occ.id, raw.id)
@@ -88,6 +91,22 @@ async def test_task_message_gets_card_and_reaction(
     # A redelivered job does nothing.
     await processor.handle_message(ctx, {"raw_id": raw.id})
     assert len(fake_ai.inputs) == 1 and len(await items_of_raw(raw.id)) == 1
+
+
+async def test_messages_processed_in_quiet_hours_are_silent(ctx, add_raw, fake_ai, bot, frozen, local) -> None:
+    # Deferred at 20:00 (AI down), processed by a retry at 02:00: the card must not ring at night.
+    raw = await add_raw("завтра в 15 созвон", tg_date=local(2026, 10, 6, 20, 0))
+    frozen.set(local(2026, 10, 7, 2, 0))
+    fake_ai.push({"items": [{"kind": "event", "title": "Созвон", "when": {"day": "+1", "time": "15:00"}}]})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    frozen.set(local(2026, 10, 7, 9, 0))
+    raw = await add_raw("завтра в 16 спорт")
+    fake_ai.push({"items": [{"kind": "event", "title": "Спорт", "when": {"day": "+1", "time": "16:00"}}]})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    night, day = bot.sent
+    assert (night["disable_notification"], day["disable_notification"]) == (True, None)
 
 
 async def test_note_gets_only_a_reaction(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:
@@ -144,6 +163,28 @@ async def test_forwarded_post_keeps_its_origin(ctx, add_raw, fake_ai, items_of_r
     assert item.source == {"forward_origin": origin}
 
 
+async def test_forwarded_post_is_never_applied_as_an_edit(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, items_of_raw
+):
+    # A friend's "Встреча с Олегом отменяется, удали из календаря", forwarded to keep it.
+    [meeting] = await make_items({"kind": "event", "title": "Встреча с Олегом", "when": {"time": "15:00"}}, now=t0)
+    origin = {"type": "user", "sender_name": "Петя"}
+    raw = await add_raw("Встреча с Олегом отменяется, удали из календаря", forward_origin=origin)
+    fake_ai.push({"intent": "edit", "edit": {"target": "встреча Олег", "action": "delete"}})
+
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert (await get(Item, meeting.item.id)).status == "open"
+    [saved] = await items_of_raw(raw.id)
+    assert (saved.kind, saved.title, saved.source_kind) == (
+        "note",
+        "Встреча с Олегом отменяется, удали из календаря",
+        "forward",
+    )
+    assert not any("Удалено" in text for text in bot.texts)
+    assert (await get(RawMessage, raw.id)).status == "done"
+
+
 # --- voice / photo / album ------------------------------------------------------------------------------------------
 
 
@@ -170,6 +211,30 @@ async def test_voice_transcript_is_persisted_before_extract_and_reused(
     [item] = await items_of_raw(raw.id)
     assert item.source_text == "напомни купить хлеб" and item.source_kind == "voice"
     assert bot.reactions == [(raw.message_id, "✍"), (raw.message_id, "👌")]
+
+
+async def test_long_audio_is_not_transcribed(ctx, add_raw, fake_ai, bot, stt, items_of_raw) -> None:
+    # A forwarded 40-minute lecture: STT bills GPU seconds and would time out, then retry for a week.
+    podcast = await add_raw(
+        None, content_type="audio", file_id="a1", file_name="podcast.mp3", mime_type="audio/mpeg", duration=2400
+    )
+    await processor.handle_message(ctx, {"raw_id": podcast.id})
+    assert stt.calls == [] and bot.calls_of("download") == [] and fake_ai.inputs == []
+    [item] = await items_of_raw(podcast.id)
+    assert (item.kind, item.title) == ("other", "Аудио: podcast.mp3")
+    assert bot.reactions == [(podcast.message_id, "👌")]
+
+    lecture = await add_raw("лекция про asyncio, послушать", content_type="audio", file_id="a2", duration=2400)
+    fake_ai.push({"items": [{"kind": "task", "title": "Послушать лекцию про asyncio"}]})
+    await processor.handle_message(ctx, {"raw_id": lecture.id})
+    assert stt.calls == []
+    [inp] = fake_ai.inputs
+    assert inp.text == "лекция про asyncio, послушать"
+
+    short = await add_raw(None, content_type="voice", file_id="v1", duration=ctx.settings.stt_max_duration_s)
+    fake_ai.push({"items": [{"kind": "note", "title": "Голосовая заметка"}]})
+    await processor.handle_message(ctx, {"raw_id": short.id})
+    assert len(stt.calls) == 1
 
 
 async def test_photo_goes_to_vision_and_ocr_is_stored(ctx, add_raw, fake_ai, bot, get, items_of_raw) -> None:
@@ -220,7 +285,8 @@ async def test_album_is_one_extraction_with_up_to_four_pictures(ctx, add_raw, fa
     raws = await db(select(RawMessage).order_by(RawMessage.message_id))
     assert [r.status for r in raws] == ["done"] * 5 + ["new"]
     assert raws[-1].id == other_group.id
-    assert bot.reactions == [(200, "👌")]
+    # Every part got 👀 from the capture router: every part gets the final reaction, not only the first.
+    assert bot.reactions == [(m, "👌") for m in range(200, 205)]
 
     await processor.handle_album(ctx, {"media_group_id": "G", "chat_id": OWNER})  # all parts done: no-op
     assert len(fake_ai.inputs) == 1
@@ -291,6 +357,37 @@ async def test_download_errors_retry_later_and_too_big_is_skipped(ctx, add_raw, 
     assert (item.kind, item.title) == ("other", "Фото")
 
 
+async def test_huge_picture_is_not_downloaded_or_sent(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:
+    # A 20 MB PNG sent as a file: ~27 MB of base64 would outlast llm_timeout_s on a home uplink.
+    raw = await add_raw(
+        None, content_type="image_document", file_id="big", mime_type="image/png", file_size=20 * 1024 * 1024
+    )
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.calls_of("download") == [] and fake_ai.inputs == []
+    [item] = await items_of_raw(raw.id)
+    assert (item.kind, item.title) == ("other", "Картинка")
+
+
+async def test_album_pictures_are_capped_in_size(ctx, add_raw, fake_ai, bot) -> None:
+    mb = 1024 * 1024
+    bot.files = {"p1": b"1" * (7 * mb), "p3": b"3" * 100, "p4": b"4" * (9 * mb)}
+    await add_raw(None, content_type="photo", file_id="p0", file_size=9 * mb, media_group_id="G", message_id=200)
+    await add_raw(
+        None, content_type="image_document", file_id="p1", mime_type="image/png", media_group_id="G", message_id=201
+    )
+    await add_raw(None, content_type="photo", file_id="p2", file_size=6 * mb, media_group_id="G", message_id=202)
+    await add_raw("скриншоты", content_type="photo", file_id="p3", media_group_id="G", message_id=203)
+    await add_raw(None, content_type="photo", file_id="p4", media_group_id="G", message_id=204)  # size unknown
+    fake_ai.push({"items": [{"kind": "note", "title": "Скриншоты"}]})
+
+    await processor.handle_album(ctx, {"media_group_id": "G", "chat_id": OWNER})
+
+    [inp] = fake_ai.inputs
+    # p0 is over the per-picture limit, p2 no longer fits next to p1, p4 turns out too big after the download.
+    assert [data[:1] for data, _ in inp.images] == [b"1", b"3"]
+    assert [call["file"] for call in bot.calls_of("download")] == ["p1", "p3", "p4"]
+
+
 # --- query ----------------------------------------------------------------------------------------------------------
 
 
@@ -328,6 +425,29 @@ async def test_query_with_nothing_found(ctx, add_raw, fake_ai, bot) -> None:
     assert "Ничего не нашёл" in bot.texts[0]
 
 
+@pytest.mark.parametrize("error", [AIBadResponse("empty answer from m"), AIUnavailable("503")])
+async def test_query_summary_falls_back_to_the_list(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, sessionmaker, jobs_all, error
+) -> None:
+    # The rows are found already: a retry would pay for the extraction again just for the prose.
+    await make_items({"kind": "event", "title": "Созвон", "when": {"day": "+1", "time": "10:00"}}, now=t0)
+    raw = await add_raw("что у меня завтра?")
+    async with sessionmaker() as session:
+        await jobs.enqueue(session, "message", {"raw_id": raw.id})
+        await session.commit()
+    fake_ai.push({"intent": "query", "query": {"range": "tomorrow", "answer": "summary"}})
+    fake_ai.answers = [error]
+
+    await JobWorker(ctx, processor.HANDLERS).run_once()
+
+    assert [j.status for j in await jobs_all()] == ["done"]
+    assert len(fake_ai.inputs) == 1 and len(fake_ai.answer_calls) == 1
+    [answer] = bot.texts
+    assert "Созвон" in answer and "10:00" in answer
+    assert bot.reactions == [(raw.message_id, "👌")]
+    assert (await get(RawMessage, raw.id)).status == "done"
+
+
 # --- edit -----------------------------------------------------------------------------------------------------------
 
 EDIT_TO_16 = {"intent": "edit", "edit": {"target": "встреча Олег", "when": {"day": "+1", "time": "16:00"}}}
@@ -350,7 +470,9 @@ async def test_edit_by_target_single_candidate(
     assert (await get(RawMessage, raw.id)).status == "done"
 
 
-async def test_edit_by_target_many_candidates_offers_a_pick(ctx, add_raw, fake_ai, bot, make_items, t0) -> None:
+async def test_edit_by_target_many_candidates_offers_a_pick(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, bot_messages
+) -> None:
     created = await make_items(
         {"kind": "event", "title": "Встреча с Олегом", "when": {"day": "+1", "time": "15:00"}},
         {"kind": "event", "title": "Встреча с Олегом по проекту", "when": {"day": "+2", "time": "11:00"}},
@@ -363,13 +485,54 @@ async def test_edit_by_target_many_candidates_offers_a_pick(ctx, add_raw, fake_a
     picks = {data for _, data in buttons(msg)}
     assert picks == {PickCb(raw=raw.id, item=c.item.id).pack() for c in created}
     assert bot.reactions == [(raw.message_id, "🤔")]
+    [record] = await bot_messages()
+    assert (record.purpose, record.raw_message_id) == ("pick", raw.id)
+    # The list order is kept with the raw: a text reply "2" picks the second item.
+    stored = (await get(RawMessage, raw.id)).raw_json[processor.CANDIDATES_KEY]
+    assert sorted(stored) == sorted(c.item.id for c in created) and len(stored) == 2
 
 
-async def test_edit_by_target_without_candidates(ctx, add_raw, fake_ai, bot) -> None:
+async def test_edit_by_target_loose_single_match_asks_first(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, bot_messages
+) -> None:
+    # "удалить приложение банка" read as an edit: only the word "банк" matches an unrelated task.
+    [credit] = await make_items({"kind": "task", "title": "Оплатить кредит в банке"}, now=t0)
+    raw = await add_raw("удалить приложение банка")
+    fake_ai.push({"intent": "edit", "edit": {"target": "приложение банка", "action": "delete"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert (await get(Item, credit.item.id)).status == "open"
+    [msg] = bot.sent
+    assert buttons(msg) == [("1", PickCb(raw=raw.id, item=credit.item.id).pack())]
+    assert bot.reactions == [(raw.message_id, "🤔")]
+
+
+@pytest.mark.parametrize("action", ["delete", "done", "no_reminder", "stop_recurrence"])
+async def test_edit_by_target_destructive_action_asks_even_for_an_exact_match(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, action
+) -> None:
+    [created] = await make_items({"kind": "event", "title": "Встреча с Олегом", "when": {"time": "15:00"}}, now=t0)
+    raw = await add_raw("удали встречу с Олегом")
+    fake_ai.push({"intent": "edit", "edit": {"target": "встреча Олег", "action": action}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    item = await get(Item, created.item.id)
+    assert (item.status, item.updated_at) == ("open", created.item.updated_at)
+    [msg] = bot.sent
+    assert buttons(msg) == [("1", PickCb(raw=raw.id, item=created.item.id).pack())]
+
+
+async def test_edit_by_target_without_candidates_keeps_the_message(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:
     raw = await add_raw("перенеси отпуск")
     fake_ai.push({"intent": "edit", "edit": {"target": "отпуск в Испании", "when": {"day": "+1"}}})
     await processor.handle_message(ctx, {"raw_id": raw.id})
-    assert bot.texts == [processor.NOT_FOUND_TEXT]
+
+    [item] = await items_of_raw(raw.id)
+    assert (item.kind, item.title) == ("note", "перенеси отпуск")
+    [card] = bot.texts
+    assert card.startswith(processor.NOT_FOUND_TEXT) and "перенеси отпуск" in card
+    assert "i:edit:" in str(buttons(bot.sent[0]))  # fixable with ✏️ (category, time)
+    assert bot.reactions == [(raw.message_id, "👌")]
 
 
 async def test_reply_edit_applies_once(ctx, add_raw, fake_ai, bot, make_items, t0, get) -> None:
@@ -425,6 +588,51 @@ async def test_edit_time_job(ctx, fake_ai, bot, make_items, t0, occurrences_of, 
     assert bot.reactions == [(555, "👌")]
 
 
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {},  # the model found nothing
+        {"title": "Как обычно"},  # a title, no time
+        {"action": "delete"},  # "отмена" read as "удали"
+        {"when": {"text": "30 февраля", "day": "2026-02-30"}},  # no such date
+    ],
+)
+async def test_edit_time_without_a_time_changes_nothing(ctx, fake_ai, bot, make_items, t0, get, edit) -> None:
+    [created] = await make_items({"kind": "task", "title": "Отчёт", "when": {"day": "+1", "time": "15:00"}}, now=t0)
+    fake_ai.push({"intent": "edit", "edit": edit})
+    await processor.handle_edit_time(ctx, {"item_id": created.item.id, "text": "как обычно", "message_id": 557})
+
+    item = await get(Item, created.item.id)
+    assert (item.title, item.status, item.updated_at) == ("Отчёт", "open", created.item.updated_at)
+    assert bot.texts == [processor.TIME_NOT_UNDERSTOOD_TEXT]
+    assert reply_to(bot.sent[0]) == 557
+    assert bot.reactions == [(557, "🤔")]
+
+
+async def test_edit_time_applies_only_the_time(ctx, fake_ai, bot, make_items, t0, get, occurrences_of, local) -> None:
+    [created] = await make_items({"kind": "task", "title": "Отчёт", "when": {"day": "+1", "time": "15:00"}}, now=t0)
+    edit = {"title": "Пятница", "kind": "idea", "action": "done", "when": {"day": "FR", "time": "18:00"}, "lead": [30]}
+    fake_ai.push({"intent": "edit", "edit": edit})
+    await processor.handle_edit_time(ctx, {"item_id": created.item.id, "text": "в пятницу 18", "message_id": 558})
+
+    item = await get(Item, created.item.id)
+    assert (item.title, item.kind, item.status, item.lead_minutes) == ("Отчёт", "task", "open", [30])
+    [occ] = [o for o in await occurrences_of(created.item.id) if o.status == "open"]
+    assert occ.due_at == local(2026, 10, 9, 18, 0)
+    assert bot.reactions == [(558, "👌")]
+
+
+async def test_edit_time_job_is_applied_once(ctx, fake_ai, bot, make_items, t0, get) -> None:
+    [created] = await make_items({"kind": "task", "title": "Отчёт", "when": {"day": "+1", "time": "15:00"}}, now=t0)
+    fake_ai.push({"intent": "edit", "edit": {"when": {"text": "в пятницу 18", "day": "FR", "time": "18:00"}}})
+    payload = {"item_id": created.item.id, "text": "в пятницу 18", "message_id": 556}
+    await processor.handle_edit_time(ctx, payload)
+    assert await get(OnceKey, f"edit-time-done:{created.item.id}:556") is not None
+
+    await processor.handle_edit_time(ctx, payload)  # re-run after a restart: no second AI call or card
+    assert len(fake_ai.inputs) == 1 and len(bot.sent) == 1
+
+
 # --- clarification --------------------------------------------------------------------------------------------------
 
 
@@ -452,6 +660,21 @@ async def test_ask_then_clarify_replaces_items(ctx, add_raw, fake_ai, bot, items
     assert (await get(Item, first.id)).status == "deleted"
     assert "Позвонить маме" in bot.texts[-1]
     assert bot.reactions[-1] == (raw.message_id, "👌")
+
+
+async def test_clarify_is_applied_once(ctx, add_raw, fake_ai, bot, items_of_raw, get) -> None:
+    raw = await add_raw(
+        "в 8 позвонить маме", status="done", raw_json={processor.ASK_KEY: {"options": ["утра", "вечера"]}}
+    )
+    fake_ai.push({"items": [{"kind": "task", "title": "Позвонить маме", "when": {"time": "20:00"}}]})
+    await processor.handle_clarify(ctx, {"raw_id": raw.id, "option": 1})
+    [first] = await items_of_raw(raw.id)
+    assert await get(OnceKey, f"clarify-done:{raw.id}") is not None
+
+    # The job runs again (SIGTERM after the commit, while the cards were being sent).
+    await processor.handle_clarify(ctx, {"raw_id": raw.id, "option": 1})
+    assert len(fake_ai.inputs) == 1 and len(bot.sent) == 1
+    assert [i.id for i in await items_of_raw(raw.id)] == [first.id]
 
 
 async def test_clarify_accepts_option_text(ctx, add_raw, fake_ai) -> None:
@@ -541,6 +764,117 @@ async def test_ai_config_error_notifies_once_a_day(ctx, add_raw, fake_ai, bot, g
     [notice] = bot.texts
     assert "chutes.ai" in notice and "402" in notice
     assert [emoji for _, emoji in bot.reactions] == ["✍", "✍"]
+
+
+async def test_missing_primary_model_is_reported_once_a_day_while_the_fallback_works(
+    ctx, add_raw, fake_ai, bot, items_of_raw, frozen
+) -> None:
+    def on_fallback(title: str) -> ExtractOutput:
+        extraction = Extraction.model_validate({"items": [{"kind": "idea", "title": title}]})
+        return ExtractOutput(extraction, "Qwen/Qwen3-32B-TEE", "v1", missing_model="google/gemma-gone")
+
+    raws = [await add_raw("идея раз"), await add_raw("идея два")]
+    fake_ai.push(on_fallback("Раз"), on_fallback("Два"))
+    for raw in raws:
+        await processor.handle_message(ctx, {"raw_id": raw.id})
+        [item] = await items_of_raw(raw.id)
+        assert item.ai_model == "Qwen/Qwen3-32B-TEE"
+    [notice] = bot.texts
+    assert "google/gemma-gone" in notice and "Qwen/Qwen3-32B-TEE" in notice and "LLM_MODEL" in notice
+    assert [emoji for _, emoji in bot.reactions] == ["👌", "👌"]
+
+    frozen.advance(days=1)
+    raw = await add_raw("идея три")
+    fake_ai.push(on_fallback("Три"))
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert len(bot.texts) == 2
+
+
+# --- unusable AI results (AIBadResponse): no retries ---------------------------------------------------------------
+
+
+async def test_unusable_ai_result_keeps_the_text_as_a_note_without_retries(
+    ctx, add_raw, fake_ai, bot, sessionmaker, jobs_all, items_of_raw, get
+) -> None:
+    # temperature 0 + fixed seed: 10 retries over 14 h would pay for the same unusable answer every time.
+    raw = await add_raw("напомни завтра купить молоко\nи хлеб")
+    async with sessionmaker() as session:
+        await jobs.enqueue(session, "message", {"raw_id": raw.id})
+        await session.commit()
+    fake_ai.push(AIBadResponse("no valid extraction from the primary and fallback models"))
+
+    await JobWorker(ctx, processor.HANDLERS).run_once()
+
+    [job] = await jobs_all()
+    assert (job.status, job.attempts) == ("done", 1)
+    assert len(fake_ai.inputs) == 1
+    [item] = await items_of_raw(raw.id)
+    assert (item.kind, item.title, item.ai_model) == ("note", "напомни завтра купить молоко", None)
+    assert item.source_text == "напомни завтра купить молоко\nи хлеб"
+    assert (await get(RawMessage, raw.id)).status == "done"
+    assert bot.texts == [processor.FAILED_MESSAGE_TEXT]
+    assert bot.reactions == [(raw.message_id, "😢")]
+
+
+async def test_unusable_ai_result_for_a_picture_or_voice_keeps_it_by_type(
+    ctx, add_raw, fake_ai, bot, stt, items_of_raw
+) -> None:
+    photo = await add_raw(None, content_type="photo", file_id="ph")
+    fake_ai.push(AIBadResponse("HTTP 413: Request Entity Too Large"))
+    await processor.handle_message(ctx, {"raw_id": photo.id})
+    [item] = await items_of_raw(photo.id)
+    assert (item.kind, item.title) == ("other", "Фото")
+
+    voice = await add_raw(None, content_type="voice", file_id="vo")
+    stt.results = [AIBadResponse("malformed STT response (KeyError)")]
+    await processor.handle_message(ctx, {"raw_id": voice.id})
+    [item] = await items_of_raw(voice.id)
+    assert (item.kind, item.title) == ("other", "Голосовое сообщение")
+    assert len(fake_ai.inputs) == 1  # the voice message never reached extract
+    assert bot.reactions == [(photo.message_id, "😢"), (voice.message_id, "😢")]
+
+
+async def test_unusable_ai_result_for_a_clarification_keeps_the_items(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:
+    raw = await add_raw("в 8 позвонить маме", raw_json={processor.ASK_KEY: {"options": ["утра", "вечера"]}})
+    fake_ai.push({"items": [{"kind": "task", "title": "Позвонить маме", "when": {"time": "20:00"}}]})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    [first] = await items_of_raw(raw.id)
+
+    fake_ai.push(AIBadResponse("no valid extraction"))
+    await processor.handle_clarify(ctx, {"raw_id": raw.id, "option": 1})
+
+    assert [i.id for i in await items_of_raw(raw.id)] == [first.id]
+    assert bot.texts[-1] == processor.FAILED_MESSAGE_TEXT
+    assert bot.reactions[-1] == (raw.message_id, "😢")
+
+
+async def test_unusable_ai_result_for_a_reply_edit_fails_at_once(
+    ctx, add_raw, fake_ai, bot, make_items, t0, sessionmaker, jobs_all, get
+) -> None:
+    [created] = await make_items({"kind": "task", "title": "Купить наушники"}, now=t0)
+    raw = await add_raw("сделай что-нибудь", reply_item_id=created.item.id, message_id=701)
+    async with sessionmaker() as session:
+        await jobs.enqueue(session, "edit", {"raw_id": raw.id, "item_id": created.item.id})
+        await session.commit()
+    fake_ai.push(AIBadResponse("intent=edit requires 'edit'"))
+
+    await JobWorker(ctx, processor.HANDLERS).run_once()
+
+    [job] = await jobs_all()
+    assert (job.status, job.attempts) == ("done", 1)
+    assert (await get(Item, created.item.id)).title == "Купить наушники"
+    stored = await get(RawMessage, raw.id)
+    assert stored.status == "failed" and "AIBadResponse" in stored.error
+    assert bot.texts == [processor.FAILED_EDIT_TEXT]
+    assert bot.reactions == [(701, "😢")]
+
+
+async def test_unusable_ai_result_for_edit_time_fails_at_once(ctx, fake_ai, bot, make_items, t0, get) -> None:
+    [created] = await make_items({"kind": "task", "title": "Отчёт", "when": {"day": "+1", "time": "15:00"}}, now=t0)
+    fake_ai.push(AIBadResponse("no valid extraction"))
+    await processor.handle_edit_time(ctx, {"item_id": created.item.id, "text": "когда-нибудь", "message_id": 557})
+    assert bot.texts == [processor.FAILED_EDIT_TEXT] and reply_to(bot.sent[0]) == 557
+    assert bot.reactions == [(557, "😢")]
 
 
 # --- on_dead --------------------------------------------------------------------------------------------------------

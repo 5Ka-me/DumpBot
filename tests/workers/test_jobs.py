@@ -11,6 +11,7 @@ from sqlalchemy import select, update
 
 from dumpbot.ai.client import AIConfigError, AIUnavailable
 from dumpbot.db.models import Job, RawMessage
+from dumpbot.watchdog import Watchdog
 from dumpbot.workers import jobs
 from dumpbot.workers.jobs import JobWorker, RetryLater, claim, enqueue
 
@@ -272,6 +273,37 @@ async def test_run_loop_wakes_survives_errors_and_cancels(ctx, sessionmaker, get
         await asyncio.sleep(0.02)
     assert (await get(Job, good_id)).status == "done"
 
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_run_loop_reports_progress_to_the_watchdog(ctx, sessionmaker) -> None:
+    clock = [0.0]
+    ctx.watchdog = Watchdog(monotonic=lambda: clock[0])
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def hangs(ctx_: Any, payload: dict) -> None:
+        started.set()
+        await release.wait()
+
+    task = asyncio.create_task(JobWorker(ctx, {"hangs": hangs}, poll_interval_s=60, on_dead=None).run())
+    await asyncio.sleep(0.05)
+    await _enqueue(sessionmaker, "hangs")
+    ctx.jobs_wakeup.set()
+    await asyncio.wait_for(started.wait(), 5)
+    clock[0] += jobs.STALL_AFTER.total_seconds()
+    assert ctx.watchdog.stalled() == {}
+    clock[0] += 1
+    assert ctx.watchdog.stalled() == {"jobs": jobs.STALL_AFTER.total_seconds() + 1}  # a job hung for 30 min
+
+    release.set()  # the job ends: the worker beats again
+    for _ in range(100):
+        if not ctx.watchdog.stalled():
+            break
+        await asyncio.sleep(0.02)
+    assert ctx.watchdog.stalled() == {}
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

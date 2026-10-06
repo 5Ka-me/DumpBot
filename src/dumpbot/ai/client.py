@@ -1,7 +1,9 @@
 """chutes.ai client: OpenAI-compatible ``/chat/completions`` over aiohttp, model prices, usage accounting.
 
 Error mapping (chutes answers with these in the wild):
-- 401 "Invalid token", 402 (no balance), 403, 404 "model not found" / "No matching cord found!" -> ``AIConfigError``
+- 401 "Invalid token", 402 (no balance), 403 -> ``AIConfigError``
+- 404 "model not found" / "No matching cord found!" -> ``AIModelNotFound`` (an ``AIConfigError``: only this model is
+  gone, so ``extract`` / ``answer_query`` still try the fallback model)
 - 408, 429 (nginx HTML, maybe ``Retry-After``), 5xx incl. 503 "No instances available (yet)",
   500 "exhausted all available targets", network errors, timeouts -> ``AIUnavailable``
 - 400 -> response_format ladder (strict json_schema -> json_object -> plain), then ``AIBadResponse``
@@ -61,6 +63,10 @@ class AIConfigError(AIError):
     """401 (API key), 402 (no balance), 403, 404 (model / chute not found). Needs the owner."""
 
 
+class AIModelNotFound(AIConfigError):
+    """404: this model / chute does not exist (renamed, retired, a typo). Other models may still work."""
+
+
 class AIBadResponse(AIError):
     """The model answered, but the result is unusable (after all retries)."""
 
@@ -73,6 +79,7 @@ class ChatResult:
     output_tokens: int
     cost_usd: float
     latency_ms: int
+    finish_reason: str | None = None  # "stop", "length" (cut at max_tokens), … as reported by the API
 
 
 class _Rejected(Exception):
@@ -137,7 +144,9 @@ def error_snippet(body: bytes | str, limit: int = 200) -> str:
 def http_error(status: int, body: bytes | str, headers: Mapping[str, str]) -> AIError:
     """Map a non-200 HTTP status to the AI error hierarchy (400 is handled by the caller)."""
     message = f"HTTP {status}: {error_snippet(body)}"
-    if status in (401, 402, 403, 404):
+    if status == 404:
+        return AIModelNotFound(message)
+    if status in (401, 402, 403):
         return AIConfigError(message)
     if status in (408, 429) or status >= 500:
         return AIUnavailable(message, retry_after=parse_retry_after(headers.get("Retry-After")))
@@ -171,6 +180,13 @@ def _usage_int(data: Mapping[str, Any], key: str) -> int | None:
         return None
 
 
+def _cached_tokens(usage_data: Mapping[str, Any], prompt_tokens: int) -> int:
+    """``usage.prompt_tokens_details.cached_tokens`` (part of ``prompt_tokens``), clamped to [0, prompt_tokens]."""
+    details = usage_data.get("prompt_tokens_details")
+    cached = _usage_int(details, "cached_tokens") if isinstance(details, Mapping) else None
+    return min(max(cached or 0, 0), prompt_tokens)
+
+
 # --- client ----------------------------------------------------------------------------------------------------
 
 
@@ -190,7 +206,7 @@ class ChutesClient:
         self._base = settings.chutes_base_url.rstrip("/")
         # (model, uses json_schema) -> response_format level that worked last time
         self._levels: dict[tuple[str, bool], int] = {}
-        self._prices: dict[str, tuple[float, float]] = {}
+        self._prices: dict[str, tuple[float, float, float]] = {}  # USD per 1M (input, output, cached input)
         self._prices_valid_until: datetime | None = None
         self._prices_lock = asyncio.Lock()
 
@@ -296,7 +312,8 @@ class ChutesClient:
 
         try:
             data = json.loads(raw)
-            message = data["choices"][0]["message"]
+            choice = data["choices"][0]
+            message = choice["message"]
             if not isinstance(message, dict):
                 raise TypeError("message is not an object")
         except (ValueError, KeyError, IndexError, TypeError) as e:
@@ -320,8 +337,11 @@ class ChutesClient:
             in_tok = _estimate_tokens(_prompt_chars(messages))
         if out_tok is None:
             out_tok = _estimate_tokens(len(raw_content) + len(reasoning))
-        price_in, price_out = await self.price(model)
-        cost = in_tok * price_in / 1e6 + out_tok * price_out / 1e6
+        # prompt_tokens includes the cached prefix, which is billed at the (much lower) cache-read price.
+        cached = _cached_tokens(usage_data, in_tok)
+        price_in, price_out, price_cached = await self._price(model)
+        cost = ((in_tok - cached) * price_in + cached * price_cached + out_tok * price_out) / 1e6
+        finish_reason = choice.get("finish_reason")
 
         await self._record(
             purpose, model, input_tokens=in_tok, output_tokens=out_tok, cost_usd=cost, latency_ms=latency
@@ -334,6 +354,7 @@ class ChutesClient:
             output_tokens=out_tok,
             cost_usd=cost,
             latency_ms=latency,
+            finish_reason=finish_reason if isinstance(finish_reason, str) else None,
         )
 
     async def _record(self, purpose: str, model: str, **fields: Any) -> None:
@@ -344,10 +365,16 @@ class ChutesClient:
 
     async def price(self, model: str) -> tuple[float, float]:
         """USD per 1M (input, output) tokens from ``GET {base}/models`` (cached 6 h), else the fallback prices."""
+        price_in, price_out, _ = await self._price(model)
+        return price_in, price_out
+
+    async def _price(self, model: str) -> tuple[float, float, float]:
+        """USD per 1M (input, output, cached input) tokens; cached input costs as much as input when not listed."""
         await self._refresh_prices()
         found = self._prices.get(model)
         if found is None:
-            return self._settings.llm_fallback_price_in, self._settings.llm_fallback_price_out
+            fallback_in = self._settings.llm_fallback_price_in
+            return fallback_in, self._settings.llm_fallback_price_out, fallback_in
         return found
 
     async def _refresh_prices(self) -> None:
@@ -366,16 +393,16 @@ class ChutesClient:
             self._prices = prices
             self._prices_valid_until = clock.utcnow() + PRICE_TTL
 
-    async def _fetch_prices(self) -> dict[str, tuple[float, float]]:
+    async def _fetch_prices(self) -> dict[str, tuple[float, float, float]]:
+        # The list is public. No key is sent: with a bad key it would answer 401 and break price lookup too.
         async with self._session().get(
             f"{self._base}/models",
-            headers=self._headers(),
             timeout=aiohttp.ClientTimeout(total=PRICE_FETCH_TIMEOUT_S),
         ) as resp:
             if resp.status != 200:
                 raise ValueError(f"GET /models -> HTTP {resp.status}")
             data = await resp.json(content_type=None)
-        prices: dict[str, tuple[float, float]] = {}
+        prices: dict[str, tuple[float, float, float]] = {}
         for entry in data.get("data") or []:
             pricing = entry.get("pricing") if isinstance(entry, dict) else None
             if not isinstance(pricing, dict) or not entry.get("id"):
@@ -383,9 +410,14 @@ class ChutesClient:
             p_in = pricing.get("prompt", pricing.get("input"))
             p_out = pricing.get("completion", pricing.get("output"))
             try:
-                prices[str(entry["id"])] = (float(p_in), float(p_out))
+                price_in, price_out = float(p_in), float(p_out)
             except (TypeError, ValueError):
                 continue
+            try:
+                price_cached = float(pricing["input_cache_read"])
+            except (KeyError, TypeError, ValueError):
+                price_cached = price_in  # not listed: no discount assumed
+            prices[str(entry["id"])] = (price_in, price_out, price_cached)
         return prices
 
 

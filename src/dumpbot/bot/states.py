@@ -4,8 +4,10 @@ State data keys:
 - edit:     ``item_id``, ``prompt_id`` (the card message turned into the prompt), ``since`` (ISO UTC);
 - settings: ``field`` (a ``views.ASK_FIELDS`` key), ``prompt_id`` (the menu message), ``since``.
 
-A prompt older than ``PROMPT_TTL`` no longer captures text: an abandoned "✏️ Название" must not swallow the next
-note the owner dumps hours later.
+Only an answer to the prompt is taken (``bot.routers.common.is_answer``): a reply to the prompt within ``PROMPT_TTL``,
+or a plain typed message within ``ANSWER_TTL``. Anything else (a forward, a reply to another message, a "?"
+question, a later note) closes the dialog and is saved as usual: an abandoned "✏️ Название" must not swallow the
+next thing the owner dumps.
 """
 
 from __future__ import annotations
@@ -17,7 +19,8 @@ from aiogram.fsm.state import State, StatesGroup
 
 from dumpbot import clock
 
-PROMPT_TTL: Final = timedelta(minutes=15)
+PROMPT_TTL: Final = timedelta(minutes=15)  # a reply to the prompt message
+ANSWER_TTL: Final = timedelta(minutes=5)  # a message that is not a reply
 
 
 class EditStates(StatesGroup):
@@ -35,10 +38,10 @@ def prompt_data(prompt_id: int | None, **values: Any) -> dict[str, Any]:
     return {"prompt_id": prompt_id, "since": clock.utcnow().isoformat(), **values}
 
 
-def expired(data: dict[str, Any]) -> bool:
-    """True when the prompt is older than PROMPT_TTL (or carries no usable timestamp)."""
+def expired(data: dict[str, Any], ttl: timedelta = PROMPT_TTL) -> bool:
+    """True when the prompt is older than ``ttl`` (or carries no usable timestamp)."""
     try:
         since = datetime.fromisoformat(str(data.get("since")))
     except ValueError:
         return True
-    return clock.utcnow() - since > PROMPT_TTL
+    return clock.utcnow() - since > ttl

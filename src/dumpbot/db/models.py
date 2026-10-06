@@ -205,7 +205,8 @@ class BotMessage(Base):
 
     chat_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     message_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    purpose: Mapped[str] = mapped_column(String(16))  # card | reminder | digest | answer | ask | notice
+    # card | reminder | digest | answer | ask | pick | notice | help | list | ... (see bot.sender callers)
+    purpose: Mapped[str] = mapped_column(String(16))
     item_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="SET NULL"))
     occurrence_id: Mapped[int | None] = mapped_column(ForeignKey("occurrences.id", ondelete="SET NULL"))
     raw_message_id: Mapped[int | None] = mapped_column(ForeignKey("raw_messages.id", ondelete="SET NULL"))

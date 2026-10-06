@@ -80,7 +80,7 @@ def test_empty_when_has_no_time():
 
 def test_at_wins_over_everything():
     due, precision, _, confirm = resolve(at="2026-10-20T10:00", in_min=30, day="+1", time="09:00")
-    assert (due, precision, confirm) == (L(2026, 10, 20, 10, 0), "fallback", True)
+    assert (due, precision, confirm) == (L(2026, 10, 20, 10, 0), "exact", True)
 
 
 def test_in_min_wins_over_day_and_time():
@@ -249,9 +249,25 @@ def test_today_with_passed_time_moves_to_tomorrow(day: str):
     assert confirm is True
 
 
-def test_today_without_time_after_bare_time_moves_to_tomorrow():
-    due, precision, warnings, confirm = resolve(day="+0")
-    assert (due, precision, warnings, confirm) == (L(2026, 10, 7, 10, 0), "date", [WARN_MOVED_TOMORROW], True)
+@pytest.mark.parametrize("day", ["+0", "+0d", "+0w", "2026-10-06"])
+def test_today_without_time_after_bare_time_stays_today(day: str):
+    # 14:05: "сегодня купить молоко" — 10:00 is only the default for a bare date, not the user's cut-off.
+    assert resolve(day=day) == (L(2026, 10, 6, 19, 0), "date", [], False)
+
+
+def test_today_without_time_before_bare_time_uses_it():
+    assert resolve(now=L(2026, 10, 6, 8, 0), day="+0") == (L(2026, 10, 6, 10, 0), "date", [], False)
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (L(2026, 10, 6, 20, 30), L(2026, 10, 6, 21, 30)),  # task_default_time passed too: in an hour
+        (L(2026, 10, 6, 23, 30), L(2026, 10, 6, 23, 59)),  # ...but never past the end of the day
+    ],
+)
+def test_today_without_time_late_in_the_evening_stays_today(now: datetime, expected: datetime):
+    assert resolve(now=now, day="+0") == (expected, "date", [], False)
 
 
 def test_today_slot_passed_moves_with_warning():
@@ -323,15 +339,18 @@ def test_next_weekday_from_monday_morning():
     [
         (NOW, "d20", None, L(2026, 10, 20, 10, 0)),
         (NOW, "d5", None, L(2026, 11, 5, 10, 0)),  # passed -> next month
-        (NOW, "d6", None, L(2026, 11, 6, 10, 0)),  # today, 10:00 passed -> next month
+        (NOW, "d6", None, L(2026, 10, 6, 19, 0)),  # today without a time: still today ("оплатить 6-го")
+        (NOW, "d6", "14:00", L(2026, 11, 6, 14, 0)),  # today, the time given has passed -> next month
         (NOW, "d6", "15:00", L(2026, 10, 6, 15, 0)),  # today, still ahead
         (NOW, "d31", None, L(2026, 10, 31, 10, 0)),
         (L(2026, 11, 3, 12, 0), "d31", None, L(2026, 11, 30, 10, 0)),  # 30-day month -> clamp
-        (L(2026, 11, 30, 12, 0), "d31", None, L(2026, 12, 31, 10, 0)),  # clamped day passed -> next month
+        (L(2026, 11, 30, 12, 0), "d31", "10:00", L(2026, 12, 31, 10, 0)),  # clamped day passed -> next month
+        (L(2026, 11, 30, 12, 0), "d31", None, L(2026, 11, 30, 19, 0)),  # clamped day is today
         (L(2027, 2, 2, 12, 0), "d30", None, L(2027, 2, 28, 10, 0)),
-        (L(2027, 1, 31, 12, 0), "d31", None, L(2027, 2, 28, 10, 0)),
+        (L(2027, 1, 31, 12, 0), "d31", "10:00", L(2027, 2, 28, 10, 0)),
         (NOW, "d-1", None, L(2026, 10, 31, 10, 0)),
-        (L(2026, 10, 31, 12, 0), "d-1", None, L(2026, 11, 30, 10, 0)),
+        (L(2026, 10, 31, 12, 0), "d-1", None, L(2026, 10, 31, 19, 0)),  # the last day is today
+        (L(2026, 10, 31, 12, 0), "d-1", "11:00", L(2026, 11, 30, 11, 0)),
         (L(2028, 2, 10, 12, 0), "d-1", None, L(2028, 2, 29, 10, 0)),
         (L(2026, 12, 15, 12, 0), "d1", None, L(2027, 1, 1, 10, 0)),
     ],
@@ -352,7 +371,8 @@ def test_month_day(now: datetime, day: str, time_: str | None, expected: datetim
         ("10-20", None, L(2026, 10, 20, 10, 0)),
         ("01-15", None, L(2027, 1, 15, 10, 0)),
         ("10-01", None, L(2027, 10, 1, 10, 0)),  # passed -> next year
-        ("10-06", None, L(2027, 10, 6, 10, 0)),  # today, 10:00 passed
+        ("10-06", None, L(2026, 10, 6, 19, 0)),  # today without a time: today, not next year
+        ("10-06", "14:00", L(2027, 10, 6, 14, 0)),  # today, the time given has passed -> next year
         ("10-06", "15:00", L(2026, 10, 6, 15, 0)),  # today, still ahead
         ("02-29", None, L(2028, 2, 29, 10, 0)),  # waits for a leap year
     ],
@@ -411,12 +431,17 @@ def test_weekend_time_from_prefs():
 # --- at (fallback) ------------------------------------------------------------------------------------------
 
 
-def test_at_with_time():
-    assert resolve(at="2026-11-27T15:00") == (L(2026, 11, 27, 15, 0), "fallback", [], True)
+def test_at_with_time_is_the_users_time():
+    # "через две недели в пятницу в 23:30": the time is stated, so lead and quiet hours work as for day+time.
+    assert resolve(at="2026-11-27T15:00") == (L(2026, 11, 27, 15, 0), "exact", [], True)
 
 
 def test_at_date_only_uses_bare_date_time():
     assert resolve(at="2026-11-27") == (L(2026, 11, 27, 10, 0), "fallback", [], True)
+
+
+def test_at_date_only_today_stays_today():
+    assert resolve(at="2026-10-06") == (L(2026, 10, 6, 19, 0), "fallback", [], True)
 
 
 def test_at_is_local_wall_time_across_dst():
@@ -425,7 +450,8 @@ def test_at_is_local_wall_time_across_dst():
 
 
 def test_at_in_past_warns():
-    assert resolve(at="2026-10-01T15:00") == (L(2026, 10, 1, 15, 0), "fallback", [WARN_PAST_DATE], True)
+    assert resolve(at="2026-10-01T15:00") == (L(2026, 10, 1, 15, 0), "exact", [WARN_PAST_DATE], True)
+    assert resolve(at="2026-10-01") == (L(2026, 10, 1, 10, 0), "fallback", [WARN_PAST_DATE], True)
 
 
 @pytest.mark.parametrize("at", ["2026-02-30", "2026-10-06T25:00", "2026-10-06T10:61"])

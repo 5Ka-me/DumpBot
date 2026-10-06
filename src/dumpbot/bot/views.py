@@ -258,7 +258,7 @@ def _time_line(
     tz = prefs.zone
     done = _occ_done(item, occ)
     if occ.precision == "default":
-        if done:
+        if done or occ.status == "cancelled":  # a time the bot chose, no longer planned: nothing to show
             return None
         head = "без срока"
     elif occ.precision == "date":
@@ -406,12 +406,19 @@ def deleted_card(item: Item) -> MenuView:
 
 
 def edit_menu(item: Item) -> MenuView:
+    """Field menu; open actionable items also get [✅ Готово] here (the card itself has no done button)."""
     text = (
         f"✏️ <b>{q(item.title)}</b>\n"
         "Что изменить?\n"
         "<i>Можно просто ответить на карточку текстом, например «перенеси на завтра 15:00» или «это идея».</i>"
     )
+    done_row = (
+        [button("✅ Готово", ItemCb(a="done", id=item.id), style="success")]
+        if item.kind in ACTIONABLE and item.status == "open"
+        else []
+    )
     kb = markup(
+        done_row,
         [button("🕒 Время", ItemCb(a="time", id=item.id)), button("🏷 Категория", ItemCb(a="kind", id=item.id))],
         [button("#️⃣ Теги", ItemCb(a="tags", id=item.id)), button("✏️ Название", ItemCb(a="title", id=item.id))],
         [button("⏱ Напомнить за…", ItemCb(a="lead", id=item.id)), *back_to_card_row(item.id)],
@@ -430,7 +437,7 @@ def kind_menu(item: Item) -> MenuView:
 
 
 def lead_menu(item: Item) -> MenuView:
-    """0/5/15/30/60/1440 minutes before (the item's own override marked ✓)."""
+    """0/5/15/30/60/1440 minutes before (the item's own override marked ✓; ``[]`` = switched off by 🔕)."""
     current = set(item.lead_minutes or [])
     buttons = [
         button(f"{'✓ ' if m in current else ''}{'В момент' if m == 0 else fmt_duration(m)}", LeadCb(id=item.id, m=m))
@@ -438,7 +445,10 @@ def lead_menu(item: Item) -> MenuView:
     ]
     now_text = _join_ru([_lead_setting(m) for m in sorted(current, reverse=True)])
     lines = [f"⏱ За сколько напомнить о <b>{q(item.title)}</b>?"]
-    lines.append(f"Сейчас: {now_text}" if current else "Сейчас: как в настройках")
+    if item.lead_minutes == []:
+        lines.append("Сейчас: напоминания выключены")
+    else:
+        lines.append(f"Сейчас: {now_text}" if current else "Сейчас: как в настройках")
     return "\n".join(lines), markup(*chunked(buttons, 3), back_to_card_row(item.id))
 
 
@@ -558,29 +568,30 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> View:
 
 
 def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> View:
-    """Evening "🌙 Итоги дня": done (struck through) and not done; [📅 Перенести…] only when something is open."""
+    """Evening "🌙 Итоги дня": done (struck through), not done (already due), still ahead tonight, overdue;
+    [📅 Перенести…] only when something already due is open (the button leaves tonight's later items alone)."""
     agenda = data.agenda
     head = [f"🌙 <b>Итоги дня</b>, {fmt_date(agenda.day)}"]
-    total = len(agenda.done) + len(agenda.open)
-    if not total and not agenda.overdue:
+    ahead = [r for r in agenda.open if r.due_at is not None and r.due_at > now]
+    missed = [r for r in agenda.open if r.due_at is None or r.due_at <= now]
+    total = len(agenda.done) + len(missed)
+    if not total and not ahead and not agenda.overdue:
         return "\n".join([*head, "Сегодня задач не было."]), None
     if total:
-        head.append("Всё сделано 🎉" if not agenda.open else f"Сделано {len(agenda.done)} из {total}")
+        head.append("Всё сделано 🎉" if not missed and not ahead else f"Сделано {len(agenda.done)} из {total}")
     budget = MAX_TEXT - _TAIL_RESERVE - tg_len("\n".join(head))
     body: list[str] = []
     sections = [
         ("<b>Сделано</b>", [f"✅ {_row_title(r)}" for r in agenda.done]),
-        (
-            "<b>Не сделано</b>",
-            [f"⬜ {_row_when(r, prefs, now, agenda.day) or '—'} · {_row_title(r)}" for r in agenda.open],
-        ),
+        ("<b>Не сделано</b>", [f"⬜ {_row_when(r, prefs, now, agenda.day) or '—'} · {_row_title(r)}" for r in missed]),
+        ("<b>Ещё сегодня</b>", [f"🕒 {_row_when(r, prefs, now, agenda.day)} · {_row_title(r)}" for r in ahead]),
         ("<b>Просрочено</b>", [f"⬜ {_row_when(r, prefs, now) or '—'} · {_row_title(r)}" for r in agenda.overdue]),
     ]
     for header, lines in sections:
         if lines:
             room = budget - tg_len("\n".join(body)) - 40
             body += ["", header, *fit_lines(lines, max(room, 60))]
-    kb = digest_move_keyboard() if agenda.open or agenda.overdue else None
+    kb = digest_move_keyboard(agenda.day) if missed or agenda.overdue else None
     return fit("\n".join(head + body)), kb
 
 
@@ -637,6 +648,7 @@ def help_text() -> str:
             "",
             "<b>Правка</b>",
             "• ответь (reply) на карточку текстом: «перенеси на пятницу 18:00», «это идея», «удали»",
+            "• запись без карточки (заметка, идея) — ответом на своё сообщение: «это задача, напомни вечером»",
             "• или нажми «✏️ Изменить» в карточке",
             "• правка исходного сообщения в Telegram запись не меняет",
             "",

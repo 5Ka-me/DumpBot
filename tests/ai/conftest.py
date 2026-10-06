@@ -69,6 +69,7 @@ class FakeChutes:
         self.chat_auth: list[str | None] = []
         self.models_reply = Reply(body=MODELS_PAYLOAD)
         self.models_hits = 0
+        self.models_auth: list[str | None] = []
         self.stt_queue: list[Reply] = []
         self.stt_requests: list[dict] = []
         self.stt_auth: list[str | None] = []
@@ -84,7 +85,9 @@ class FakeChutes:
         prompt_tokens: int = 1000,
         completion_tokens: int = 200,
         usage: bool = True,
+        cached_tokens: Any = None,
         reasoning: str | None = None,
+        finish_reason: str = "stop",
         delay: float = 0.0,
     ) -> None:
         message: dict[str, Any] = {"role": "assistant", "content": content}
@@ -94,7 +97,7 @@ class FakeChutes:
             "id": "chatcmpl-1",
             "object": "chat.completion",
             "model": GEMMA,
-            "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
         }
         if usage:
             body["usage"] = {
@@ -102,6 +105,8 @@ class FakeChutes:
                 "completion_tokens": completion_tokens,
                 "total_tokens": prompt_tokens + completion_tokens,
             }
+            if cached_tokens is not None:
+                body["usage"]["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
         self.chat_queue.append(Reply(body=body, delay=delay))
 
     def chat_json(self, obj: Any, **kwargs: Any) -> None:
@@ -158,6 +163,7 @@ class FakeChutes:
 
     async def _models(self, request: web.Request) -> web.StreamResponse:
         self.models_hits += 1
+        self.models_auth.append(request.headers.get("Authorization"))
         return await _respond(self.models_reply)
 
     async def _stt(self, request: web.Request) -> web.StreamResponse:

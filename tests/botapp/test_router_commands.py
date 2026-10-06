@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 from aiogram.methods import SendMessage
+from aiogram.types import ForceReply
 from sqlalchemy import select
 
 from dumpbot.ai.schemas import When
@@ -16,6 +17,12 @@ from dumpbot.db.models import AiUsage, BotMessage, Occurrence
 async def _purposes(seed) -> list[str]:
     async with seed.sessionmaker() as s:
         return list((await s.scalars(select(BotMessage.purpose).order_by(BotMessage.message_id))).all())
+
+
+async def _last_sent(seed) -> int:
+    """Telegram id of the latest recorded bot message."""
+    async with seed.sessionmaker() as s:
+        return (await s.scalars(select(BotMessage.message_id).order_by(BotMessage.message_id.desc()))).first()
 
 
 async def test_start_and_help_show_the_help(feed, updates, tg) -> None:
@@ -81,6 +88,35 @@ async def test_recent_lists_saved_items(feed, updates, seed, tg) -> None:
 async def test_search_without_text_shows_a_hint(feed, updates, tg) -> None:
     await feed(updates.message("/search"))
     assert "/search" in tg.texts[0]
+
+
+async def test_search_from_the_menu_takes_the_reply_as_the_search(feed, updates, seed, tg) -> None:
+    # /search picked from the "/" menu arrives without text; the next message is the search, not a note.
+    await seed.item("Купить наушники Sony", kind="purchase")
+    await feed(updates.message("/search"))
+
+    [prompt] = tg.sent
+    assert isinstance(prompt.reply_markup, ForceReply)
+    assert await _purposes(seed) == ["search_prompt"]
+
+    await feed(updates.message("наушники", reply_to=await _last_sent(seed)))
+
+    assert await seed.raws() == []
+    found = tg.texts[-1]
+    assert "Поиск: наушники" in found and "наушники Sony" in found
+
+
+async def test_ask_from_the_menu_takes_the_reply_as_the_question(feed, updates, seed, tg) -> None:
+    await feed(updates.message("/ask"))
+    [prompt] = tg.sent
+    assert isinstance(prompt.reply_markup, ForceReply)
+
+    await feed(updates.message("наушники", reply_to=await _last_sent(seed)))
+
+    [raw] = await seed.raws()
+    assert (raw.text, raw.force_query) == ("наушники", True)
+    [job] = await seed.jobs()
+    assert job.kind == "message"
 
 
 async def test_search_finds_items_and_escapes_the_query(feed, updates, seed, tg) -> None:

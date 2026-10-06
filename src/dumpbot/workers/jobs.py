@@ -12,6 +12,9 @@ short transaction:
   the job is younger than ``AI_RETRY_WINDOW`` (chutes outages are expected to end);
 - any other exception -> the same backoff; at ``max_attempts`` -> ``dead`` and ``on_dead(ctx, job)``.
 
+``JobWorker.run`` registers with ``ctx.watchdog`` and beats on every iteration and before every job: silence for
+``STALL_AFTER`` (far beyond the slowest job: the AI fallback ladder, speech-to-text, Telegram) exits the process.
+
 Logs and ``last_error`` never contain exception messages of unknown origin: they may carry message text (SQL
 parameters, validation input) or Telegram file URLs with the bot token. Only the exception type and the code
 location are kept; messages of our own error types are content-free by design.
@@ -41,6 +44,7 @@ __all__ = [
     "AI_RETRY_WINDOW",
     "BUDGET_REASON",
     "MAX_BACKOFF",
+    "STALL_AFTER",
     "DeadHook",
     "Handler",
     "JobWorker",
@@ -66,6 +70,8 @@ AI_RETRY_WINDOW: Final = timedelta(days=7)
 DEFAULT_LOCK: Final = timedelta(minutes=5)
 MIN_RETRY_DELAY: Final = timedelta(seconds=1)  # a RetryLater "now" must not spin the worker
 MIN_WAIT_S: Final = 0.5
+STALL_AFTER: Final = timedelta(minutes=30)
+WATCH_NAME: Final = "jobs"
 # ``last_error`` of jobs deferred until the AI budget allows them (see ``requeue_deferred``).
 BUDGET_REASON: Final = "budget exhausted"
 _ERROR_MAX: Final = 500
@@ -237,7 +243,9 @@ class JobWorker:
     async def run(self) -> None:
         """Forever: run due jobs, then wait for ``ctx.jobs_wakeup``, the next ``run_after`` or the poll interval."""
         log.info("job worker started (%d handlers)", len(self._handlers))
+        self._ctx.watchdog.watch(WATCH_NAME, STALL_AFTER.total_seconds())
         while True:
+            self._ctx.watchdog.beat(WATCH_NAME)
             self._ctx.jobs_wakeup.clear()  # before claiming: a wakeup during the run is not lost
             handled = 0
             try:
@@ -257,6 +265,7 @@ class JobWorker:
         """Claim and run up to ``batch`` due jobs; returns how many ran."""
         count = 0
         while count < self._batch:
+            self._ctx.watchdog.beat(WATCH_NAME)
             job = await self._claim_one()
             if job is None:
                 break

@@ -1,9 +1,13 @@
 """Settings menu (``SetCb``, keys documented in ``bot.views``) and the typed-value dialog.
 
-Buttons change a preference at once; ``SetCb("ask", field)`` turns the menu into a prompt and the next text
-message is validated locally (``HH:MM``, IANA timezone, minutes, dollars). After a change: save prefs, wake the
-scheduler, re-render the submenu. Raising the budget also makes jobs deferred for the budget runnable now.
-Existing reminders are not re-planned (the menus say so).
+Buttons change a preference at once; ``SetCb("ask", field)`` turns the menu into a prompt and the answer
+(``common.is_answer``) is validated locally (``HH:MM``, IANA timezone, minutes, dollars). After a change: save
+prefs, wake the scheduler, re-render the submenu. Raising the budget also makes jobs deferred for the budget runnable
+now. Existing reminders are not re-planned (the menus say so).
+
+A value that does not parse gets one "попробуй ещё раз"; a second one closes the dialog and goes on to capture
+(it was a note typed into an abandoned prompt), like anything that is not an answer (a forward, a reply to another
+message, a "?" question, a photo, a message sent minutes later).
 """
 
 from __future__ import annotations
@@ -13,19 +17,20 @@ import math
 import re
 from collections.abc import Callable
 from datetime import datetime, time
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NoReturn
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.enums import ChatType
+from aiogram.filters import StateFilter
 from aiogram.types import CallbackQuery, Message
 
 from dumpbot import clock
 from dumpbot.bot import sender, views
 from dumpbot.bot.cbdata import SetCb
 from dumpbot.bot.routers import common
-from dumpbot.bot.states import SettingsStates, expired, prompt_data
+from dumpbot.bot.states import SettingsStates, prompt_data
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services.settings_repo import save_prefs
 from dumpbot.workers import jobs
@@ -59,6 +64,7 @@ def make_router() -> Router:
     router.callback_query.register(on_setting, SetCb.filter())
     router.message.filter(F.chat.type == ChatType.PRIVATE)
     router.message.register(on_value, SettingsStates.value, F.text)
+    router.message.register(on_other, StateFilter(SettingsStates))  # photos, voice…: never a value
     return router
 
 
@@ -165,15 +171,13 @@ async def _change(callback: CallbackQuery, ctx: AppContext, key: str, value: str
 async def on_value(message: Message, ctx: AppContext, state: FSMContext) -> None:
     data = await state.get_data()
     spec = views.ASK_FIELDS.get(str(data.get("field")))
-    if spec is None or expired(data):
-        await common.restore_prompt(ctx, state, await _load_prefs(ctx), clock.utcnow())
-        log.info("settings prompt expired; message %s goes to capture", message.message_id)
-        raise SkipHandler
+    if spec is None or not common.is_answer(message, data):
+        await _leave(message, ctx, state)
     field = str(data["field"])
     try:
         value = parse_value(spec.kind, message.text or "")
     except ValueError:
-        await message.answer(ERRORS[spec.kind] + RETRY)
+        await _invalid(message, ctx, state, data, spec.kind)
         return
     now = clock.utcnow()
     async with ctx.sessionmaker() as session:
@@ -183,7 +187,7 @@ async def on_value(message: Message, ctx: AppContext, state: FSMContext) -> None
             setattr(new, field, value)
         except ValueError:
             await session.commit()
-            await message.answer(ERRORS[spec.kind] + RETRY)
+            await _invalid(message, ctx, state, data, spec.kind)
             return
         budget_raised = await _save(session, ctx, prefs, new, now)
         await session.commit()
@@ -191,6 +195,26 @@ async def on_value(message: Message, ctx: AppContext, state: FSMContext) -> None
     await common.show(ctx, data.get("prompt_id"), views.settings_view(spec.menu, new))
     await sender.react(ctx, message.message_id, sender.REACT_SAVED)
     _wake(ctx, budget_raised)
+
+
+async def on_other(message: Message, ctx: AppContext, state: FSMContext) -> None:
+    """Not a value (a photo, a voice, a sticker): close the dialog, save the message."""
+    await _leave(message, ctx, state)
+
+
+async def _invalid(message: Message, ctx: AppContext, state: FSMContext, data: dict[str, Any], kind: str) -> None:
+    """The first value that does not parse: say what is expected and wait again; the second one is not a typo
+    but something else typed into a forgotten prompt, so it is saved as a note instead of being swallowed."""
+    if data.get("retried"):
+        await _leave(message, ctx, state)
+    await state.update_data(retried=True)
+    await message.answer(ERRORS[kind] + RETRY)
+
+
+async def _leave(message: Message, ctx: AppContext, state: FSMContext) -> NoReturn:
+    if await common.leave_dialog(ctx, state):
+        log.info("message %s is not a settings value; it goes to capture", message.message_id)
+    raise SkipHandler
 
 
 def parse_value(kind: str, text: str) -> Any:

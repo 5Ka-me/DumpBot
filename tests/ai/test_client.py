@@ -11,6 +11,7 @@ from dumpbot import clock
 from dumpbot.ai.client import (
     AIBadResponse,
     AIConfigError,
+    AIModelNotFound,
     AIUnavailable,
     ChutesClient,
     parse_json_object,
@@ -100,6 +101,24 @@ async def test_http_errors_are_mapped(fake, client, status, body, exc):
     with pytest.raises(exc):
         await client.chat(purpose="extract", model=GEMMA, messages=MSGS)
     assert len(fake.chat_requests) == 1  # no retries outside the 400 ladder
+
+
+async def test_only_404_means_model_not_found(fake, client):
+    # A missing model is not a global problem (another model may work); a bad key / balance is.
+    fake.chat_error(404, '{"detail":"model not found: google/gemma-4-31B-turbo-TEE"}')
+    fake.chat_error(401, '{"detail":"Invalid token"}')
+    with pytest.raises(AIModelNotFound):
+        await client.chat(purpose="extract", model=GEMMA, messages=MSGS)
+    with pytest.raises(AIConfigError) as ei:
+        await client.chat(purpose="extract", model=GEMMA, messages=MSGS)
+    assert not isinstance(ei.value, AIModelNotFound)
+
+
+async def test_finish_reason_is_reported(fake, client):
+    fake.chat_ok('{"a": "cut her', finish_reason="length")
+    fake.chat_raw({"choices": [{"message": {"content": "{}"}}]})
+    assert (await client.chat(purpose="extract", model=GEMMA, messages=MSGS)).finish_reason == "length"
+    assert (await client.chat(purpose="extract", model=GEMMA, messages=MSGS)).finish_reason is None
 
 
 async def test_429_with_retry_after(fake, client):
@@ -243,6 +262,36 @@ async def test_price_cache_and_refresh_after_6h(fake, client, monkeypatch):
     monkeypatch.setattr(clock, "utcnow", lambda: t0 + timedelta(hours=6, minutes=1))
     await client.price(GEMMA)
     assert fake.models_hits == 2
+
+
+@pytest.mark.parametrize(
+    ("model", "cached", "expected"),
+    [
+        (GEMMA, 2500, 500 * 0.12 + 2500 * 0.012 + 200 * 0.37),  # cached prefix at the input_cache_read price
+        (QWEN, 2500, 3000 * 0.104 + 200 * 0.416),  # no input_cache_read listed: no discount assumed
+        (GEMMA, 9999, 3000 * 0.012 + 200 * 0.37),  # never more cached than prompt tokens
+        (GEMMA, "n/a", 3000 * 0.12 + 200 * 0.37),
+    ],
+)
+async def test_cached_prompt_tokens_are_billed_at_the_cache_read_price(
+    fake, settings, sessionmaker, model, cached, expected
+):
+    client = ChutesClient(settings, sessionmaker)
+    fake.chat_ok("{}", prompt_tokens=3000, completion_tokens=200, cached_tokens=cached)
+    try:
+        res = await client.chat(purpose="extract", model=model, messages=MSGS)
+    finally:
+        await client.close()
+    assert res.cost_usd == pytest.approx(expected / 1e6)
+    async with sessionmaker() as s:
+        row = await s.scalar(select(AiUsage))
+    assert (row.input_tokens, row.cost_usd) == (3000, Decimal(f"{expected / 1e6:.6f}"))
+
+
+async def test_price_list_is_fetched_without_the_api_key(fake, client):
+    # GET /models is public but answers 401 to a bad key: a broken key must not also break prices.
+    assert await client.price(GEMMA) == (0.12, 0.37)
+    assert fake.models_auth == [None]
 
 
 async def test_unknown_model_uses_fallback_prices(fake, make_settings):

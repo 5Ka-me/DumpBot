@@ -1,7 +1,8 @@
 """Speech-to-text via the community Whisper chute "AudioDojo" on chutes.ai (see docs/research/chutes-stt.md).
 
 ``POST {stt_url}`` with JSON ``{"audio_b64", "language"?, "return_timestamps": false}`` -> ``{"text"}``.
-Billed per started second of GPU time, so cost = ``stt_usd_per_second * max(1, ceil(latency_s))``.
+Billed per started second of GPU time, so cost = ``stt_usd_per_second * max(1, ceil(latency_s))``; a timed-out
+request is counted the same way (the chute keeps running after we stop waiting).
 """
 
 from __future__ import annotations
@@ -91,7 +92,18 @@ class ChutesWhisperSTT:
                 status, headers = resp.status, resp.headers
                 raw = await resp.read()
         except (TimeoutError, aiohttp.ClientError) as e:
-            await self._record(ok=False, latency_s=time.monotonic() - started, error=f"network: {type(e).__name__}")
+            latency_s = time.monotonic() - started
+            # A timed-out request was most likely running on the GPU, which is billed whether or not we waited:
+            # count the time waited, so the budget guard sees it (a connect timeout never reached the chute).
+            sent = isinstance(e, TimeoutError) and not isinstance(e, aiohttp.ConnectionTimeoutError)
+            billed_s = max(1, math.ceil(latency_s)) if sent else 0
+            await self._record(
+                ok=False,
+                latency_s=latency_s,
+                billed_s=billed_s,
+                cost=self._settings.stt_usd_per_second * billed_s,
+                error=f"network: {type(e).__name__}",
+            )
             raise AIUnavailable(f"STT unreachable ({type(e).__name__})") from e
         latency_s = time.monotonic() - started
 

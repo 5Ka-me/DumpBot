@@ -32,11 +32,13 @@ __all__ = [
     "WARN_PAST_DATE",
     "ReminderPlan",
     "Resolution",
+    "lead_applies",
     "localize",
     "plan_reminders",
     "resolve_item",
     "resolve_range",
     "resolve_when",
+    "tomorrow",
 ]
 
 WARN_PAST_DATE: Final = "дата в прошлом"
@@ -58,6 +60,9 @@ _EARLY_HOUR_OK_RE = re.compile(r"утр|ноч|(?<![a-z])a\.?\s?m\b\.?", re.IGNO
 _CONFIRM_SOURCES: Final[frozenset[str]] = frozenset({"photo", "forward"})
 _LEAD_PRECISIONS: Final[frozenset[str]] = frozenset({"exact", "slot"})
 _AUTO_PRECISIONS: Final[frozenset[str]] = frozenset({"date", "default", "fallback"})
+# A date without a time that is today, once its bare-date time and task_default_time have passed: due this long
+# from now (but still today), so the item stays on today's list and gets one automatic nudge.
+_LATER_TODAY: Final = timedelta(hours=1)
 
 WhenResult = tuple[datetime | None, Precision, list[str], bool]
 
@@ -110,7 +115,8 @@ def resolve_when(when: When, now: datetime, prefs: Prefs) -> WhenResult:
         return None, "none", [], False
     try:
         t, precision = _time_of(when, prefs)
-        due_local, warnings, confirm = _resolve_day(when.day, t, now_utc.astimezone(prefs.zone), prefs)
+        now_local = now_utc.astimezone(prefs.zone)
+        due_local, warnings, confirm = _resolve_day(when.day, t, now_local, prefs, timed=precision != "date")
     except (ValueError, KeyError):
         return None, "none", [WARN_BAD_TIME], True
     if precision == "exact" and _ambiguous_early_hour(t, when.text):
@@ -129,12 +135,13 @@ def plan_reminders(
     """Reminder plan for one occurrence (sorted, unique ``fire_at``; empty if ``due_at <= now``).
 
     - exact/slot + role event/deadline: ``lead`` minutes before (default ``[prefs.lead_minutes]``), auto=False;
-    - exact/slot + role remind, and relative: exactly at due, auto=False;
+    - exact/slot + role remind, and relative: at due unless ``lead`` is given explicitly, auto=False;
     - default: exactly at due, auto=True;
     - date/fallback (time chosen automatically): at due, auto=True; whole-day leads (multiples of 1440, e.g.
       "за день") are honoured, other lead values collapse to "at due".
-    Leads that are multiples of 1440 are subtracted in local wall-clock days, others in UTC. A fire time already
-    in the past fires now; auto reminders are moved out of quiet hours.
+    ``lead`` is only ever explicit (the message, the ⏱ menu or an edit). Leads that are multiples of 1440 are
+    subtracted in local wall-clock days, others in UTC. A fire time already in the past fires now; auto reminders
+    are moved out of quiet hours.
     """
     due = _as_utc(due_at)
     now_utc = _as_utc(now)
@@ -145,8 +152,10 @@ def plan_reminders(
         leads = lead or [prefs.lead_minutes]
     elif precision in ("date", "fallback"):
         leads = [m if m % 1440 == 0 else 0 for m in lead or [0]]
-    else:
+    elif precision == "default":
         leads = [0]
+    else:  # role remind, relative: the moment itself, unless the user asked for a lead ("напомни за 30 минут")
+        leads = lead or [0]
 
     plans: dict[datetime, ReminderPlan] = {}
     for minutes in sorted(set(leads)):
@@ -158,16 +167,33 @@ def plan_reminders(
     return tuple(sorted(plans.values(), key=lambda p: p.fire_at))
 
 
+def lead_applies(precision: str, minutes: int) -> bool:
+    """Whether an explicit "remind ``minutes`` before" changes the plan of an occurrence with this precision
+    (see ``plan_reminders``): any lead for a time the user gave, only whole days for an automatic date."""
+    if precision in _LEAD_PRECISIONS or precision == "relative":
+        return True
+    if precision in ("date", "fallback"):
+        return minutes % 1440 == 0
+    return minutes == 0
+
+
+def tomorrow(now: datetime, prefs: Prefs) -> date:
+    """Local date that "завтра" means at ``now``: before ``prefs.night_cutoff`` it is the calendar day that has just
+    started (the owner has not slept yet), otherwise the next calendar day."""
+    local = _as_utc(now).astimezone(prefs.zone)
+    return local.date() if local.time() < prefs.night_cutoff else local.date() + timedelta(days=1)
+
+
 def resolve_range(spec_range: str, now: datetime, prefs: Prefs) -> tuple[datetime, datetime]:
     """QuerySpec.range -> [start, end) in UTC on the local calendar of ``prefs.tz``.
 
     today|tomorrow|yesterday|this_week|next_week|last_week (weeks start on Monday)|this_month|last_month
     |past:N (last N days incl. today)|next:N (today + N days)|YYYY-MM-DD|YYYY-MM-DD..YYYY-MM-DD (inclusive).
-    Raises ValueError for anything else.
+    "tomorrow" follows ``night_cutoff`` like the day spec "+1" (``tomorrow``). Raises ValueError for anything else.
     """
     tz = prefs.zone
     today = _as_utc(now).astimezone(tz).date()
-    first, last = _range_days(spec_range.strip(), today)
+    first, last = _range_days(spec_range.strip(), today, tomorrow(now, prefs))
     return localize(first, time(0), tz).astimezone(UTC), localize(last, time(0), tz).astimezone(UTC)
 
 
@@ -189,7 +215,17 @@ def _resolve_recurring(
         except (ValueError, KeyError):
             pass  # keep the default time; the rule itself is fine
     tz = prefs.zone
-    dtstart_local = datetime.combine(now_utc.astimezone(tz).date(), t)
+    now_local = now_utc.astimezone(tz)
+    start = now_local.date()
+    if when is not None and when.day:
+        # "с понедельника каждый день", "каждые 2 недели, начиная со следующей пятницы": the series starts there,
+        # and an interval rule keeps the phase of DTSTART. A day in the past (or unreadable) starts today.
+        try:
+            first, _, _ = _resolve_day(when.day, t, now_local, prefs, timed=precision != "default")
+            start = max(first.date(), start)
+        except (ValueError, KeyError):
+            pass
+    dtstart_local = datetime.combine(start, t)
     if ";COUNT=" in f";{rule}" and localize(dtstart_local.date(), t, tz) < now_utc:
         # COUNT is counted from DTSTART: today's instance, already past, must not use one up
         # ("каждый день в 9, 2 раза" sent at 10:00 means tomorrow and the day after).
@@ -229,21 +265,37 @@ def _time_of(when: When, prefs: Prefs) -> tuple[time, Precision]:
     return prefs.bare_date_time, "date"
 
 
-def _resolve_day(day: str | None, t: time, now_local: datetime, prefs: Prefs) -> tuple[datetime, list[str], bool]:
-    """Local aware datetime for ``day`` at ``t`` (+ warnings, needs_confirm). Raises ValueError for bad dates."""
+def _resolve_day(
+    day: str | None, t: time, now_local: datetime, prefs: Prefs, *, timed: bool = True
+) -> tuple[datetime, list[str], bool]:
+    """Local aware datetime for ``day`` at ``t`` (+ warnings, needs_confirm). Raises ValueError for bad dates.
+
+    ``timed=False``: the user named no time (``t`` is the bare-date default), so an explicit date (+N, dN, MM-DD,
+    YYYY-MM-DD) that is today stays today even after ``t`` — that cut-off is not the user's — at a time still
+    ahead (``_later_today``). Weekdays and "weekend" keep comparing the moment itself.
+    """
     tz: ZoneInfo = prefs.zone
     today = now_local.date()
 
     def at(d: date) -> datetime:
         return localize(d, t, tz)
 
-    def upcoming(d: date) -> bool:
+    def upcoming(d: date) -> bool:  # the moment itself is still ahead
         return at(d) > now_local
+
+    def current(d: date) -> bool:  # an explicit date still counts: ahead, or today without a time of its own
+        return upcoming(d) or (not timed and d == today)
+
+    def place(d: date) -> datetime:
+        return _later_today(now_local, prefs) if not timed and d == today and not upcoming(d) else at(d)
 
     if day is None:  # time only: today, or tomorrow once it has passed (no warning)
         return at(today if upcoming(today) else today + timedelta(days=1)), [], False
     if m := _OFFSET_RE.match(day):
-        return _offset_day(int(m[1]), m[2] or "d", today, now_local, prefs, at)
+        d = _offset_date(int(m[1]), m[2] or "d", now_local, prefs)
+        if d == today and timed and not upcoming(d):
+            return at(today + timedelta(days=1)), [WARN_MOVED_TOMORROW], True
+        return place(d), [], False
     if day == "weekend":
         return at(_nearest_weekday(_SATURDAY, today, upcoming)), [], False
     if m := _WEEKDAY_RE.match(day):
@@ -252,34 +304,40 @@ def _resolve_day(day: str | None, t: time, now_local: datetime, prefs: Prefs) ->
             return at(today - timedelta(days=today.weekday()) + timedelta(days=7 + weekday)), [], False
         return at(_nearest_weekday(weekday, today, upcoming)), [], False
     if m := _MONTHDAY_RE.match(day):
-        return at(_month_day(int(m[1]), today, upcoming)), [], False
+        return place(_month_day(int(m[1]), today, current)), [], False
     if m := _DATE_RE.match(day):
         year, month, dom = m.groups()
         if year is None:
-            return at(_upcoming_month_day(int(month), int(dom), today.year, upcoming)), [], False
+            return place(_upcoming_month_day(int(month), int(dom), today.year, current)), [], False
         d = date(int(year), int(month), int(dom))
-        if not upcoming(d):  # explicit past date: probably a fact, keep it but ask
+        if not current(d):  # explicit past date: probably a fact, keep it but ask
             return at(d), [WARN_PAST_DATE], True
-        return at(d), [], False
+        return place(d), [], False
     raise ValueError(f"unknown day spec: {day!r}")
 
 
-def _offset_day(
-    n: int, unit: str, today: date, now_local: datetime, prefs: Prefs, at: Callable[[date], datetime]
-) -> tuple[datetime, list[str], bool]:
-    # Before night_cutoff "завтра" still means the calendar day that has just started.
-    if unit == "d" and n >= 1 and now_local.time() < prefs.night_cutoff:
-        n -= 1
+def _offset_date(n: int, unit: str, now_local: datetime, prefs: Prefs) -> date:
+    if unit == "d" and n >= 1:  # before night_cutoff "завтра" still means the calendar day that has just started
+        return tomorrow(now_local, prefs) + timedelta(days=n - 1)
     step = {
         "d": relativedelta(days=n),
         "w": relativedelta(weeks=n),
         "mo": relativedelta(months=n),  # clamps: Jan 31 + 1 month -> Feb 28
         "y": relativedelta(years=n),
     }[unit]
-    d = today + step
-    if d == today and at(d) <= now_local:
-        return at(today + timedelta(days=1)), [WARN_MOVED_TOMORROW], True
-    return at(d), [], False
+    return now_local.date() + step
+
+
+def _later_today(now_local: datetime, prefs: Prefs) -> datetime:
+    """Due time for a date without a time that is today, once its bare-date time has passed: ``task_default_time``
+    if still ahead, otherwise in ``_LATER_TODAY`` (at the latest 23:59)."""
+    tz: ZoneInfo = prefs.zone
+    today = now_local.date()
+    default = localize(today, prefs.task_default_time, tz)
+    if default > now_local:
+        return default
+    last_minute = localize(today + timedelta(days=1), time(0), tz) - timedelta(minutes=1)
+    return min(now_local + _LATER_TODAY, last_minute)
 
 
 def _nearest_weekday(weekday: int, today: date, upcoming: Callable[[date], bool]) -> date:
@@ -288,38 +346,51 @@ def _nearest_weekday(weekday: int, today: date, upcoming: Callable[[date], bool]
     return d if d != today or upcoming(d) else d + timedelta(days=7)
 
 
-def _month_day(n: int, today: date, upcoming: Callable[[date], bool]) -> date:
+def _month_day(n: int, today: date, current: Callable[[date], bool]) -> date:
     """N-th day of this month (clamped to its end; -1 = last day), or of the next month if already passed."""
     dom = 31 if n == -1 else n
     if not 1 <= dom <= 31:
         raise ValueError(f"bad day of month: {n}")
     first = today.replace(day=1)
     d = first + relativedelta(day=dom)
-    return d if upcoming(d) else first + relativedelta(months=1, day=dom)
+    return d if current(d) else first + relativedelta(months=1, day=dom)
 
 
-def _upcoming_month_day(month: int, dom: int, year: int, upcoming: Callable[[date], bool]) -> date:
+def _upcoming_month_day(month: int, dom: int, year: int, current: Callable[[date], bool]) -> date:
     """MM-DD this year if still ahead, else the next year that has it (02-29 waits for a leap year)."""
     for y in range(year, year + 9):
         try:
             d = date(y, month, dom)
         except ValueError:
             continue
-        if upcoming(d):
+        if current(d):
             return d
     raise ValueError(f"bad date: {month:02d}-{dom:02d}")
 
 
 def _resolve_at(at: str, now_utc: datetime, prefs: Prefs) -> WhenResult:
-    """``at`` = local "YYYY-MM-DD[THH:MM]" for phrasings the spec cannot express: always confirmed."""
+    """``at`` = local "YYYY-MM-DD[THH:MM]" for phrasings the spec cannot express: always confirmed.
+
+    A time in ``at`` is the user's own (precision ``exact``: lead, no quiet-hours shift); a date alone gets an
+    automatic time (``fallback``) like a day without a time, and today stays today.
+    """
     day_s, _, time_s = at.partition("T")
     try:
         d = date.fromisoformat(day_s)
-        t = time.fromisoformat(time_s) if time_s else prefs.bare_date_time
+        t = time.fromisoformat(time_s) if time_s else None
     except ValueError:
         return None, "none", [WARN_BAD_TIME], True
-    due = localize(d, t, prefs.zone).astimezone(UTC)
-    return due, "fallback", [WARN_PAST_DATE] if due <= now_utc else [], True
+    tz = prefs.zone
+    precision: Precision = "exact"
+    if t is None:
+        now_local = now_utc.astimezone(tz)
+        due_local, precision = localize(d, prefs.bare_date_time, tz), "fallback"
+        if d == now_local.date() and due_local <= now_local:
+            due_local = _later_today(now_local, prefs)
+    else:
+        due_local = localize(d, t, tz)
+    due = due_local.astimezone(UTC)
+    return due, precision, [WARN_PAST_DATE] if due <= now_utc else [], True
 
 
 def _ambiguous_early_hour(t: time, text: str | None) -> bool:
@@ -348,14 +419,14 @@ def _minus_lead(due: datetime, minutes: int, tz: ZoneInfo) -> datetime:
     return due - timedelta(minutes=minutes)
 
 
-def _range_days(spec: str, today: date) -> tuple[date, date]:
-    """[first, last) local dates for a range spec."""
+def _range_days(spec: str, today: date, tmr: date) -> tuple[date, date]:
+    """[first, last) local dates for a range spec (``tmr``: the date "tomorrow" means, see ``tomorrow``)."""
     day = timedelta(days=1)
     week_start = today - timedelta(days=today.weekday())
     month_start = today.replace(day=1)
     fixed = {
         "today": (today, today + day),
-        "tomorrow": (today + day, today + 2 * day),
+        "tomorrow": (tmr, tmr + day),
         "yesterday": (today - day, today),
         "this_week": (week_start, week_start + 7 * day),
         "next_week": (week_start + 7 * day, week_start + 14 * day),

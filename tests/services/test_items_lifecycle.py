@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import asyncio
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
+from dumpbot.ai.schemas import EditPatch
 from dumpbot.db.models import Reminder
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items
@@ -400,3 +402,137 @@ async def test_move_to_tomorrow_merges_into_existing_series_instance(
     assert today.status == "cancelled"
     assert tomorrow.status == "open"
     assert await reminders_of(tomorrow.id, "pending") == [(local(2026, 10, 8, 8, 55), "pending", 5, False)]
+
+
+# --- review fixes: snooze, stop, night cutoff, concurrency -------------------------------------------------------
+
+
+async def test_snooze_keeps_later_reminders(session, make, reminders_of, local, now, prefs):
+    # "встреча завтра в 15:00, напомни за день и за 30 минут": "+15 мин" on the day-before reminder.
+    spec = {"kind": "event", "title": "Встреча", "when": {"day": "+1", "time": "15:00"}, "lead": [1440, 30]}
+    [c] = await make(spec, now=now)
+    day_before = local(2026, 10, 6, 15, 0)
+    await items.snooze(session, c.occurrence.id, minutes=15, prefs=prefs, now=day_before)
+    assert await reminders_of(c.occurrence.id, "pending") == [
+        (local(2026, 10, 6, 15, 15), "pending", 0, False),
+        (local(2026, 10, 7, 14, 30), "pending", 30, False),
+    ]
+
+
+async def test_snooze_cancels_reminders_up_to_the_snoozed_time(session, make, reminders_of, local, now, prefs):
+    spec = {"kind": "event", "title": "Врач", "when": {"time": "15:00"}, "lead": [60, 5]}
+    [c] = await make(spec, now=now)  # 14:00 and 14:55
+    await items.snooze(session, c.occurrence.id, minutes=60, prefs=prefs, now=local(2026, 10, 6, 14, 0))
+    assert await reminders_of(c.occurrence.id, "pending") == [(local(2026, 10, 6, 15, 0), "pending", 0, False)]
+
+
+async def test_snooze_tomorrow_after_midnight_is_the_day_that_has_started(session, make, local, now, prefs):
+    [c] = await make({"kind": "event", "title": "Созвон", "when": {"time": "23:55"}}, now=now)
+    reminder = await items.snooze(session, c.occurrence.id, tomorrow=True, prefs=prefs, now=local(2026, 10, 7, 0, 10))
+    assert reminder.fire_at == local(2026, 10, 7, 23, 55)  # Wednesday, not Thursday
+
+
+async def test_snooze_tomorrow_after_midnight_never_fires_in_the_past(session, make, local, now, prefs):
+    [c] = await make({"kind": "event", "title": "Созвон", "when": {"day": "+1", "time": "00:20"}}, now=now)
+    reminder = await items.snooze(session, c.occurrence.id, tomorrow=True, prefs=prefs, now=local(2026, 10, 7, 0, 30))
+    assert reminder.fire_at == local(2026, 10, 8, 0, 20)
+
+
+async def test_snoozed_series_instance_survives_until_its_reminder(
+    session, make, occurrences_of, reminders_of, local, now, prefs
+):
+    # Weekly MO 09:00: "📅 Завтра" at Mon 09:01 must still remind on Tuesday 09:00.
+    [c] = await make(WEEKLY_MO_9, now=now)
+    monday = c.occurrence
+    await items.ensure_recurring(session, prefs, local(2026, 10, 12, 9, 0) + timedelta(seconds=30))
+    reminder = await items.snooze(session, monday.id, tomorrow=True, prefs=prefs, now=local(2026, 10, 12, 9, 1))
+    assert reminder.fire_at == local(2026, 10, 13, 9, 0)
+    assert await items.ensure_recurring(session, prefs, local(2026, 10, 12, 21, 30)) == 0
+    occs = await occurrences_of(c.item.id)
+    assert [(o.due_at, o.status) for o in occs] == [
+        (local(2026, 10, 13, 9, 0), "open"),  # moved with the snooze, not missed at Monday 21:00
+        (local(2026, 10, 19, 9, 0), "open"),
+    ]
+    assert await reminders_of(monday.id, "pending") == [(local(2026, 10, 13, 9, 0), "pending", 0, False)]
+
+
+async def test_superseded_instance_with_a_pending_snooze_stays_open(session, make, reminders_of, local, now, prefs):
+    [c] = await make(DAILY_9, now=now)  # Wed 09:00
+    first = c.occurrence
+    await items.ensure_recurring(session, prefs, local(2026, 10, 7, 9, 30))
+    # "⏰ 1 час" pressed late in the evening on the morning's reminder: it fires after the 12 h mark.
+    await items.snooze(session, first.id, minutes=60, prefs=prefs, now=local(2026, 10, 7, 20, 45))
+    await items.ensure_recurring(session, prefs, local(2026, 10, 7, 21, 30))
+    assert first.status == "open"
+    assert await reminders_of(first.id, "pending") == [(local(2026, 10, 7, 21, 45), "pending", 0, False)]
+    # Once the snooze is due it no longer holds the instance: superseded as usual.
+    await items.ensure_recurring(session, prefs, local(2026, 10, 7, 21, 46))
+    assert first.status == "missed"
+
+
+async def test_snooze_tomorrow_of_a_daily_instance_merges_into_tomorrows(
+    session, make, occurrences_of, reminders_of, local, now, prefs
+):
+    [c] = await make(DAILY_9, now=now)  # Wed 09:00
+    await items.ensure_recurring(session, prefs, local(2026, 10, 7, 9, 0) + timedelta(seconds=30))
+    wednesday, thursday = await occurrences_of(c.item.id)
+    reminder = await items.snooze(session, wednesday.id, tomorrow=True, prefs=prefs, now=local(2026, 10, 7, 9, 1))
+    assert reminder.occurrence_id == thursday.id
+    assert (wednesday.status, thursday.status) == ("cancelled", "open")
+    pending = [r for o in await occurrences_of(c.item.id) for r in await reminders_of(o.id, "pending")]
+    assert pending == [(local(2026, 10, 8, 9, 0), "pending", 0, False)]  # one reminder on Thursday, no duplicate
+
+
+async def test_stop_recurrence_cancels_the_already_generated_next_instance(
+    session, make, occurrences_of, reminders_of, local, prefs
+):
+    [c] = await make(DAILY_9, now=local(2026, 10, 6, 8, 0))  # Tue 09:00
+    await items.ensure_recurring(session, prefs, local(2026, 10, 6, 9, 1))  # Wed 09:00 exists now
+    await items.stop_recurrence(session, c.item.id, local(2026, 10, 6, 12, 0))
+    today, tomorrow = await occurrences_of(c.item.id)
+    assert (today.status, tomorrow.status) == ("open", "cancelled")
+    assert await reminders_of(tomorrow.id, "pending") == []
+    assert await items.ensure_recurring(session, prefs, local(2026, 10, 9, 12, 0)) == 0
+    assert today.status == "open"  # no later sibling: it waits in the overdue list until done
+
+
+async def test_stop_recurrence_patch_cancels_the_next_instance_too(session, make, occurrences_of, local, prefs):
+    [c] = await make(DAILY_9, now=local(2026, 10, 6, 8, 0))
+    await items.ensure_recurring(session, prefs, local(2026, 10, 6, 9, 1))
+    await items.apply_patch(session, c.item.id, EditPatch(action="stop_recurrence"), prefs, local(2026, 10, 6, 12, 0))
+    assert [o.status for o in await occurrences_of(c.item.id)] == ["open", "cancelled"]
+
+
+async def test_move_to_tomorrow_after_midnight_is_the_day_that_has_started(session, make, local, now, prefs):
+    [c] = await make({"kind": "task", "title": "Позвонить", "when": {"time": "15:00"}}, now=now)
+    [moved] = await items.move_to_tomorrow(session, [c.occurrence.id], prefs, local(2026, 10, 7, 0, 30))
+    assert moved.due_at == local(2026, 10, 7, 15, 0)  # Wednesday, not Thursday
+
+
+async def test_move_to_tomorrow_never_lands_in_the_past(session, make, local, now, prefs):
+    [c] = await make({"kind": "task", "title": "Поздно", "when": {"day": "+1", "time": "00:15"}}, now=now)
+    [moved] = await items.move_to_tomorrow(session, [c.occurrence.id], prefs, local(2026, 10, 7, 1, 0))
+    assert moved.due_at == local(2026, 10, 8, 0, 15)
+
+
+async def test_move_to_tomorrow_to_a_given_day(session, make, local, now, prefs):
+    [c] = await make({"kind": "task", "title": "Вторник", "when": {"time": "15:00"}}, now=now)
+    wed_8 = local(2026, 10, 7, 8, 0)
+    [moved] = await items.move_to_tomorrow(session, [c.occurrence.id], prefs, wed_8, day=date(2026, 10, 7))
+    assert moved.due_at == local(2026, 10, 7, 15, 0)
+    [again] = await items.move_to_tomorrow(session, [c.occurrence.id], prefs, wed_8, day=date(2026, 10, 1))
+    assert again.due_at == local(2026, 10, 8, 15, 0)  # still ahead: just one day later; ``day`` is for past dues
+
+
+async def test_concurrent_snoozes_leave_one_pending_reminder(sessionmaker, make, local, now, prefs):
+    [c] = await make({"kind": "task", "title": "Купить хлеб", "when": {"time": "11:00"}}, now=now)
+    at = local(2026, 10, 6, 11, 0)
+    async with sessionmaker() as first, sessionmaker() as second:
+        await items.snooze(first, c.occurrence.id, minutes=15, prefs=prefs, now=at)  # holds the occurrence lock
+        racing = asyncio.create_task(items.snooze(second, c.occurrence.id, minutes=15, prefs=prefs, now=at))
+        await asyncio.sleep(0.3)  # the second tap reaches the lock
+        await first.commit()
+        await racing
+        await second.commit()
+    async with sessionmaker() as check:
+        assert len(await items.pending_reminders(check, c.occurrence.id)) == 1

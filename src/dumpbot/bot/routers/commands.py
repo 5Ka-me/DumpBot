@@ -2,6 +2,10 @@
 
 This router runs first, so commands (``/cancel`` in particular) work in the middle of an input dialog. Any other
 ``/word`` gets a short hint instead of being saved as a note.
+
+``/search`` and ``/ask`` picked from the command menu arrive without text: they answer with a prompt that asks for
+a reply (``ForceReply``); the capture router turns the reply into the search / the question (``sender.PURPOSE_*``),
+so the search text is never saved as a note.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ from typing import TYPE_CHECKING, Final
 from aiogram import F, Router
 from aiogram.enums import ChatType
 from aiogram.filters import Command
-from aiogram.types import BotCommand, Message
+from aiogram.types import BotCommand, ForceReply, Message
 
 from dumpbot import clock
 from dumpbot.bot import sender, views
@@ -49,8 +53,8 @@ BOT_COMMANDS: Final[tuple[tuple[str, str], ...]] = (
 )
 
 START_TEXT: Final = "👋 Привет! Присылай что угодно — разберу, сохраню и напомню."
-SEARCH_HINT: Final = "🔎 Что искать? Напиши после команды: <code>/search наушники</code>"
-ASK_HINT: Final = "❓ Напиши вопрос после команды: <code>/ask что у меня завтра?</code>"
+SEARCH_HINT: Final = "🔎 Напиши в ответ на это сообщение, что найти. Или сразу: <code>/search наушники</code>"
+ASK_HINT: Final = "❓ Напиши вопрос в ответ на это сообщение. Или сразу: <code>/ask что у меня завтра?</code>"
 UNKNOWN_COMMAND: Final = "🤷 Не знаю такой команды. Список команд — /help"
 CANCELLED: Final = "Отменено."
 NOTHING_TO_CANCEL: Final = "Нечего отменять."
@@ -136,8 +140,15 @@ async def cmd_recent(message: Message, ctx: AppContext) -> None:
 async def cmd_search(message: Message, ctx: AppContext) -> None:
     text = common.command_args(message)
     if not text:
-        await message.answer(SEARCH_HINT)
+        await sender.send(
+            ctx, SEARCH_HINT, ForceReply(input_field_placeholder="что найти"), purpose=sender.PURPOSE_SEARCH
+        )
         return
+    await send_search(ctx, text)
+
+
+async def send_search(ctx: AppContext, text: str) -> None:
+    """Search results for ``text`` (``/search text``, or a reply to the /search prompt)."""
 
     async def load(session: AsyncSession, prefs: Prefs, now: datetime) -> views.View:
         rows = await query.search(session, text)
@@ -171,7 +182,7 @@ async def cmd_ask(message: Message, ctx: AppContext) -> None:
     """Save the question like any captured message, forced into query mode; the processor answers it."""
     question = common.command_args(message)
     if not question:
-        await message.answer(ASK_HINT)
+        await sender.send(ctx, ASK_HINT, ForceReply(input_field_placeholder="вопрос"), purpose=sender.PURPOSE_QUESTION)
         return
     async with ctx.sessionmaker() as session:
         raw, created = await ingest.save_incoming(session, message, force_query=True)

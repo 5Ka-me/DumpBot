@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from aiogram.methods import SendMessage
+from sqlalchemy import select
 
-from dumpbot.bot.sender import REACT_SEEN
-from dumpbot.db.models import Item
+from dumpbot.ai.schemas import ExtractedItem, Extraction
+from dumpbot.bot.cbdata import PickCb
+from dumpbot.bot.sender import PURPOSE_ASK, PURPOSE_PICK, REACT_ASK, REACT_SAVED, REACT_SEEN
+from dumpbot.db.models import BotMessage, Item
+from dumpbot.domain.prefs import Prefs
+from dumpbot.services import ingest, items
+from dumpbot.workers import jobs
 
 STRANGER = 777  # not the owner (conftest's OWNER is 4242)
 
@@ -82,6 +88,138 @@ async def test_reply_to_own_message_is_not_looked_up(feed, updates, seed) -> Non
 
     [raw] = await seed.raws()
     assert raw.reply_item_id is None
+
+
+async def _items_from(seed, raw, *titles: str) -> list[int]:
+    """Items saved from ``raw`` (as the processor would), kinds note."""
+    async with seed.sessionmaker() as s:
+        created = await items.create_items(
+            s,
+            raw=raw,
+            extraction=Extraction(items=[ExtractedItem(kind="note", title=t) for t in titles]),
+            source="text",
+            source_text=None,
+            source_meta=None,
+            urls=[],
+            prefs=Prefs(),
+            now=raw.tg_date,
+            model=None,
+            prompt_version=None,
+        )
+        await s.commit()
+    return [c.item.id for c in created]
+
+
+async def test_reply_to_own_message_edits_the_item_saved_from_it(feed, updates, seed) -> None:
+    # A note got only 👌 (no card): replying to the message itself is the way to fix it.
+    raw = await seed.raw(600, text="позвонить в банк")
+    [item_id] = await _items_from(seed, raw, "Позвонить в банк")
+
+    await feed(updates.message("это задача, напомни вечером", reply_to=600, reply_to_bot=False))
+
+    reply = (await seed.raws())[-1]
+    assert reply.reply_item_id == item_id
+    [job] = await seed.jobs()
+    assert (job.kind, job.payload) == ("edit", {"raw_id": reply.id, "item_id": item_id})
+
+
+async def test_reply_to_a_part_of_own_album_edits_its_item(feed, updates, seed) -> None:
+    first = await seed.raw(610, text="чеки", media_group_id="g7")
+    await seed.raw(611, text=None, media_group_id="g7")
+    [item_id] = await _items_from(seed, first, "Чеки")
+
+    await feed(updates.message("это покупки", reply_to=611, reply_to_bot=False))
+
+    assert (await seed.raws())[-1].reply_item_id == item_id
+
+
+async def test_reply_to_own_message_with_several_items_asks_which(feed, updates, seed, tg, get_buttons) -> None:
+    raw = await seed.raw(620, text="купить хлеб и позвонить маме")
+    bread, mum = await _items_from(seed, raw, "Купить хлеб", "Позвонить маме")
+
+    update = updates.message("это задача", reply_to=620, reply_to_bot=False)
+    await feed(update)
+
+    reply = (await seed.raws())[-1]
+    assert reply.status == "done" and reply.raw_json[ingest.CANDIDATES_KEY] == [bread, mum]
+    assert await seed.jobs() == []
+    [msg] = tg.sent
+    assert "Какую запись изменить?" in msg.text and msg.reply_parameters.message_id == update.message.message_id
+    assert get_buttons(msg.reply_markup) == [
+        ("1", PickCb(raw=reply.id, item=bread).pack()),
+        ("2", PickCb(raw=reply.id, item=mum).pack()),
+    ]
+    async with seed.sessionmaker() as s:
+        [record] = (await s.scalars(select(BotMessage))).all()
+    assert (record.purpose, record.raw_message_id) == (PURPOSE_PICK, reply.id)
+    assert tg.reactions == [(update.message.message_id, REACT_ASK)]
+
+    # A reply "2" to that list picks the second item.
+    await feed(updates.message("2", reply_to=record.message_id))
+    [job] = await seed.jobs()
+    assert (job.kind, job.payload, job.dedupe_key) == (
+        "edit",
+        {"raw_id": reply.id, "item_id": mum},
+        f"pick:{reply.id}:{mum}",
+    )
+
+
+async def test_reply_to_own_message_without_items_is_a_plain_message(feed, updates, seed) -> None:
+    await seed.raw(630, text="? что у меня завтра")  # a question: no items
+
+    await feed(updates.message("и послезавтра", reply_to=630, reply_to_bot=False))
+
+    assert (await seed.raws())[-1].reply_item_id is None
+    assert [j.kind for j in await seed.jobs()] == ["message"]
+
+
+async def test_text_reply_to_the_clarifying_question_answers_it(feed, updates, seed, tg) -> None:
+    asked = await seed.raw(640, text="встреча с Олегом в 8", raw_json={"_ask": {"q": "В 8 утра или вечера?"}})
+    await seed.bot_message(710, purpose=PURPOSE_ASK, raw_message_id=asked.id)
+
+    update = updates.message("вечера", reply_to=710)
+    await feed(update)
+
+    [job] = await seed.jobs()
+    assert (job.kind, job.payload, job.dedupe_key) == (
+        "clarify",
+        {"raw_id": asked.id, "option": "вечера"},
+        f"clarify:{asked.id}",
+    )
+    reply = (await seed.raws())[-1]
+    assert (reply.text, reply.status) == ("вечера", "done")
+    assert tg.reactions == [(update.message.message_id, REACT_SAVED)]
+    [shown] = tg.edits  # the question shows the answer, like after a button
+    assert shown.message_id == 710 and shown.text.endswith("✅ вечера") and shown.reply_markup is None
+
+
+async def test_reply_to_an_already_answered_question_is_saved_as_a_message(feed, updates, seed) -> None:
+    asked = await seed.raw(650, text="встреча в 8", raw_json={"_ask": {"q": "?"}})
+    await seed.bot_message(711, purpose=PURPOSE_ASK, raw_message_id=asked.id)
+    async with seed.sessionmaker() as s:  # the owner pressed a button first
+        await jobs.enqueue(s, "clarify", {"raw_id": asked.id, "option": 0}, dedupe_key=f"clarify:{asked.id}")
+        await s.commit()
+
+    await feed(updates.message("вечера", reply_to=711))
+
+    assert [j.kind for j in await seed.jobs()] == ["clarify", "message"]
+    assert (await seed.raws())[-1].status == "new"
+
+
+async def test_reply_to_the_candidates_list(feed, updates, seed) -> None:
+    first = await seed.item("Встреча с Олегом")
+    second = await seed.item("Встреча с Олегом по проекту")
+    edit = await seed.raw(
+        660, text="перенеси встречу с Олегом", raw_json={ingest.CANDIDATES_KEY: [first.item.id, second.item.id]}
+    )
+    await seed.bot_message(712, purpose=PURPOSE_PICK, raw_message_id=edit.id)
+
+    await feed(updates.message("7", reply_to=712))  # not on the list: a message of its own
+    await feed(updates.message("2", reply_to=712))
+
+    message_job, pick = await seed.jobs()
+    assert message_job.kind == "message"
+    assert (pick.kind, pick.payload) == ("edit", {"raw_id": edit.id, "item_id": second.item.id})
 
 
 async def test_question_reply_to_card_keeps_both_flags(feed, updates, seed) -> None:

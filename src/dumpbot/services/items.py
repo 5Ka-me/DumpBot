@@ -19,7 +19,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -323,23 +323,34 @@ async def snooze(
     prefs: Prefs,
     now: datetime,
 ) -> Reminder:
-    """Cancel the occurrence's pending reminders and add one (auto=False): ``now + minutes``, or tomorrow
-    (relative to now) at the local time of day of ``due_at``."""
+    """Add a reminder (auto=False) at ``now + minutes``, or tomorrow (relative to now; before ``night_cutoff``
+    that is the day that has just started) at the local time of day of ``due_at``.
+
+    Pending reminders of the occurrence that would fire up to then are cancelled (the snooze replaces them);
+    later ones, e.g. "за 30 минут" after a "за день" reminder, are kept. An instance of an active series
+    snoozed past its due is moved to the new time (merging into an instance already there, e.g. tomorrow's of a
+    daily series): left behind, it would be marked missed once the next instance exists. The returned
+    reminder's ``occurrence_id`` is the occurrence it now belongs to.
+    """
     if (minutes is None) == (not tomorrow):
         raise ValueError("snooze needs exactly one of minutes / tomorrow")
     now = _utc(now)
     occ = await _get_occ(session, occurrence_id)
+    item = await _get_item(session, occ.item_id)
     if minutes is not None:
         if minutes <= 0:
             raise ValueError(f"snooze minutes must be positive: {minutes}")
         fire = now + timedelta(minutes=minutes)
     else:
         tz = prefs.zone
-        day = now.astimezone(tz).date() + timedelta(days=1)
-        fire = timeresolve.localize(day, occ.due_at.astimezone(tz).time(), tz).astimezone(UTC)
-    await _cancel_pending(session, [occ.id])
+        day, clock_time = timeresolve.tomorrow(now, prefs), occ.due_at.astimezone(tz).time()
+        fire = timeresolve.localize(day, clock_time, tz).astimezone(UTC)
+        if fire <= now:  # "завтра" right after midnight is today, but that time of day has passed
+            fire = timeresolve.localize(day + timedelta(days=1), clock_time, tz).astimezone(UTC)
+        if item.rec_active and item.rrule and fire > occ.due_at:
+            occ = await _move(session, item, occ, fire, occ.precision)
+    await _cancel_pending(session, [occ.id], until=fire)
     [reminder] = await _add_reminders(session, occ.id, [ReminderPlan(fire_at=fire, lead_minutes=0, auto=False)])
-    item = await _get_item(session, occ.item_id)
     _touch(item)
     return reminder
 
@@ -425,10 +436,20 @@ async def set_lead(session: AsyncSession, item_id: int, lead: list[int], prefs: 
     return await _patch_result(session, item, [])
 
 
-async def stop_recurrence(session: AsyncSession, item_id: int) -> Item:
-    """rec_active=False; the current open occurrence stays."""
+async def stop_recurrence(session: AsyncSession, item_id: int, now: datetime | None = None) -> Item:
+    """rec_active=False; the current (earliest open) occurrence stays. Later instances that were already generated
+    (the next one exists as soon as the current one is due) are cancelled with their reminders.
+
+    ``now`` is an optional extension of the contract (default: the current time).
+    """
+    now = _utc(now) if now is not None else clock.utcnow()
     item = await _get_item(session, item_id)
     item.rec_active = False
+    current = await _first_open(session, item.id)
+    for occ in await _open_occurrences(session, item.id, after=now):
+        if current is not None and occ.id != current.id:
+            occ.status = "cancelled"
+            await _cancel_pending(session, [occ.id])
     _touch(item)
     return item
 
@@ -444,7 +465,9 @@ async def apply_patch(
 
     ``when`` moves the current open occurrence (or creates one) and re-plans its reminders; for an active
     series it moves only this instance. ``rrule`` enables or replaces the recurrence (time of day from the
-    new/current due). An item that becomes actionable without any time gets the default reminder.
+    new/current due). An item that becomes actionable without any time gets the default reminder; one that stops
+    being actionable (task -> idea) loses it: the open ``default`` occurrences (the 19:00 a task without a time got)
+    are cancelled with their reminders, times the owner set (exact, slot, date…) stay.
     """
     now = _utc(now)
     item = await _get_item(session, item_id)
@@ -472,11 +495,13 @@ async def apply_patch(
             await _replan(session, item, occ, prefs, now)
     if not scheduled and not was_actionable and item.kind in ACTIONABLE:
         await _schedule_default(session, item, prefs, now)
+    if not scheduled and was_actionable and item.kind not in ACTIONABLE and not item.rec_active:
+        await _drop_default(session, item)
 
     if patch.action == "no_reminder":
         await remove_reminders(session, item.id)
     elif patch.action == "stop_recurrence":
-        await stop_recurrence(session, item.id)
+        await stop_recurrence(session, item.id, now)
 
     _touch(item)
     return await _patch_result(session, item, warnings)
@@ -650,6 +675,19 @@ async def _schedule_default(session: AsyncSession, item: Item, prefs: Prefs, now
     await _replan(session, item, occ, prefs, now)
 
 
+async def _drop_default(session: AsyncSession, item: Item) -> None:
+    """An item that is no longer actionable: its open ``default`` occurrences (a time the bot chose only because
+    it was a task) -> cancelled with their pending reminders, so an idea neither pings at 19:00 nor sits in
+    «Просрочено». Times the owner gave (exact, slot, date, relative, fallback) are kept."""
+    stmt = select(Occurrence).where(
+        Occurrence.item_id == item.id, Occurrence.status == "open", Occurrence.precision == "default"
+    )
+    occs = list((await session.scalars(stmt)).all())
+    for occ in occs:
+        occ.status = "cancelled"
+    await _cancel_pending(session, [o.id for o in occs])
+
+
 # --- recurrence ------------------------------------------------------------------------------------------------
 
 
@@ -702,9 +740,15 @@ async def _create_next(session: AsyncSession, item: Item, prefs: Prefs, now: dat
 
 
 async def _mark_superseded(session: AsyncSession, now: datetime) -> None:
+    """Open series instances older than 12 h with a later sibling -> missed, unless a reminder of theirs is still
+    to come (a snooze): they stay open until it has been sent (the scheduler cancels reminders of instances that
+    are no longer open)."""
     later = aliased(Occurrence)
     superseded = exists().where(
         later.item_id == Occurrence.item_id, later.due_at > Occurrence.due_at, later.status != "cancelled"
+    )
+    awaited = exists().where(
+        Reminder.occurrence_id == Occurrence.id, Reminder.status == "pending", Reminder.fire_at > now
     )
     stmt = (
         select(Occurrence)
@@ -714,6 +758,7 @@ async def _mark_superseded(session: AsyncSession, now: datetime) -> None:
             Occurrence.due_at < now - SUPERSEDED_AFTER,
             Item.rrule.is_not(None),
             superseded,
+            ~awaited,
         )
     )
     stale = (await session.scalars(stmt)).all()
@@ -745,16 +790,19 @@ def _rec_precision(item: Item) -> Precision:
 
 
 async def move_to_tomorrow(
-    session: AsyncSession, occurrence_ids: list[int], prefs: Prefs, now: datetime
+    session: AsyncSession, occurrence_ids: list[int], prefs: Prefs, now: datetime, *, day: date | None = None
 ) -> list[Occurrence]:
-    """+1 day to the local date at the same time of day (a due in the past -> tomorrow at that time), re-plan.
+    """+1 day to the local date at the same time of day, re-plan. A due in the past goes to ``day`` (default:
+    tomorrow, which before ``night_cutoff`` is the day that has just started; never a day in the past) at that
+    time of day, or to the day after when that moment has passed as well.
 
     Done/cancelled occurrences and deleted items are skipped. Moving onto an existing occurrence of the same
-    item (a daily series) merges into it.
+    item (a daily series) merges into it. ``day`` is an optional extension of the contract (the evening
+    digest passes its own day + 1).
     """
     now = _utc(now)
     tz = prefs.zone
-    tomorrow = now.astimezone(tz).date() + timedelta(days=1)
+    past_due_day = max(day or timeresolve.tomorrow(now, prefs), now.astimezone(tz).date())
     moved: dict[int, Occurrence] = {}
     for occurrence_id in dict.fromkeys(occurrence_ids):
         occ = await session.get(Occurrence, occurrence_id)
@@ -764,8 +812,10 @@ async def move_to_tomorrow(
         if item.status == "deleted":
             continue
         local = occ.due_at.astimezone(tz)
-        day = local.date() + timedelta(days=1) if occ.due_at > now else tomorrow
-        due = timeresolve.localize(day, local.time(), tz).astimezone(UTC)
+        new_day = local.date() + timedelta(days=1) if occ.due_at > now else past_due_day
+        due = timeresolve.localize(new_day, local.time(), tz).astimezone(UTC)
+        if due <= now:
+            due = timeresolve.localize(new_day + timedelta(days=1), local.time(), tz).astimezone(UTC)
         target = await _move(session, item, occ, due, occ.precision)
         _reopen(item)
         await _replan(session, item, target, prefs, now)
@@ -886,11 +936,23 @@ async def _add_reminders(session: AsyncSession, occurrence_id: int, plans: Itera
     return reminders
 
 
-async def _cancel_pending(session: AsyncSession, occurrence_ids: Sequence[int]) -> int:
-    """pending -> cancelled; sent/sending/missed reminders are left alone."""
+async def _cancel_pending(
+    session: AsyncSession, occurrence_ids: Sequence[int], *, until: datetime | None = None
+) -> int:
+    """pending -> cancelled (with ``until``: only those firing at or before it); sent/sending/missed reminders are
+    left alone.
+
+    The occurrence rows are locked first (until commit), so two re-plans of one occurrence (a double tap on
+    "+15 мин", a button racing an edit job) run one after the other: the second one sees the first one's new
+    reminders as pending and cancels them instead of adding a duplicate next to them.
+    """
     if not occurrence_ids:
         return 0
+    lock = select(Occurrence.id).where(Occurrence.id.in_(occurrence_ids)).order_by(Occurrence.id).with_for_update()
+    await session.execute(lock)
     stmt = select(Reminder).where(Reminder.occurrence_id.in_(occurrence_ids), Reminder.status == "pending")
+    if until is not None:
+        stmt = stmt.where(Reminder.fire_at <= until)
     reminders = (await session.scalars(stmt)).all()
     for reminder in reminders:
         reminder.status = "cancelled"

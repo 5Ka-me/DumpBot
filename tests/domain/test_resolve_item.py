@@ -125,9 +125,31 @@ def test_relative(now: datetime, prefs: Prefs):
     assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 16, 5), lead_minutes=0, auto=False),)
 
 
+def test_relative_with_stated_lead(now: datetime, prefs: Prefs):
+    it = item("event", when={"text": "через 2 часа", "in_min": 120}, lead=[30])  # "…созвон, напомни за 30 минут"
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 15, 35), lead_minutes=30, auto=False),)
+
+
 def test_date_precision_is_auto(now: datetime, prefs: Prefs):
     res = resolve_item(item(when={"day": "+1"}), now, prefs, source="text")
     assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 7, 10, 0), lead_minutes=0, auto=True),)
+
+
+@pytest.mark.parametrize("day", ["+0", "10-06", "d6", "2026-10-06"])
+@pytest.mark.parametrize("source", ["text", "forward"])
+def test_today_without_time_in_the_afternoon_stays_today(day: str, source: str, now: datetime, prefs: Prefs):
+    # 14:05: "сегодня купить молоко" / "концерт 6 октября" / "оплатить 6-го" — today, reminded today at 19:00.
+    res = resolve_item(item(when={"text": "сегодня", "day": day}), now, prefs, source=source)
+    assert (res.due_at, res.precision, res.warnings) == (L(2026, 10, 6, 19, 0), "date", ())
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 19, 0), lead_minutes=0, auto=True),)
+    assert res.needs_confirm is (source == "forward")
+
+
+def test_today_without_time_late_at_night_is_reminded_after_quiet_hours(prefs: Prefs):
+    res = resolve_item(item(when={"text": "сегодня", "day": "+0"}), L(2026, 10, 6, 23, 10), prefs, source="text")
+    assert (res.due_at, res.warnings, res.needs_confirm) == (L(2026, 10, 6, 23, 59), (), False)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 7, 8, 0), lead_minutes=0, auto=True),)
 
 
 def test_date_precision_honours_whole_day_lead(now: datetime, prefs: Prefs):
@@ -162,9 +184,16 @@ def test_past_date_has_no_reminders(now: datetime, prefs: Prefs):
 
 
 def test_fallback_at(now: datetime, prefs: Prefs):
-    res = resolve_item(item("event", when={"at": "2026-11-27T15:00"}), now, prefs, source="text")
-    assert (res.due_at, res.precision, res.needs_confirm) == (L(2026, 11, 27, 15, 0), "fallback", True)
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 11, 27, 15, 0), lead_minutes=0, auto=True),)
+    res = resolve_item(item("event", when={"at": "2026-11-27"}), now, prefs, source="text")
+    assert (res.due_at, res.precision, res.needs_confirm) == (L(2026, 11, 27, 10, 0), "fallback", True)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 11, 27, 10, 0), lead_minutes=0, auto=True),)
+
+
+def test_at_with_time_keeps_lead_and_ignores_quiet_hours(now: datetime, prefs: Prefs):
+    # "через две недели в пятницу в 23:30 поезд": an explicit time, sent as usual even in quiet hours.
+    res = resolve_item(item("event", when={"at": "2026-10-23T23:30"}), now, prefs, source="text")
+    assert (res.due_at, res.precision, res.needs_confirm) == (L(2026, 10, 23, 23, 30), "exact", True)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 23, 23, 25), lead_minutes=5, auto=False),)
 
 
 def test_bad_date_for_actionable_falls_back_to_default(now: datetime, prefs: Prefs):
@@ -260,10 +289,47 @@ def test_recurring_today_still_ahead_is_included(now: datetime, prefs: Prefs):
     assert resolve_item(it, now, prefs, source="text").due_at == L(2026, 10, 6, 15, 0)
 
 
-def test_recurring_ignores_day(now: datetime, prefs: Prefs):
+def test_recurring_day_only_sets_the_start(now: datetime, prefs: Prefs):
     it = item(when={"day": "+3", "time": "10:00"}, rrule="FREQ=MONTHLY;BYMONTHDAY=5")
     res = resolve_item(it, now, prefs, source="text")
     assert res.due_at == L(2026, 11, 5, 10, 0)
+    assert res.rec_dtstart_local == datetime(2026, 10, 9, 10, 0)
+
+
+@pytest.mark.parametrize(
+    ("when", "rule", "start", "due", "second"),
+    [
+        # "с понедельника каждый день в 9 пить таблетки" (Tue): starts Monday, not tomorrow
+        ({"day": "MO", "time": "09:00"}, "FREQ=DAILY", datetime(2026, 10, 12, 9, 0), L(2026, 10, 12, 9, 0), 13),
+        # "каждые две недели по пятницам, начиная со следующей": 16 Oct, 30 Oct… (not 9 Oct, 23 Oct…)
+        (
+            {"day": "next FR", "time": "18:00"},
+            "FREQ=WEEKLY;INTERVAL=2;BYDAY=FR",
+            datetime(2026, 10, 16, 18, 0),
+            L(2026, 10, 16, 18, 0),
+            30,
+        ),
+        # "каждый год 15 марта": a bare FREQ=YEARLY follows the start date, not the day it was said
+        ({"day": "03-15"}, "FREQ=YEARLY", datetime(2027, 3, 15, 19, 0), L(2027, 3, 15, 19, 0), None),
+    ],
+)
+def test_recurring_starts_on_the_stated_day(
+    when: dict, rule: str, start: datetime, due: datetime, second: int | None, now: datetime, prefs: Prefs
+):
+    res = resolve_item(item(when=when, rrule=rule), now, prefs, source="text")
+    assert (res.rec_dtstart_local, res.due_at) == (start, due)
+    nxt = recurrence.next_occurrence(res.rrule, res.rec_dtstart_local, prefs.zone, res.due_at)
+    assert nxt is not None
+    if second is not None:
+        assert nxt.astimezone(TZ).day == second
+    else:
+        assert nxt == L(2028, 3, 15, 19, 0)
+
+
+def test_recurring_day_in_the_past_starts_today(now: datetime, prefs: Prefs):
+    it = item(when={"day": "2026-09-01", "time": "18:00"}, rrule="FREQ=DAILY")
+    res = resolve_item(it, now, prefs, source="text")
+    assert (res.rec_dtstart_local, res.due_at) == (datetime(2026, 10, 6, 18, 0), L(2026, 10, 6, 18, 0))
 
 
 def test_recurring_from_photo_needs_confirm(now: datetime, prefs: Prefs):

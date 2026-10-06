@@ -152,11 +152,12 @@ INTENT: save (default) | query = asks about OWN saved data or schedule ("что 
 "какие идеи я сохранял?"); MODE query → always query | edit = changes an EXISTING item ("перенеси", "отмени", \
 "удали", "готово"), with edit.target naming it; REPLYING TO ITEM → always edit (no target).
 
-ITEMS: split independent things into separate items (one per thing to buy).
+ITEMS: split independent things into separate items (one per thing to buy), at most 20; more than 8 things to buy \
+→ ONE purchase item with the list in details.
 kind: task = something to do | event = meeting, appointment, something happening at a time | purchase = something \
 to buy | idea | note = thought, fact, diary | link = saved link/article | meme = humor, meme image | quote | other.
-title: short, imperative for tasks, in the message language. details: extra info only. tags: 0-4 lowercase, \
-no "#". conf: high|med|low.
+title: short (max 120 chars), imperative for tasks, in the message language. details: extra info only \
+(max 600 chars). tags: 0-4 lowercase, no "#". conf: high|med|low.
 
 TIME: describe it, NEVER compute dates. when = {{text: verbatim phrase, day, time, in_min, at, role}}
 - day: +N days (+0 сегодня, +1 завтра, +2 послезавтра) | +Nw | +Nmo | +Ny | MO TU WE TH FR SA SU = nearest such day | \
@@ -176,10 +177,10 @@ still in when.time.
 - Past facts (звонил, был) get no when; no time mentioned → no when.
 ask: only if a reminder would likely be wrong; 2-4 options; item = index in items.
 
-IMAGES: image.text = all readable text verbatim ("" if none); image.description = one short sentence in Russian. \
-Memes → kind meme.
+IMAGES: image.text = all readable text verbatim, max 4000 chars ("" if none); image.description = one short \
+sentence in Russian. Memes → kind meme.
 LINKS: kind link, title = page title or a short description.
-FORWARDED posts: usually note, link or idea; dates in them → conf low.
+FORWARDED posts: usually note, link or idea, never edit (someone else's words); dates in them → conf low.
 
 query = {{text: keywords, kinds, status open|done|any, date_field: due (scheduled) or created (when saved), range, \
 tags, answer: list or summary (short answer: когда?, сколько?)}}
