@@ -1,13 +1,29 @@
 # syntax=docker/dockerfile:1
 # Dump Bot image: multi-stage uv build, slim non-root runtime. Multi-arch (linux/amd64, linux/arm64):
 # every dependency ships binary wheels for both, so the runtime needs no compilers.
+# The Mini App frontend (webapp/) is built with Node in its own stage and copied in as static files.
 #   docker compose build                                  # this machine's architecture
 #   docker buildx build --platform linux/arm64 -t dumpbot:local .   # e.g. for a Raspberry Pi
 
 ARG PYTHON_IMAGE=python:3.12-slim-trixie
 ARG UV_VERSION=0.12.23
+ARG NODE_IMAGE=node:lts-slim
 
 FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+# ---------- webapp: the Mini App (React + Vite) -> /webapp/dist ----------
+# Static files are the same for every architecture, so this stage runs natively even in a cross-build.
+FROM --platform=$BUILDPLATFORM ${NODE_IMAGE} AS webapp
+WORKDIR /webapp
+ENV npm_config_update_notifier=false \
+    npm_config_fund=false \
+    npm_config_audit=false
+# Dependencies first: this layer is reused until package.json / package-lock.json change.
+COPY webapp/package.json webapp/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci
+COPY webapp/ ./
+RUN npm run build
 
 # ---------- build: resolve the locked dependencies into /app/.venv ----------
 FROM ${PYTHON_IMAGE} AS builder
@@ -51,6 +67,8 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY alembic.ini ./
 COPY migrations ./migrations
+# The Mini App build, served by the bot from WEBAPP_STATIC_DIR (default /app/webapp).
+COPY --from=webapp /webapp/dist ./webapp
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     TZ=UTC \

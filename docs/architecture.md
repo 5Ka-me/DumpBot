@@ -3,7 +3,7 @@
 Документ — источник правды для реализации. Требования: [requirements.md](requirements.md).
 Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
 Итерация 2 (размытые сроки, локальный Whisper, связи и подзадачи, Mini App): [features/iteration-2.md](features/iteration-2.md)
-— там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B, C, бэкенд D) кратко отмечено в этом документе.
+— там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B, C, D) кратко отмечено в этом документе.
 Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
 
 ## 1. Общая схема
@@ -46,6 +46,14 @@ Mini App ([iteration-2.md, D](features/iteration-2.md), [miniapp-api.md](feature
 `RawMessage.source="app"` с синтетическим отрицательным `message_id` через обычный конвейер, но без карточек и реакций
 в чате (итог — в `raw_json["_app"]`); «🕒 Время» текстом и «🪄 Разбить» из приложения — задачи `edit_time` / `split`
 с `app: true`, их итог — в `jobs.result` (обработчик возвращает dict).
+
+Фронтенд Mini App (`webapp/`, React + TypeScript + Vite, без UI-библиотек): `src/api/` — типы контракта и клиент
+(`Authorization: tma <initData>` на каждом запросе, ошибки → `ApiError`), `src/telegram.ts` — ready/expand, тема из
+`themeParams`, BackButton/MainButton, haptics; `src/lib/` — кэш чтений (stale-while-revalidate, `markStale` после
+правок), навигация стеком экранов (нижние вкладки), «закинуть в свалку» с опросом статуса, превью картинок через
+`fetch` → blob URL; `src/screens/` — экраны. `npm run dev` отвечает на `/api/*` мок-API в памяти (`webapp/mock/`),
+им же пользуются тесты vitest. Dockerfile собирает `dist/` в стадии `node:lts-slim` и кладёт в `/app/webapp`
+(`WEBAPP_STATIC_DIR`); в собранном `index.html` — CSP (свои файлы, скрипт Telegram, `blob:` для картинок).
 
 ## 2. Ключевые решения
 
@@ -106,6 +114,7 @@ src/dumpbot/
 migrations/  alembic (0001 initial, 0002 item periods, 0003 subtasks + item_links, 0004 mini app)   [infra]
 whisper/     app.py Dockerfile requirements.txt — локальный Whisper (compose profile whisper)        [infra]
 tailscale/   serve.json — Funnel для Mini App (compose profile miniapp)                              [infra]
+webapp/      фронтенд Mini App: src/ (api, lib, screens, components) mock/ (мок-API для dev и тестов)   [webapp]
 Dockerfile  compose.yaml  .dockerignore  .env.example  README.md                                     [infra]
 tests/conftest.py (фикстуры БД)                                                                       [foundation ✔]
 tests/<area>/test_*.py                                                                                [владелец модуля]

@@ -1,0 +1,491 @@
+/**
+ * «Карточка»: everything about one item and every edit of the bot — title, details, category, tags, the time (by
+ * words through the AI or from the picker, a span, «когда-нибудь»), «напомнить за», no reminders, snooze, done /
+ * not done, delete / restore, stop repeating, the checklist with «🪄 Разбить на шаги», related items, the source.
+ */
+import { useCallback, useEffect, useState } from "react";
+import { ApiError, api } from "../../api";
+import type { ItemDetail, ItemPatch, ItemResponse, Kind, PeriodValue, Step, StepPatch, StepResponse } from "../../api/types";
+import { AutoTextarea } from "../../components/AutoTextarea";
+import { Sheet } from "../../components/Sheet";
+import { Chip, Empty, ErrorBox, Loading, ScreenHeader, Section, Spinner } from "../../components/ui";
+import { fmtDateTime, fmtStamp, leadLabel } from "../../lib/format";
+import { ACTIONABLE, SOURCE_LABELS, kindInfo } from "../../lib/kinds";
+import { useMainButton } from "../../lib/mainButton";
+import { useKinds, useTz } from "../../lib/me";
+import { useBackHandler, useNav } from "../../lib/nav";
+import { itemsChanged, setCached, useResource } from "../../lib/store";
+import { toast, toastError } from "../../lib/toast";
+import { confirmDialog, haptic, openExternal, setClosingConfirmation } from "../../telegram";
+import { Gallery } from "./Gallery";
+import { KindPicker } from "./KindPicker";
+import { Steps } from "./Steps";
+import { TagsEditor } from "./TagsEditor";
+import { TimeSheet } from "./TimeSheet";
+import { useJob } from "./useJob";
+
+export const LEAD_CHOICES = [0, 5, 15, 30, 60, 1440] as const;
+export const SNOOZE_CHOICES: { label: string; minutes: number | null }[] = [
+  { label: "15 мин", minutes: 15 },
+  { label: "1 час", minutes: 60 },
+  { label: "3 часа", minutes: 180 },
+  { label: "завтра", minutes: null },
+];
+const LEAD_MAX = 3;
+
+/** The new "напомнить за" after tapping `minutes` (null: back to the settings' default). */
+export function nextLead(current: number[] | null, minutes: number): number[] | null {
+  if (!current || current.length === 0) return [minutes];
+  if (current.includes(minutes)) {
+    const rest = current.filter((m) => m !== minutes);
+    return rest.length ? rest : null;
+  }
+  return [...current, minutes].sort((a, b) => b - a).slice(0, LEAD_MAX);
+}
+
+/** "как в настройках", "выключено", "за 1 ч, за 15 мин". */
+export function leadSummary(item: Pick<ItemDetail, "lead_minutes" | "reminders_off">): string {
+  if (item.reminders_off) return "🔕 выключено";
+  if (!item.lead_minutes?.length) return "как в настройках";
+  return item.lead_minutes.map(leadLabel).join(", ");
+}
+
+/** The item can be done / not done in the card. */
+export function canBeDone(item: ItemDetail): boolean {
+  return item.status !== "deleted" && (ACTIONABLE.has(item.kind) || item.occurrence !== null);
+}
+
+export function itemDone(item: ItemDetail): boolean {
+  return item.status === "done" || item.occurrence?.status === "done";
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return url;
+  }
+}
+
+export function CardScreen({ id }: { id: number }) {
+  const tz = useTz();
+  const nav = useNav();
+  const kinds = useKinds();
+  const key = `item:${id}`;
+  const res = useResource(key, (signal) => api.item(id, { signal }));
+  const item = res.data;
+  const [busy, setBusy] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [timeOpen, setTimeOpen] = useState(false);
+  const [leadOpen, setLeadOpen] = useState(false);
+  const [draft, setDraft] = useState<{ title: string; details: string } | null>(null);
+  const { job, start, waitText } = useJob((jobWarnings) => {
+    setWarnings(jobWarnings);
+    return res.reload();
+  });
+
+  const reload = res.reload;
+  const apply = useCallback((answer: ItemResponse | StepResponse) => {
+    itemsChanged();
+    setCached(`item:${answer.item.id}`, answer.item);
+    setWarnings(answer.item.warnings);
+    haptic.success();
+    toast(answer.message, "success");
+  }, []);
+
+  const run = useCallback(
+    async (name: string, call: () => Promise<ItemResponse>): Promise<boolean> => {
+      setBusy(name);
+      try {
+        apply(await call());
+        return true;
+      } catch (error) {
+        toastError(error);
+        if (error instanceof ApiError && error.status === 409) void reload();
+        return false;
+      } finally {
+        setBusy(null);
+      }
+    },
+    [apply, reload],
+  );
+
+  // «🪄 Разбить» started elsewhere (the chat): refresh until it ends.
+  const splitPending = Boolean(item?.split_pending) && !job;
+  useEffect(() => {
+    if (!splitPending) return;
+    const timer = setInterval(() => void reload(), 2500);
+    return () => clearInterval(timer);
+  }, [splitPending, reload]);
+
+  const title = draft?.title ?? item?.title ?? "";
+  const details = draft?.details ?? item?.details ?? "";
+  const dirty = Boolean(item && draft && (draft.title.trim() !== item.title || draft.details.trim() !== (item.details ?? "")));
+
+  const save = async () => {
+    if (!item) return;
+    const patch: ItemPatch = {};
+    if (title.trim() !== item.title) patch.title = title.trim();
+    if (details.trim() !== (item.details ?? "")) patch.details = details.trim() || null;
+    if (await run("save", () => api.patchItem(id, patch))) setDraft(null);
+  };
+
+  useMainButton(dirty ? { text: "Сохранить", onClick: () => void save(), progress: busy === "save", disabled: !title.trim() } : null);
+  useBackHandler(dirty, () => {
+    void confirmDialog("Изменения не сохранены. Выйти без сохранения?").then((leave) => {
+      if (!leave) return;
+      setDraft(null);
+      nav.pop();
+    });
+  });
+  useEffect(() => {
+    setClosingConfirmation(dirty);
+    return () => setClosingConfirmation(false);
+  }, [dirty]);
+
+  if (!item) {
+    if (res.error instanceof ApiError && res.error.status === 404) {
+      return (
+        <>
+          <ScreenHeader title="Запись" />
+          <Empty emoji="🤷" title="Запись не найдена" text="Возможно, её удалили насовсем." />
+        </>
+      );
+    }
+    return (
+      <>
+        <ScreenHeader title="Запись" />
+        {res.error ? <ErrorBox error={res.error} onRetry={res.reload} /> : <Loading rows={5} />}
+      </>
+    );
+  }
+
+  const info = kindInfo(item.kind);
+  const deleted = item.status === "deleted";
+  const done = itemDone(item);
+  const locked = deleted || busy !== null;
+  const occOpen = item.occurrence?.status === "open" && !item.someday;
+  const hasTime = item.occurrence !== null && !item.someday;
+  const pendingReminders = item.reminders.filter((r) => r.status === "pending");
+  const sourceText = item.source.text && item.source.text.trim() !== item.title.trim() ? item.source.text : null;
+  const allWarnings = [...(item.needs_confirm ? ["🤔 Проверь время — я не уверен, что понял правильно."] : []), ...warnings];
+
+  const setKind = (kind: Kind) => run("kind", () => api.patchItem(id, { kind }));
+  const setTags = (tags: string[]) => run("tags", () => api.patchItem(id, { tags }));
+  const setLead = (lead: number[] | null) => run("lead", () => api.patchItem(id, { lead }));
+  const setPeriod = async (period: PeriodValue) => {
+    if (await run("time", () => api.patchItem(id, { period }))) setTimeOpen(false);
+  };
+  const setSomeday = async (someday: boolean) => {
+    if (await run("time", () => api.patchItem(id, { someday }))) setTimeOpen(false);
+  };
+  const pickTime = async (dueLocal: string) => {
+    if (await run("time", () => api.whenAt(id, dueLocal))) setTimeOpen(false);
+  };
+  const timeByText = (text: string) => {
+    setTimeOpen(false);
+    void start("edit_time", () => api.whenText(id, text));
+  };
+  const toggleDone = () => run("done", () => api.action(id, done ? "undone" : "done"));
+  const snooze = (minutes: number | null) =>
+    run(`snooze:${minutes}`, () => api.snooze(id, minutes === null ? { tomorrow: true } : { minutes }));
+  const remove = async () => {
+    const withSteps = item.steps.length ? " Шаги удалятся вместе с ней." : "";
+    if (await confirmDialog(`Удалить «${item.title}»?${withSteps}`)) await run("delete", () => api.action(id, "delete"));
+  };
+  const stopRepeat = async () => {
+    if (await confirmDialog("Остановить повтор? Текущий раз останется.")) await run("stoprec", () => api.action(id, "stoprec"));
+  };
+
+  const toggleStep = async (step: Step) => {
+    haptic.tap();
+    setCached<ItemDetail>(key, (prev) =>
+      prev && {
+        ...prev,
+        steps: prev.steps.map((s) => (s.id === step.id ? { ...s, done: !step.done } : s)),
+        steps_done: prev.steps_done + (step.done ? -1 : 1),
+      },
+    );
+    try {
+      apply(await api.toggleStep(step.id, !step.done));
+    } catch (error) {
+      toastError(error);
+      void reload();
+    }
+  };
+  const addStep = (stepTitle: string) => run("step", () => api.addStep(id, { title: stepTitle }));
+  const saveStep = (step: Step, patch: StepPatch) => run("step", () => api.patchStep(step.id, patch));
+  const deleteStep = async (step: Step) =>
+    (await confirmDialog(`Удалить шаг «${step.title}»?`)) && run("step", () => api.deleteStep(step.id));
+
+  return (
+    <>
+      <ScreenHeader title={`${info.emoji} ${info.label}`} />
+
+      {deleted && (
+        <div className="banner banner--danger">
+          <span>🗑 Удалено{item.deleted_at ? ` ${fmtStamp(item.deleted_at, tz)}` : ""}</span>
+          <button type="button" className="button button--small" disabled={busy !== null} onClick={() => run("restore", () => api.action(id, "restore"))}>
+            ↩️ Вернуть
+          </button>
+        </div>
+      )}
+
+      {item.parent && (
+        <button type="button" className="parent-link" onClick={() => nav.push({ name: "item", id: item.parent!.id })}>
+          ↳ шаг из «{item.parent.title}»
+        </button>
+      )}
+
+      <Section>
+        <AutoTextarea
+          className={done ? "title-input title-input--done" : "title-input"}
+          value={title}
+          maxLength={200}
+          disabled={deleted}
+          aria-label="Название"
+          onChange={(e) => setDraft({ title: e.target.value.replace(/\n/g, " "), details })}
+        />
+        <AutoTextarea
+          className="details-input"
+          value={details}
+          maxLength={4000}
+          disabled={deleted}
+          placeholder="Подробности…"
+          aria-label="Подробности"
+          onChange={(e) => setDraft({ title, details: e.target.value })}
+        />
+        {dirty && (
+          <div className="row row--action draft-actions">
+            <button type="button" className="text-button" onClick={() => setDraft(null)}>
+              Отменить
+            </button>
+            <span className="field-hint">Сохранить — кнопкой внизу</span>
+          </div>
+        )}
+      </Section>
+
+      {allWarnings.length > 0 && (
+        <div className="banner banner--warn" role="status">
+          {allWarnings.map((w) => (
+            <span key={w}>{w}</span>
+          ))}
+        </div>
+      )}
+
+      {!deleted && (
+        <Section title="Время">
+          <div className="row row--static">
+            <span className="when-line">{item.when_text ?? (canBeDone(item) ? "Без срока" : "Без времени")}</span>
+          </div>
+          {item.repeat_text && (
+            <div className="row row--static">
+              <span>
+                🔁 {item.repeat_text}
+                {!item.rec_active && <span className="field-hint"> · повтор остановлен</span>}
+              </span>
+            </div>
+          )}
+          {pendingReminders.length > 1 && (
+            <div className="row row--static">
+              <span className="field-hint">
+                🔔{" "}
+                {pendingReminders
+                  .map((r) => `${fmtDateTime(r.fire_at, tz)}${r.auto ? " (авто)" : ""}`)
+                  .join(", ")}
+              </span>
+            </div>
+          )}
+          {job?.kind === "edit_time" && (
+            <div className="row row--static">
+              <span className="inline-status">
+                <Spinner small /> {waitText ?? "Разбираю время…"}
+              </span>
+            </div>
+          )}
+          <div className="button-row">
+            <button type="button" className="button button--secondary" disabled={locked || job !== null} onClick={() => setTimeOpen(true)}>
+              🕒 Время
+            </button>
+            {canBeDone(item) && (
+              <button type="button" className={done ? "button button--secondary" : "button"} disabled={locked} onClick={toggleDone}>
+                {busy === "done" ? <Spinner small /> : done ? "↩️ Не сделано" : "✅ Готово"}
+              </button>
+            )}
+          </div>
+          {occOpen && (
+            <div className="field-group field-group--inset">
+              <span className="field-label">⏰ Отложить</span>
+              <div className="chips">
+                {SNOOZE_CHOICES.map((c) => (
+                  <Chip key={c.label} onClick={() => snooze(c.minutes)} disabled={locked}>
+                    {c.label}
+                  </Chip>
+                ))}
+              </div>
+            </div>
+          )}
+          {hasTime && !done && (
+            <button type="button" className="link-row" disabled={locked} onClick={() => setLeadOpen(true)}>
+              <span className="row-emoji" aria-hidden="true">
+                ⏱
+              </span>
+              <span className="link-row-text">
+                <span>Напомнить</span>
+                <span className="field-hint">{leadSummary(item)}</span>
+              </span>
+              <span className="link-row-chevron" aria-hidden="true">
+                ›
+              </span>
+            </button>
+          )}
+          {(pendingReminders.length > 0 || item.rec_active) && (
+            <div className="button-row">
+              {pendingReminders.length > 0 && !item.reminders_off && (
+                <button type="button" className="button button--secondary" disabled={locked} onClick={() => run("norem", () => api.action(id, "norem"))}>
+                  🔕 Без напоминаний
+                </button>
+              )}
+              {item.rec_active && (
+                <button type="button" className="button button--secondary" disabled={locked} onClick={stopRepeat}>
+                  ⏹ Стоп повтор
+                </button>
+              )}
+            </div>
+          )}
+        </Section>
+      )}
+
+      <Steps
+        item={item}
+        tz={tz}
+        busy={busy !== null}
+        splitStatus={job?.kind === "split" ? (waitText ?? "Разбиваю на шаги…") : null}
+        onToggle={toggleStep}
+        onAdd={addStep}
+        onSave={saveStep}
+        onDelete={deleteStep}
+        onOpen={(step) => nav.push({ name: "item", id: step.id })}
+        onSplit={() => void start("split", () => api.split(id))}
+      />
+
+      {!deleted && (
+        <Section title="Категория">
+          <KindPicker kinds={kinds} value={item.kind} disabled={locked} onChange={setKind} />
+        </Section>
+      )}
+
+      <Section title="Теги">
+        <div className="chips-padded">
+          <TagsEditor tags={item.tags} disabled={locked} onChange={setTags} />
+        </div>
+      </Section>
+
+      {item.images.length > 0 && (
+        <Section title="Картинки">
+          <Gallery images={item.images} title={item.title} />
+        </Section>
+      )}
+
+      {item.urls.length > 0 && (
+        <Section title="Ссылки">
+          {item.urls.map((url) => (
+            <button key={url} type="button" className="link-row" onClick={() => openExternal(url)}>
+              <span className="row-emoji" aria-hidden="true">
+                🔗
+              </span>
+              <span className="link-row-text">
+                <span>{item.link_titles[url] ?? hostOf(url)}</span>
+                <span className="field-hint link-url">{url}</span>
+              </span>
+            </button>
+          ))}
+        </Section>
+      )}
+
+      {item.related.length > 0 && (
+        <Section title="🔗 Похоже на">
+          {item.related.map((r) => (
+            <button key={r.id} type="button" className="link-row" onClick={() => nav.push({ name: "item", id: r.id })}>
+              <span className="row-emoji" aria-hidden="true">
+                {kindInfo(r.kind).emoji}
+              </span>
+              <span className="link-row-text">
+                <span>{r.title}</span>
+                <span className="field-hint">{fmtStamp(r.created_at, tz)}</span>
+              </span>
+            </button>
+          ))}
+        </Section>
+      )}
+
+      <Section title="Откуда">
+        <div className="row row--static">
+          <span className="field-hint">
+            {SOURCE_LABELS[item.source.kind] ?? "Сообщение"}
+            {item.source.from_app ? " из приложения" : ""}
+            {item.source.message_date ? ` · ${fmtStamp(item.source.message_date, tz)}` : ""}
+          </span>
+        </div>
+        {item.source.forward && (
+          <div className="row row--static">
+            {item.source.forward.url ? (
+              <button type="button" className="text-button" onClick={() => openExternal(item.source.forward!.url!)}>
+                ↪️ {item.source.forward.name ?? "Источник"}
+              </button>
+            ) : (
+              <span>↪️ {item.source.forward.name ?? "Переслано"}</span>
+            )}
+          </div>
+        )}
+        {sourceText && (
+          <details className="source-text">
+            <summary>Исходный текст</summary>
+            <p>{sourceText}</p>
+          </details>
+        )}
+      </Section>
+
+      {!deleted && (
+        <div className="danger-zone">
+          <button type="button" className="button button--danger-text" disabled={locked} onClick={remove}>
+            🗑 Удалить
+          </button>
+        </div>
+      )}
+      <p className="footnote">
+        Создано {fmtStamp(item.created_at, tz)}
+        {fmtStamp(item.updated_at, tz) !== fmtStamp(item.created_at, tz) ? ` · изменено ${fmtStamp(item.updated_at, tz)}` : ""}
+        {item.done_at ? ` · сделано ${fmtStamp(item.done_at, tz)}` : ""}
+      </p>
+
+      <Sheet open={leadOpen} title="⏱ Напомнить" onClose={() => setLeadOpen(false)}>
+        <div className="field-group">
+          {item.reminders_off && <span className="field-hint">Напоминания выключены — выбери, когда напомнить, чтобы включить.</span>}
+          <div className="chips">
+            <Chip pressed={item.lead_minutes === null} onClick={() => setLead(null)} disabled={locked}>
+              как в настройках
+            </Chip>
+            {LEAD_CHOICES.map((m) => (
+              <Chip key={m} pressed={Boolean(item.lead_minutes?.includes(m))} onClick={() => setLead(nextLead(item.lead_minutes, m))} disabled={locked}>
+                {leadLabel(m)}
+              </Chip>
+            ))}
+          </div>
+          <span className="field-hint">До трёх вариантов сразу. Для даты без времени и «на этой неделе» время выбирает бот.</span>
+        </div>
+      </Sheet>
+      <TimeSheet
+        open={timeOpen}
+        item={item}
+        tz={tz}
+        busy={busy !== null}
+        onClose={() => setTimeOpen(false)}
+        onText={timeByText}
+        onPick={pickTime}
+        onPeriod={setPeriod}
+        onSomeday={setSomeday}
+      />
+    </>
+  );
+}

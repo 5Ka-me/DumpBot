@@ -1,4 +1,5 @@
-# Only pyproject.toml, uv.lock, README.md, src/, alembic.ini and migrations/ are needed in the build context.
+# Only pyproject.toml, uv.lock, README.md, src/, alembic.ini, migrations/ and webapp/ (the Mini App sources, built in
+# the image) are needed in the build context.
 
 # Secrets
 .env
@@ -15,6 +16,12 @@
 *.egg-info/
 dist/
 build/
+
+# Mini App: dependencies and builds are made inside the image
+webapp/node_modules/
+webapp/dist/
+webapp/coverage/
+**/node_modules/
 
 # Not part of the image
 .git/

@@ -1,6 +1,6 @@
 """compose.yaml: shutdown grace periods, the bot's healthcheck (run as Docker runs it, against a temp file), the
-optional local Whisper service, the optional Tailscale Funnel of the Mini App and its serve config; .env.example
-documents every setting."""
+optional local Whisper service, the optional Tailscale Funnel of the Mini App and its serve config; the image builds the
+Mini App frontend; .env.example documents every setting."""
 
 from __future__ import annotations
 
@@ -168,6 +168,24 @@ def test_serve_config_funnels_https_to_the_bot_only() -> None:
         "Web": {host: {"Handlers": {"/": {"Proxy": f"http://bot:{Settings.model_fields['webapp_port'].default}"}}}},
         "AllowFunnel": {host: True},
     }
+
+
+def test_image_builds_the_mini_app_frontend() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    # A Node stage builds webapp/ natively (static files are the same for every architecture)...
+    assert re.search(r"^FROM --platform=\$BUILDPLATFORM \$\{NODE_IMAGE\} AS webapp$", dockerfile, re.MULTILINE)
+    assert "COPY webapp/package.json webapp/package-lock.json ./" in dockerfile
+    assert "npm ci" in dockerfile and "RUN npm run build" in dockerfile
+    # ... and the runtime gets dist/ where the bot serves it from by default.
+    runtime = dockerfile.split(" AS runtime", 1)[1]
+    assert "WORKDIR /app" in runtime and "COPY --from=webapp /webapp/dist ./webapp" in runtime
+    assert Settings.model_fields["webapp_static_dir"].default == "/app/webapp"
+    # The sources are in the build context, the local installs and builds are not.
+    ignored = (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+    assert not {"webapp", "webapp/", "webapp/*", "webapp/src/"} & set(ignored)
+    assert {"webapp/node_modules/", "webapp/dist/"} <= set(ignored)
+    package = json.loads((ROOT / "webapp" / "package.json").read_text(encoding="utf-8"))
+    assert "build" in package["scripts"] and (ROOT / "webapp" / "package-lock.json").is_file()
 
 
 def test_env_example_documents_every_setting() -> None:

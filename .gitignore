@@ -9,6 +9,10 @@ __pycache__/
 dist/
 build/
 
+# Node (webapp/)
+node_modules/
+coverage/
+
 # Secrets / local
 .env
 *.local.env
