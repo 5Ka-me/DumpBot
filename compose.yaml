@@ -2,6 +2,7 @@
 #   docker compose up -d --build      # build, migrate, start
 #   docker compose logs -f bot        # logs
 #   docker compose --profile whisper up -d --build   # + the optional local Whisper (LOCAL_STT_URL, README.md)
+#   docker compose --profile miniapp up -d --build   # + the Telegram Mini App over Tailscale Funnel (README.md)
 # Secrets and settings come from .env (copy .env.example). Postgres is reachable from the host only on 127.0.0.1.
 
 name: dumpbot
@@ -116,6 +117,43 @@ services:
     stop_grace_period: 10s
     logging: *logging
 
+  # Telegram Mini App over Tailscale Funnel, docs/features/iteration-2.md, D. Started only with "--profile miniapp".
+  # Publishes https://dump.<tailnet>.ts.net (HTTPS 443, certificate by Tailscale) -> http://bot:8080, the bot's own
+  # web server (.env: WEBAPP_ENABLED=true, WEBAPP_URL). Only that port is proxied: Postgres and the rest stay inside
+  # the compose network, and nothing is published on the host. Userspace networking: no /dev/net/tun, no extra
+  # capabilities (works in Docker Desktop on Windows). The node keeps its identity in the tailscale-state volume, so
+  # TS_AUTHKEY is needed only for the first start (TS_AUTH_ONCE).
+  tailscale:
+    profiles: ["miniapp"]
+    image: tailscale/tailscale:stable
+    hostname: dump
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: dump
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "true"
+      TS_AUTH_ONCE: "true"
+      # serve.json: TCP 443 HTTPS, "/" -> http://bot:8080, AllowFunnel; ${TS_CERT_DOMAIN} in it is filled in by
+      # the container itself. Mounted as a directory, so edits are picked up without a restart.
+      TS_SERVE_CONFIG: /config/serve.json
+      TS_ENABLE_HEALTH_CHECK: "true"
+      TS_LOCAL_ADDR_PORT: 127.0.0.1:9002
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - ./tailscale:/config:ro
+    depends_on:
+      - bot
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9002/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging: *logging
+
 volumes:
   pgdata:
   whisper-models:
+  tailscale-state:

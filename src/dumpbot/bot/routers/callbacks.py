@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, Final
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
-from sqlalchemy import exists, select
 
 from dumpbot import clock
 from dumpbot.ai.schemas import EditPatch
@@ -45,7 +44,7 @@ from dumpbot.bot.cbdata import (
 )
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
-from dumpbot.db.models import Job, Occurrence, RawMessage
+from dumpbot.db.models import Occurrence, RawMessage
 from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import fmt_date, fmt_dt, fmt_duration
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
@@ -279,10 +278,7 @@ async def _split(c: ItemCall) -> Outcome:
 
 
 async def _split_pending(session: AsyncSession, item_id: int) -> bool:
-    pending = exists().where(
-        Job.kind == "split", Job.status.in_(("queued", "running")), Job.payload["item_id"].astext == str(item_id)
-    )
-    return bool(await session.scalar(select(pending)))
+    return await jobs.pending_job(session, "split", item_id) is not None
 
 
 async def _related(c: ItemCall) -> Outcome:

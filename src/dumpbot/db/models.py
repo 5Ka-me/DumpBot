@@ -96,6 +96,9 @@ class RawMessage(Base):
     status: Mapped[str] = mapped_column(String(16), server_default="new", default="new")
     error: Mapped[str | None] = mapped_column(Text)
     raw_json: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # full Telegram Message for re-processing
+    # telegram | app: "закинуть в свалку" from the Mini App (docs/features/iteration-2.md §D) has a synthetic
+    # negative message_id, gets no card or reaction in the chat; what the owner would be told stays in raw_json.
+    source: Mapped[str] = mapped_column(String(16), server_default="telegram", default="telegram")
     created_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
     processed_at: Mapped[datetime | None] = mapped_column(TZ)
 
@@ -257,6 +260,8 @@ class Job(Base):
     run_after: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
     locked_until: Mapped[datetime | None] = mapped_column(TZ)
     last_error: Mapped[str | None] = mapped_column(Text)
+    # What a finished job reports to the Mini App ("🕒 Время" by text, "🪄 Разбить на шаги"): the handler's dict.
+    result: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now(), onupdate=func.now())
 

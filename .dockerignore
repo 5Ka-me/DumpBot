@@ -26,6 +26,7 @@ build/
 tests/
 docs/
 whisper/
+tailscale/
 backups/
 *.backup
 *.dump

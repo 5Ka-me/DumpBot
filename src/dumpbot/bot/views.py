@@ -398,6 +398,37 @@ def _time_line(
     return f"⏰ {head} · {phrase}"
 
 
+def time_text(
+    item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime
+) -> str | None:
+    """The card's time line as plain text, for the Mini App: "⏰ сегодня 13:00 · напомню в 12:55",
+    "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00", "🌙 когда-нибудь"."""
+    if item.someday:
+        occ = None
+    line = _time_line(item, occ, reminders, prefs, now)
+    return html.unescape(_TAG_RE.sub("", line)) if line else None
+
+
+def row_when(row: Row, prefs: Prefs, now: datetime) -> str | None:
+    """Due of a list row as plain text, for the Mini App: "сегодня 13:00", "на этой неделе", "когда-нибудь"."""
+    return _row_when(row, prefs, now)
+
+
+def step_when(step: Step, prefs: Prefs, now: datetime) -> str | None:
+    """Time of a checklist step as plain text ("чт 8 окт 15:00"), for the Mini App."""
+    return _step_when(step, prefs, now)
+
+
+def repeat_text(rule: str | None) -> str | None:
+    """A recurrence rule in Russian words ("каждый пн"); the rule itself when it cannot be described."""
+    if not rule:
+        return None
+    try:
+        return describe_rrule_ru(rule)
+    except ValueError:
+        return rule
+
+
 def _recurrence_line(item: Item) -> str | None:
     if not item.rrule:
         return None
@@ -943,6 +974,12 @@ def help_text() -> str:
             "• шаг без времени не напоминает и виден только в карточке; шаг со временем — как обычная задача"
             " с пометкой «(из «Переезд»)», в /tasks у задачи прогресс 2/5",
             "• «🔗 похоже на …» — подсказка о похожих старых записях (кнопка «🔗 Похожее»); дубли не объединяю",
+            "",
+            "<b>Приложение</b>",
+            "• кнопка «📱 Свалка» слева от поля ввода открывает Mini App: сегодня, лента с поиском и картинками,"
+            " задачи, карточки со всеми правками и чек-листом, «закинуть в свалку», вопросы, настройки и расходы",
+            "• кнопка появляется, когда приложение включено (README, раздел «Mini App»); записи из приложения в чат"
+            " не дублируются",
             "",
             "<b>Команды</b>",
             "/today — план на сегодня",

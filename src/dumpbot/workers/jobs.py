@@ -5,7 +5,7 @@ A job is claimed with ``UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKE
 again. Handlers open their own sessions from ``ctx.sessionmaker``; the worker records the outcome in a separate
 short transaction:
 
-- success -> ``done``;
+- success -> ``done`` (a handler that returns a dict leaves it in ``Job.result`` for the Mini App);
 - ``RetryLater`` -> ``queued`` at ``at`` or ``now + delay`` (``count_attempt=False`` gives the attempt back,
   e.g. budget deferral); a counted RetryLater at ``max_attempts`` -> ``dead``;
 - ``AIUnavailable`` -> ``queued`` at ``now + max(min(2**attempts min, 6 h), retry_after)``; never ``dead`` while
@@ -54,6 +54,7 @@ __all__ = [
     "describe_error",
     "enqueue",
     "forget_once",
+    "pending_job",
     "requeue_deferred",
     "safe_traceback",
     "try_once",
@@ -61,7 +62,7 @@ __all__ = [
 
 log = logging.getLogger(__name__)
 
-Handler = Callable[[AppContext, dict[str, Any]], Awaitable[None]]
+Handler = Callable[[AppContext, dict[str, Any]], Awaitable[Any]]  # a dict result is kept in Job.result
 DeadHook = Callable[[AppContext, Job], Awaitable[None]]
 
 MAX_BACKOFF: Final = timedelta(hours=6)
@@ -194,6 +195,17 @@ async def requeue_deferred(session: AsyncSession, now: datetime) -> int:
     return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
 
+async def pending_job(session: AsyncSession, kind: str, item_id: int) -> int | None:
+    """Id of a queued or running job of ``kind`` about the item (payload ``item_id``), if there is one."""
+    stmt = (
+        select(Job.id)
+        .where(Job.kind == kind, Job.status.in_(("queued", "running")), Job.payload["item_id"].astext == str(item_id))
+        .order_by(Job.id)
+        .limit(1)
+    )
+    return await session.scalar(stmt)
+
+
 async def try_once(session: AsyncSession, key: str) -> bool:
     """Insert a ``once_keys`` marker; True only for the caller that inserted it. Does not commit."""
     stmt = (
@@ -291,7 +303,7 @@ class JobWorker:
             return
         log.debug("job %s (%s) attempt %d", job.id, job.kind, job.attempts)
         try:
-            await handler(self._ctx, dict(job.payload or {}))
+            result = await handler(self._ctx, dict(job.payload or {}))
         except asyncio.CancelledError:
             await self._release(job)
             raise
@@ -302,7 +314,8 @@ class JobWorker:
         except Exception as e:
             await self._failed(job, e)
         else:
-            await self._record(job.id, status="done", last_error=None)
+            outcome = result if isinstance(result, dict) else None
+            await self._record(job.id, status="done", last_error=None, result=outcome)
             log.debug("job %s (%s) done", job.id, job.kind)
 
     async def _retry_later(self, job: Job, e: RetryLater) -> None:

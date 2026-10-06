@@ -7,6 +7,7 @@
 
 - Работает только с владельцем (`OWNER_ID`), остальных игнорирует.
 - Long polling: входящие порты не нужны, достаточно Docker на ПК или Raspberry Pi.
+- Есть [Mini App](#mini-app-необязательно) «📱 Свалка» внутри Telegram (по желанию, через бесплатный Tailscale Funnel).
 - Всё хранится в вашем PostgreSQL. Сами файлы бот не копирует, хранит только Telegram `file_id`.
 - Расход на ИИ: примерно $0.3–1 в месяц при 30 сообщениях в день. Есть месячный лимит, по умолчанию $5.
 
@@ -246,6 +247,9 @@
 Заголовки ссылок бот загружает сам, напрямую с этих сайтов. База данных хранится только у вас.
 С [локальным Whisper](#локальный-whisper-необязательно) в режиме «Локальный» сам звук голосовых остаётся на вашем
 компьютере, но распознанный текст всё равно уходит в chutes.ai на разбор.
+С [Mini App](#mini-app-необязательно) веб-сервер бота доступен из интернета через Tailscale Funnel (TLS
+заканчивается на вашем компьютере, Tailscale видит только зашифрованный трафик). Каждый запрос к данным проверяется
+подписью Telegram и принимается только от `OWNER_ID`; без этой подписи виден лишь статический фронтенд.
 
 ---
 
@@ -328,6 +332,85 @@ Whisper на chutes недоступен (это community-chute одного а
   (`uv run python -m dumpbot`), опубликуйте порт (`ports: ["127.0.0.1:9000:9000"]` в `compose.override.yaml`) и
   укажите `LOCAL_STT_URL=http://127.0.0.1:9000`.
 - Каждый вызов попадает в `/usage` (раздел «голосовые») с ценой $0: модель в учёте — `local:small`.
+
+### Mini App (необязательно)
+
+Приложение «📱 Свалка» внутри Telegram: сегодня и неделя, лента с поиском, фильтрами и превью картинок, задачи,
+«когда-нибудь» и повторы, карточка записи со всеми правками (название, подробности, категория, теги, время текстом
+через ИИ или пикером, «напомнить за», отложить, готово, удалить/вернуть, чек-лист, «🪄 разбить», похожие),
+«закинуть в свалку», вопросы к базе, настройки и расходы. Открывается кнопкой меню бота (слева от поля ввода).
+API приложения описан в [docs/features/miniapp-api.md](docs/features/miniapp-api.md).
+
+Telegram открывает Mini App только по HTTPS-адресу из интернета. Своего домена не нужно: адрес
+`https://dump.<ваш-tailnet>.ts.net` бесплатно даёт **Tailscale Funnel** — контейнер `tailscale` (профиль compose
+`miniapp`) получает сертификат и проксирует HTTPS на веб-сервер бота (`http://bot:8080`). Наружу видно только его:
+Postgres и остальное остаются внутри сети Docker, на хосте ничего не открывается, роутер настраивать не нужно.
+
+**Один раз руками (10 минут):**
+
+1. **Регистрация.** Откройте [login.tailscale.com/start](https://login.tailscale.com/start) и войдите через Google,
+   GitHub или Microsoft — бесплатный план Personal подходит. Приложение Tailscale на ПК ставить не нужно.
+2. **DNS и сертификаты.** В админке откройте [DNS](https://login.tailscale.com/admin/dns): **MagicDNS** должен быть
+   включён (кнопка «Enable MagicDNS», если он выключен), а внизу страницы в разделе **HTTPS Certificates** нажмите
+   «Enable HTTPS». Там же вверху написано имя вашего tailnet (**Tailnet DNS name**), например `tail1234.ts.net` —
+   оно понадобится в шаге 5.
+3. **Funnel разрешён.** Откройте [Access controls](https://login.tailscale.com/admin/acls/file) и проверьте, что в
+   политике есть атрибут `funnel` (в новых tailnet он есть по умолчанию):
+   ```json
+   "nodeAttrs": [
+     {"target": ["autogroup:member"], "attr": ["funnel"]}
+   ]
+   ```
+   Если блока нет — добавьте его и нажмите «Save».
+4. **Ключ.** [Settings → Keys](https://login.tailscale.com/admin/settings/keys) → «Generate auth key…»: Reusable и
+   Ephemeral **не** включайте (машина должна остаться в tailnet после перезапуска), остальное по умолчанию →
+   «Generate key». Скопируйте ключ `tskey-auth-…` — его показывают один раз.
+5. **`.env`:**
+   ```
+   TS_AUTHKEY=tskey-auth-…
+   WEBAPP_ENABLED=true
+   WEBAPP_URL=https://dump.tail1234.ts.net
+   ```
+   (`tail1234.ts.net` — имя из шага 2.) Ключ нужен только для первого запуска: дальше контейнер помнит себя в томе
+   `tailscale-state`.
+6. **Запуск** — как обычно, но с профилем `miniapp` (без него контейнер `tailscale` не создаётся):
+   ```bash
+   docker compose --profile miniapp up -d --build
+   ```
+   С локальным Whisper — оба профиля: `docker compose --profile whisper --profile miniapp up -d --build`.
+7. **Срок ключа.** В админке на странице [Machines](https://login.tailscale.com/admin/machines) у машины `dump`
+   откройте меню «…» → **Disable key expiry**. Иначе примерно через полгода машина выпадет из tailnet и приложение
+   перестанет открываться. Проверьте там же имя машины: если `dump` уже было занято, Tailscale назовёт её `dump-1`, и
+   в `WEBAPP_URL` нужно имя `dump-1` (потом `docker compose up -d`).
+8. **Telegram.** Закройте и снова откройте чат с ботом: слева от поля ввода появится кнопка «📱 Свалка» (иногда
+   нужно перезапустить Telegram). Кнопку бот ставит при каждом старте, если `WEBAPP_ENABLED=true` и `WEBAPP_URL`
+   начинается с `https://`; иначе там меню команд.
+
+**Как проверить:**
+
+```bash
+docker compose --profile miniapp ps                              # у tailscale — (healthy)
+docker compose logs bot | grep "Mini App"                        # "Mini App web server listening on 0.0.0.0:8080"
+docker compose --profile miniapp exec tailscale tailscale funnel status   # https://dump.….ts.net (Funnel on) → http://bot:8080
+curl -i https://dump.tail1234.ts.net/api/me                      # 401 {"error":{"code":"unauthorized",…}} — так и должно быть
+```
+
+Ответ 401 значит, что вся цепочка работает, а API защищён: данные отдаются только запросам, подписанным Telegram для
+вашего `OWNER_ID` (initData не старше 24 часов). Тот же адрес в обычном браузере покажет стартовую страницу без
+данных. Первый HTTPS-запрос может идти до минуты (Tailscale выпускает сертификат), а новое имя в публичном DNS
+появляется в течение 10 минут.
+
+Если не работает: `docker compose --profile miniapp logs tailscale` (ключ просрочен или уже использован — создайте
+новый, очистите том: `docker compose --profile miniapp rm -sf tailscale` и `docker volume rm dumpbot_tailscale-state`,
+запустите снова); `funnel status` пустой — проверьте шаги 2–3. Приложение пишет «Сессия устарела» — закройте его и
+откройте кнопкой заново.
+
+**Выключить:** `WEBAPP_ENABLED=false` в `.env`, `docker compose up -d` (кнопка меню снова станет списком команд) и
+`docker compose --profile miniapp stop tailscale`.
+
+Записи, добавленные через приложение, проходят тот же разбор ИИ, что и сообщения боту, но карточки и реакции в чат
+не приходят — результат показывает приложение. Правки из приложения в чате не дублируются; только закрытие задачи
+последним шагом чек-листа, как и в боте, присылает «🎉 Все шаги выполнены».
 
 ### Windows-ПК
 

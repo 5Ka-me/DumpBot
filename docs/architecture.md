@@ -3,7 +3,8 @@
 Документ — источник правды для реализации. Требования: [requirements.md](requirements.md).
 Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
 Итерация 2 (размытые сроки, локальный Whisper, связи и подзадачи, Mini App): [features/iteration-2.md](features/iteration-2.md)
-— там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B, C) кратко отмечено в этом документе.
+— там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B, C, бэкенд D) кратко отмечено в этом документе.
+Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
 
 ## 1. Общая схема
 
@@ -35,7 +36,16 @@ Telegram ──long polling──► aiogram Dispatcher
 
 Контейнеры: `db` (postgres:18), `migrate` (alembic upgrade head, one-shot), `bot`; необязательный `whisper`
 (compose profile `whisper`, `whisper/app.py`: faster-whisper на CPU, `POST /transcribe`, `GET /health`, модель в томе
-`whisper-models`, наружу не публикуется — [iteration-2.md, B](features/iteration-2.md)).
+`whisper-models`, наружу не публикуется — [iteration-2.md, B](features/iteration-2.md)); необязательный `tailscale`
+(compose profile `miniapp`, userspace-режим, `tailscale/serve.json`: Funnel HTTPS 443 → `http://bot:8080`).
+
+Mini App ([iteration-2.md, D](features/iteration-2.md), [miniapp-api.md](features/miniapp-api.md)): при
+`WEBAPP_ENABLED` `Lifecycle` поднимает в том же процессе aiohttp-сервер (`dumpbot/web/`: `/api/*` — тонкий слой над
+сервисами, каждый запрос подписан initData владельца; остальное — статика фронтенда с fallback на `index.html`) и
+ставит кнопку меню «📱 Свалка» (`WEBAPP_URL`); при остановке сервер закрывается первым. «Закинуть в свалку» —
+`RawMessage.source="app"` с синтетическим отрицательным `message_id` через обычный конвейер, но без карточек и реакций
+в чате (итог — в `raw_json["_app"]`); «🕒 Время» текстом и «🪄 Разбить» из приложения — задачи `edit_time` / `split`
+с `app: true`, их итог — в `jobs.result` (обработчик возвращает dict).
 
 ## 2. Ключевые решения
 
@@ -91,8 +101,11 @@ src/dumpbot/
     middlewares.py  cbdata.py  keyboards.py  states.py  views.py  sender.py                           [bot]
     cards.py               карточка + CardExtras (чек-лист, похожие, родитель), 🎉 после закрытия шагов   [bot]
     routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
-migrations/  alembic (env.py async, 0001 initial, 0002 item periods, 0003 subtasks + item_links)   [infra]
+  web/                     Mini App: server.py (aiohttp, статика, WebServer) auth.py (initData) http.py  [web]
+                           api_lists.py api_items.py api_inbox.py files.py (превью, LRU) serialize.py
+migrations/  alembic (0001 initial, 0002 item periods, 0003 subtasks + item_links, 0004 mini app)   [infra]
 whisper/     app.py Dockerfile requirements.txt — локальный Whisper (compose profile whisper)        [infra]
+tailscale/   serve.json — Funnel для Mini App (compose profile miniapp)                              [infra]
 Dockerfile  compose.yaml  .dockerignore  .env.example  README.md                                     [infra]
 tests/conftest.py (фикстуры БД)                                                                       [foundation ✔]
 tests/<area>/test_*.py                                                                                [владелец модуля]
@@ -495,6 +508,10 @@ pending-напоминания → cancelled), снятие отметки у з
 Родитель, закрытый вручную, закрывает свои открытые шаги; удаление родителя удаляет шаги с тем же `deleted_at`,
 `restore_item` возвращает именно их. Родитель-повтор шагами не закрывается.
 
+Итерация 2, D (Mini App): `add_step(session, parent_id, title, prefs, now, *, when=None)` — шаг в конец чек-листа
+(до `MAX_CHECKLIST` = 20; закрытый родитель открывается), `set_details`, `clear_someday` («когда-нибудь» → запись без
+даты, задача получает 19:00), `clear_time` (шаг без своего времени).
+
 Внутренние правила: при любом перепланировании pending-напоминания текущего occurrence → cancelled, создаются новые
 по `plan_reminders` (для precision `period` — с `period=(item.period_start, item.period_end)`). Итерация 2: `Item`
 хранит `period_kind/period_start/period_end/someday`; `apply_patch` с `when.period` пересчитывает срок и
@@ -574,6 +591,10 @@ def rows_for_llm(rows: list[Row], prefs: Prefs) -> list[dict]      # компа�
 не отменённое occurrence); повестка и дайджесты строятся по occurrences, так что шаги без времени туда не попадают.
 `search` и `find_edit_candidates` находят и шаги. Строки получают `parent_title` / `steps_done/steps_total`.
 
+Итерация 2, D: `feed(session, prefs, *, text, kinds, tags, status, created_from, created_to, before, limit)` — лента
+новых первыми с keyset-курсором `(created_at, id)`; `rows_by_ids`; `item_images(session, item)` / `image_counts` —
+картинки сообщения записи (все части альбома; фото и JPEG/PNG/WebP/GIF файлом) для превью.
+
 ### 4.12 workers/jobs.py  [workers]
 
 ```python
@@ -594,7 +615,8 @@ class JobWorker:
     async def run_once(self) -> int      # одна итерация (для тестов): claim + выполнить; вернуть число задач
 ```
 `run` регистрирует `"jobs"` в `ctx.watchdog` (лимит `STALL_AFTER` = 30 мин) и отмечается на каждой итерации и перед
-каждой задачей.
+каждой задачей. Итерация 2, D: обработчик может вернуть dict — он сохраняется в `Job.result` (итог для Mini App,
+`GET /api/jobs/{id}`); `pending_job(session, kind, item_id)` — id идущей задачи о записи.
 
 Семантика выполнения задачи: обработчик открывает свои сессии через `ctx.sessionmaker`. Успех → `done`.
 `RetryLater` → `queued`, `run_after = at or now+delay` (count_attempt=False — не увеличивать attempts, например бюджет).
@@ -620,6 +642,9 @@ async def enqueue_processing(session, raw: RawMessage, now: datetime) -> None
 async def message_raw_ids(session, chat_id: int, message_id: int) -> list[int]  # raw сообщения или всех частей альбома
 async def picked_item(session, raw_id: int, text: str) -> int | None   # ответ «2» на список кандидатов raw → item_id
 ASK_KEY = "_ask"; CANDIDATES_KEY = "_candidates"   # ключи raw_json: заданный вопрос / item_id списка кандидатов
+async def save_app_text(session, chat_id: int, text: str, now: datetime) -> RawMessage   # итерация 2, D
+    # source="app", message_id = -id, urls из текста (text_urls), "?" в начале -> force_query
+APP_KEY = "_app"   # raw_json сообщения из приложения: {note, answer: {text, title, item_ids}, edited: [item_id]}
 ```
 
 ### 4.14 services/processor.py  [workers]
@@ -687,6 +712,11 @@ now}` от кнопки «🪄 Разбить на шаги» → `split_steps` 
 карточка с чек-листом (кнопка — правка этой карточки; ответ — новая карточка reply). Нечего разбивать / уже есть шаги /
 нельзя → заметка над карточкой. `AIUnavailable` для кнопки — один раз «✍ ИИ сейчас недоступен…», `AIBadResponse` —
 «😢 Не смог разбить на шаги». После правок, закрывших родителя последним шагом, — `cards.after_steps` (🎉).
+Итерация 2, D: сообщение из Mini App (`raw.source == "app"`) идёт тем же путём, но в чат ничего не отправляется
+(ни карточек, ни реакций, ни вопроса, ни ответа, ни списка кандидатов): заметка, ответ на «?» и изменённые записи —
+в `raw_json[APP_KEY]`, вопрос и кандидаты — под обычными ключами. `edit_time` / `split` с `app: true` возвращают итог
+`{ok, reason, message, …}` (→ `Job.result`). `ask_question(ctx, question, prefs, now) -> QueryAnswer` — `POST /api/ask`
+(бюджет → `extract(force_query)` → `run_question`: строки QuerySpec и ответ словами).
 `handle_clarify(ctx, {"raw_id","option"})` — повтор `extract(clarification=option)` → `replace_items_for_raw` → карточки.
 Не более одного раза на raw: once_key `clarify-done:{raw_id}` коммитится вместе с новыми записями и проверяется в начале
 (повторный запуск job после рестарта не платит за ИИ и не заменяет записи снова).

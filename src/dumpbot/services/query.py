@@ -12,6 +12,9 @@ Checklists and related items (§C): a step shows in the top-level lists (/tasks,
 when it has a time of its own, named after its parent ("(из «Переезд»)"); a parent row counts its steps ("2/5").
 ``related_candidates`` finds earlier items with any word of a new message for the "RELATED CANDIDATES" prompt line;
 ``card_extras`` loads what an item card shows besides the item (checklist, related items, parent).
+
+The Mini App (§D): ``feed`` pages through all items newest first with filters (keyset cursor), ``rows_by_ids`` loads
+the rows an answer named, ``item_images`` / ``image_counts`` find the pictures of the message an item came from.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from sqlalchemy.orm import defer
 from sqlalchemy.sql.selectable import Subquery
 
 from dumpbot.ai.schemas import QuerySpec
-from dumpbot.db.models import AiUsage, Item, ItemLink, Occurrence
+from dumpbot.db.models import AiUsage, Item, ItemLink, Occurrence, RawMessage
 from dumpbot.domain import recurrence, timeresolve
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
@@ -42,13 +45,17 @@ __all__ = [
     "UsageSummary",
     "agenda",
     "card_extras",
+    "feed",
     "find_edit_candidates",
+    "image_counts",
+    "item_images",
     "items_of_raw",
     "open_tasks",
     "recent",
     "recurring",
     "related_candidates",
     "related_refs",
+    "rows_by_ids",
     "rows_for_llm",
     "run_query",
     "search",
@@ -87,6 +94,10 @@ RELATED_DAYS: Final = 365  # related candidates are items saved within this many
 RELATED_LIMIT: Final = 5
 _CANDIDATE_WORDS: Final = 30  # words of a message that go into the OR query
 _LEXEME_RE = re.compile(r"[^\W_]+", re.UNICODE)  # letters and digits only: safe in to_tsquery syntax
+FEED_STATUSES: Final = ("any", "open", "done", "deleted")  # any = not deleted; deleted = the trash
+IMAGE_TYPES: Final = ("photo", "image_document")
+# Pictures the Mini App previews (raster formats a browser shows; never SVG from our own origin).
+PREVIEW_MIME: Final = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 
 
 # --- agenda / lists --------------------------------------------------------------------------------------------
@@ -333,6 +344,125 @@ async def _with_family(session: AsyncSession, rows: list[Row]) -> list[Row]:
             if row.item_id in progress:
                 row.steps_done, row.steps_total = progress[row.item_id]
     return rows
+
+
+# --- Mini App --------------------------------------------------------------------------------------------------
+
+
+async def feed(
+    session: AsyncSession,
+    prefs: Prefs,
+    *,
+    text: str | None = None,
+    kinds: Sequence[str] = (),
+    tags: Sequence[str] = (),
+    status: str = "any",
+    created_from: date | None = None,
+    created_to: date | None = None,
+    before: tuple[datetime, int] | None = None,
+    limit: int = 30,
+) -> list[Row]:
+    """All items newest first (the Mini App's feed), one page of ``limit`` after ``before`` = (created_at, id) of the
+    last row of the previous page. ``text`` matches like ``search`` (steps too); without it a step shows only with a
+    time of its own, as in the other lists. ``kinds`` / ``tags``: any of them. ``status``: ``FEED_STATUSES``.
+    ``created_from`` / ``created_to``: local dates of saving, inclusive."""
+    if status not in FEED_STATUSES:
+        raise ValueError(f"unknown status: {status}")
+    conds: list[ColumnElement[bool]] = []
+    if status == "any":
+        conds.append(Item.status != "deleted")
+    else:
+        conds.append(Item.status == status)
+    text = (text or "").strip()
+    conds.append(_matches(text, _tsquery(text)) if text else _listed())
+    if kinds:
+        conds.append(Item.kind.in_(list(kinds)))
+    if tags:
+        conds.append(Item.tags.overlap(list(tags)))
+    tz = prefs.zone
+    if created_from is not None:
+        conds.append(Item.created_at >= timeresolve.localize(created_from, time(0), tz).astimezone(UTC))
+    if created_to is not None:
+        conds.append(
+            Item.created_at < timeresolve.localize(created_to + timedelta(days=1), time(0), tz).astimezone(UTC)
+        )
+    if before is not None:
+        at, item_id = before
+        conds.append(or_(Item.created_at < at, and_(Item.created_at == at, Item.id < item_id)))
+    stmt = (
+        _item_select(_occ_subquery(open_only=False))
+        .where(*conds)
+        .order_by(Item.created_at.desc(), Item.id.desc())
+        .limit(limit)
+    )
+    return await _item_rows(session, stmt)
+
+
+async def rows_by_ids(session: AsyncSession, item_ids: Sequence[int]) -> list[Row]:
+    """Rows of these items (not deleted) in the given order, with their current occurrence."""
+    ids = list(dict.fromkeys(item_ids))
+    if not ids:
+        return []
+    stmt = _item_select(_occ_subquery(open_only=False)).where(Item.id.in_(ids), Item.status != "deleted")
+    by_id = {row.item_id: row for row in await _item_rows(session, stmt)}
+    return [by_id[i] for i in ids if i in by_id]
+
+
+def _previewable() -> ColumnElement[bool]:
+    """A picture the Mini App can preview: a Telegram photo, or a JPEG / PNG / WebP / GIF sent as a file."""
+    return and_(
+        RawMessage.file_id.is_not(None),
+        or_(
+            RawMessage.content_type == "photo",
+            and_(
+                RawMessage.content_type == "image_document",
+                func.lower(func.coalesce(RawMessage.mime_type, "")).in_(sorted(PREVIEW_MIME)),
+            ),
+        ),
+    )
+
+
+async def item_images(session: AsyncSession, item: Item) -> list[RawMessage]:
+    """Pictures of the message the item was saved from (every part of an album), in message order. A step has none
+    of its own (it shares its parent's message)."""
+    if item.raw_message_id is None or item.parent_id is not None:
+        return []
+    raw = await session.get(RawMessage, item.raw_message_id)
+    if raw is None:
+        return []
+    stmt = select(RawMessage).where(_previewable()).options(defer(RawMessage.raw_json))
+    if raw.media_group_id:
+        stmt = stmt.where(RawMessage.chat_id == raw.chat_id, RawMessage.media_group_id == raw.media_group_id)
+    else:
+        stmt = stmt.where(RawMessage.id == raw.id)
+    return list((await session.scalars(stmt.order_by(RawMessage.message_id, RawMessage.id))).all())
+
+
+async def image_counts(session: AsyncSession, item_ids: Sequence[int]) -> dict[int, int]:
+    """Number of previewable pictures (``item_images``) per item, for list rows; items without any are left out."""
+    if not item_ids:
+        return {}
+    stmt = (
+        select(Item.id, RawMessage.chat_id, RawMessage.media_group_id, _previewable())
+        .join(RawMessage, RawMessage.id == Item.raw_message_id)
+        .where(Item.id.in_(list(item_ids)), Item.parent_id.is_(None))
+    )
+    rows = (await session.execute(stmt)).tuples().all()
+    groups = {(chat, group) for _, chat, group, _ in rows if group}
+    per_group: dict[tuple[int, str], int] = {}
+    if groups:
+        count_stmt = (
+            select(RawMessage.chat_id, RawMessage.media_group_id, func.count())
+            .where(_previewable(), RawMessage.media_group_id.in_(sorted(g for _, g in groups)))
+            .group_by(RawMessage.chat_id, RawMessage.media_group_id)
+        )
+        per_group = {(c, g): int(n) for c, g, n in (await session.execute(count_stmt)).tuples()}
+    counts: dict[int, int] = {}
+    for item_id, chat, group, previewable in rows:
+        n = per_group.get((chat, group), 0) if group else int(bool(previewable))
+        if n:
+            counts[item_id] = n
+    return counts
 
 
 # --- search ----------------------------------------------------------------------------------------------------

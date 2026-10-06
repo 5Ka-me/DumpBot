@@ -1,8 +1,10 @@
 """compose.yaml: shutdown grace periods, the bot's healthcheck (run as Docker runs it, against a temp file), the
-optional local Whisper service; .env.example documents every setting."""
+optional local Whisper service, the optional Tailscale Funnel of the Mini App and its serve config; .env.example
+documents every setting."""
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -16,6 +18,7 @@ import pytest
 
 from dumpbot.bot.app import DRAIN_TIMEOUT_S
 from dumpbot.config import Settings
+from dumpbot.web.server import SHUTDOWN_TIMEOUT_S
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPOSE = ROOT / "compose.yaml"
@@ -40,8 +43,8 @@ def grace_s(name: str) -> int:
 
 
 def test_bot_has_time_to_drain_before_sigkill() -> None:
-    # Drain the updates being handled, release the running job (<= 2 s), close the resources.
-    assert grace_s("bot") >= DRAIN_TIMEOUT_S + 2 + 10
+    # Stop the Mini App's web server, drain the updates being handled, release the running job (<= 2 s), close.
+    assert grace_s("bot") >= SHUTDOWN_TIMEOUT_S + DRAIN_TIMEOUT_S + 2 + 10
 
 
 def test_db_has_time_for_its_shutdown_checkpoint() -> None:
@@ -136,6 +139,37 @@ def test_whisper_image_files() -> None:
     assert "whisper/" in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
 
 
+# --- Mini App over Tailscale Funnel (docs/features/iteration-2.md, D) ------------------------------------------------
+
+
+def test_tailscale_is_an_optional_userspace_service() -> None:
+    block = service("tailscale")
+    assert re.search(r'^    profiles: \["miniapp"\]$', block, re.MULTILINE), "only with --profile miniapp"
+    assert re.search(r"^    image: tailscale/tailscale:", block, re.MULTILINE)
+    assert "ports:" not in block, "nothing on the host: Funnel reaches the tailnet from inside the container"
+    assert "/dev/net/tun" not in block and "cap_add" not in block and "privileged" not in block
+    env = dict(re.findall(r"^      (TS_[A-Z_]+): (.+)$", block, re.MULTILINE))
+    assert env["TS_AUTHKEY"] == "${TS_AUTHKEY:-}"  # interpolated for every profile: never required
+    assert env["TS_HOSTNAME"] == "dump" and env["TS_USERSPACE"] == '"true"' and env["TS_AUTH_ONCE"] == '"true"'
+    assert env["TS_STATE_DIR"] == "/var/lib/tailscale" and env["TS_SERVE_CONFIG"] == "/config/serve.json"
+    assert "      - tailscale-state:/var/lib/tailscale" in block
+    assert "      - ./tailscale:/config:ro" in block  # a directory: Tailscale notices changes of the file
+    assert re.search(r"^  tailscale-state:$", COMPOSE.read_text(encoding="utf-8"), re.MULTILINE)
+    assert re.search(r"^    restart: unless-stopped$", block, re.MULTILINE)
+    assert grace_s("tailscale") >= 5
+    assert "tailscale/" in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+
+
+def test_serve_config_funnels_https_to_the_bot_only() -> None:
+    config = json.loads((ROOT / "tailscale" / "serve.json").read_text(encoding="utf-8"))
+    host = "${TS_CERT_DOMAIN}:443"
+    assert config == {
+        "TCP": {"443": {"HTTPS": True}},
+        "Web": {host: {"Handlers": {"/": {"Proxy": f"http://bot:{Settings.model_fields['webapp_port'].default}"}}}},
+        "AllowFunnel": {host: True},
+    }
+
+
 def test_env_example_documents_every_setting() -> None:
     keys = {
         line.split("=", 1)[0]
@@ -144,3 +178,4 @@ def test_env_example_documents_every_setting() -> None:
     }
     assert {name.upper() for name in Settings.model_fields} <= keys
     assert {"WHISPER_MODEL", "WHISPER_THREADS", "WHISPER_BEAM_SIZE", "WHISPER_MAX_AUDIO_S", "WHISPER_MEM_LIMIT"} <= keys
+    assert "TS_AUTHKEY" in keys

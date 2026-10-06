@@ -49,15 +49,19 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import CreatedItem, PatchResult, ReminderPlan, Resolution
 
 __all__ = [
+    "MAX_CHECKLIST",
     "STEP_KIND",
     "SUPERSEDED_AFTER",
     "CreatedItem",
     "NotFoundError",
     "ParentEvents",
     "PatchResult",
+    "add_step",
     "add_steps",
     "apply_patch",
     "can_split",
+    "clear_someday",
+    "clear_time",
     "create_items",
     "current_occurrence",
     "current_occurrence_order",
@@ -72,6 +76,7 @@ __all__ = [
     "remove_reminders",
     "replace_items_for_raw",
     "restore_item",
+    "set_details",
     "set_kind",
     "set_lead",
     "set_tags",
@@ -90,6 +95,7 @@ MAX_LEAD_MINUTES: Final = 43200  # 30 days, same cap as the AI schema
 _HHMM_RE: Final = re.compile(r"^\d{2}:\d{2}$")
 _LOCAL_FMT: Final = "%Y-%m-%d %H:%M"
 STEP_KIND: Final = "task"  # every step of a checklist is a task
+MAX_CHECKLIST: Final = 20  # steps of one checklist added by hand (the AI gives at most MAX_STEPS)
 _EVENTS_KEY: Final = "dumpbot.parent_events"  # Session.info key of ParentEvents
 
 
@@ -340,6 +346,39 @@ async def toggle_step(session: AsyncSession, step_id: int, *, done: bool, prefs:
     return step
 
 
+async def add_step(
+    session: AsyncSession, parent_id: int, title: str, prefs: Prefs, now: datetime, *, when: When | None = None
+) -> CreatedItem:
+    """One more step at the end of the checklist (added by hand in the Mini App), with its own time if ``when`` gives
+    one. A done parent opens again: it has an open step now. ValueError: an empty title, a full checklist
+    (``MAX_CHECKLIST``), or an item that cannot have steps (a step itself, a series, deleted)."""
+    now = _utc(now)
+    title = " ".join((title or "").split())
+    if not title:
+        raise ValueError("empty title")
+    lock = select(Item).where(Item.id == parent_id).with_for_update().execution_options(populate_existing=True)
+    parent = await session.scalar(lock)
+    if parent is None:
+        raise NotFoundError(f"item {parent_id} not found")
+    if parent.parent_id is not None or parent.rec_active or parent.status == "deleted":
+        raise ValueError("this item cannot have steps")
+    listed = func.count().filter(Item.status != "deleted")
+    count, last = (
+        await session.execute(select(listed, func.max(Item.position)).where(Item.parent_id == parent.id))
+    ).one()
+    if count >= MAX_CHECKLIST:
+        raise ValueError("the checklist is full")
+    spec = StepSpec(title=title, when=when)
+    [created] = await _create_steps(
+        session, parent, [spec], prefs, now, model=None, prompt_version=None, first=(last or 0) + 1
+    )
+    if parent.status == "done":
+        await _patch_undone(session, parent, prefs, now)
+    _events(session).changed.add(parent.id)
+    _touch(parent)
+    return created
+
+
 async def _create_steps(
     session: AsyncSession,
     parent: Item,
@@ -349,11 +388,12 @@ async def _create_steps(
     *,
     model: str | None,
     prompt_version: str | None,
+    first: int = 1,
 ) -> list[CreatedItem]:
-    """Steps 1..n (at most MAX_STEPS) of ``parent``; only those with a time of their own get an occurrence."""
+    """Steps ``first``.. (at most MAX_STEPS) of ``parent``; only those with a time of their own get an occurrence."""
     named = [(title, spec) for spec in specs if (title := " ".join(spec.title.split()))]
     out: list[CreatedItem] = []
-    for position, (title, spec) in enumerate(named[:MAX_STEPS], start=1):
+    for position, (title, spec) in enumerate(named[:MAX_STEPS], start=first):
         res = _step_resolution(spec, now, prefs)
         item = Item(
             raw_message_id=parent.raw_message_id,
@@ -669,6 +709,14 @@ async def set_title(session: AsyncSession, item_id: int, title: str) -> Item:
     return item
 
 
+async def set_details(session: AsyncSession, item_id: int, details: str | None) -> Item:
+    """Replace the details (blank -> none)."""
+    item = await _get_item(session, item_id)
+    item.details = (details or "").strip() or None
+    _touch(item)
+    return item
+
+
 async def set_tags(session: AsyncSession, item_id: int, tags: list[str]) -> Item:
     """Replace the tags (normalized like the AI's: lower case, no '#', spaces -> '_', unique)."""
     item = await _get_item(session, item_id)
@@ -702,6 +750,38 @@ async def stop_recurrence(session: AsyncSession, item_id: int, now: datetime | N
         if current is not None and occ.id != current.id:
             occ.status = "cancelled"
             await _cancel_pending(session, [occ.id])
+    _touch(item)
+    return item
+
+
+async def clear_someday(session: AsyncSession, item_id: int, prefs: Prefs, now: datetime) -> PatchResult:
+    """No longer "когда-нибудь": an item without a date; an actionable one gets the default reminder, like a task
+    saved without a time."""
+    now = _utc(now)
+    item = await _get_item(session, item_id)
+    if item.someday:
+        item.when_spec = None
+        _set_period(item, None, None, None)
+        if item.kind in ACTIONABLE:
+            await _schedule_default(session, item, prefs, now)
+        _touch(item)
+    return await _patch_result(session, item, [])
+
+
+async def clear_time(session: AsyncSession, item_id: int) -> Item:
+    """No time of its own any more (a step: it then lives in its parent's card only): open occurrences are cancelled
+    with their pending reminders, the time spec and any fuzzy span are dropped."""
+    item = await _get_item(session, item_id)
+    occs = list(
+        (
+            await session.scalars(select(Occurrence).where(Occurrence.item_id == item.id, Occurrence.status == "open"))
+        ).all()
+    )
+    for occ in occs:
+        occ.status = "cancelled"
+    await _cancel_pending(session, [o.id for o in occs])
+    item.when_spec = None
+    _set_period(item, None, None, None)
     _touch(item)
     return item
 

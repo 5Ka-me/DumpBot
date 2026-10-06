@@ -44,6 +44,14 @@ class Settings(BaseSettings):
     local_stt_url: str = ""  # e.g. http://whisper:9000
     local_stt_timeout_s: float = 120.0  # CPU transcription; the first request also loads (or downloads) the model
 
+    # Telegram Mini App (docs/features/iteration-2.md §D): the bot's own web server with /api/* and the built
+    # frontend, published by Tailscale Funnel (compose profile "miniapp"). Off by default.
+    webapp_enabled: bool = False
+    webapp_host: str = "0.0.0.0"
+    webapp_port: int = 8080
+    webapp_url: str = ""  # public HTTPS address for the menu button, e.g. https://dump.<tailnet>.ts.net
+    webapp_static_dir: str = "/app/webapp"  # the frontend build (index.html + assets)
+
     # Seeds for the per-user preferences row
     default_tz: str = "Europe/Warsaw"
     default_budget_usd: float = 5.0

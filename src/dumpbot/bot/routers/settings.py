@@ -165,7 +165,7 @@ async def _change(callback: CallbackQuery, ctx: AppContext, key: str, value: str
             await session.commit()
             await common.answer(callback, INVALID)
             return
-        budget_raised = await _save(session, ctx, prefs, new, now)
+        budget_raised = await save_changes(session, ctx.owner_id, prefs, new, now)
         await session.commit()
     await common.answer(callback, SAVED)
     await common.show(ctx, message_id, _view(ctx, views.SETTINGS_PARENT.get(key, "main"), new))
@@ -196,7 +196,7 @@ async def on_value(message: Message, ctx: AppContext, state: FSMContext) -> None
             await session.commit()
             await _invalid(message, ctx, state, data, spec.kind)
             return
-        budget_raised = await _save(session, ctx, prefs, new, now)
+        budget_raised = await save_changes(session, ctx.owner_id, prefs, new, now)
         await session.commit()
     await state.clear()
     await common.show(ctx, data.get("prompt_id"), _view(ctx, spec.menu, new))
@@ -283,9 +283,9 @@ async def _load_prefs(ctx: AppContext) -> Prefs:
     return prefs
 
 
-async def _save(session: AsyncSession, ctx: AppContext, old: Prefs, new: Prefs, now: datetime) -> bool:
+async def save_changes(session: AsyncSession, owner_id: int, old: Prefs, new: Prefs, now: datetime) -> bool:
     """Save prefs; when the budget went up, make budget-deferred jobs runnable now. True if it went up."""
-    await save_prefs(session, ctx.owner_id, new)
+    await save_prefs(session, owner_id, new)
     if new.budget_usd <= old.budget_usd:
         return False
     count = await jobs.requeue_deferred(session, now)

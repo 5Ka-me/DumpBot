@@ -29,6 +29,13 @@ Data changes are committed before their cards are sent (a lost card never duplic
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
 Everything sent in quiet hours is silent (a deferred message can be processed at night); the final reaction goes on
 every part of an album.
+
+The Mini App (docs/features/iteration-2.md §D): a message from the app (``RawMessage.source == "app"``) goes through
+the same pipeline, but nothing about it is sent to the chat (no cards, reactions, questions, answers): its note, the
+answer to a question and the edited items are kept in ``raw_json[APP_KEY]`` (the question and the candidates under
+the usual keys) for ``GET /api/inbox/{raw_id}``. Jobs "edit_time" and "split" with ``app: true`` in the payload stay
+out of the chat too and return their outcome (``{"ok", "reason", "message", …}``), which the worker keeps in
+``Job.result``. ``ask_question`` answers ``POST /api/ask`` (the "?" path without a saved message).
 Message text, transcripts and OCR are never logged at INFO or above.
 """
 
@@ -62,11 +69,13 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import BudgetState, CreatedItem, PatchResult, Row
 from dumpbot.services import items as items_svc
 from dumpbot.services import query, usage
-from dumpbot.services.ingest import ASK_KEY, CANDIDATES_KEY
+from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY
 from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, try_once
 
 __all__ = [
     "HANDLERS",
+    "QueryAnswer",
+    "ask_question",
     "handle_album",
     "handle_clarify",
     "handle_edit",
@@ -74,6 +83,7 @@ __all__ = [
     "handle_message",
     "handle_split",
     "on_dead",
+    "run_question",
 ]
 
 log = logging.getLogger(__name__)
@@ -220,7 +230,7 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
             await _reply_query(ctx, [raw], content, out.extraction.query, prefs, _image_text(out.extraction))
             return
     except items_svc.NotFoundError:
-        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=raw.message_id, purpose="answer", raw_message_id=raw.id)
+        await _tell(ctx, [raw], ITEM_GONE_TEXT, prefs=prefs, purpose="answer")
         await _mark_done(ctx, [raw], None)
         return
     except AIUnavailable:
@@ -243,21 +253,25 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
             return  # applied concurrently
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
         view = await _patch_view(session, result, prefs)
-        _finish(await _reload(session, [raw]), image_text)
+        fresh = await _reload(session, [raw])
+        _finish(fresh, image_text)
+        _app_update(fresh, edited=[item_id])
         await session.commit()
         events = items_svc.take_parent_events(session)
-    await _send_patch_card(ctx, prefs, view, result, reply_to=raw.message_id, raw_message_id=raw.id)
+    if not _is_app([raw]):
+        await _send_patch_card(ctx, prefs, view, result, reply_to=raw.message_id, raw_message_id=raw.id)
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
-    await sender.react(ctx, raw.message_id, sender.REACT_SAVED)
+    await _react(ctx, [raw], sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
 
 
-async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
-    """Job "edit_time" ``{item_id, text, message_id?, now?}`` from the card's "🕒 Время" button.
+async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Job "edit_time" ``{item_id, text, message_id?, now?, app?}`` from the card's "🕒 Время" button.
 
     ``message_id`` (the user's text message) gets the reply card and reactions; ``now`` (ISO time the text was
     sent) keeps "завтра" right when the job runs late. Both are optional. With ``message_id`` the patch is applied
-    at most once (a once-key is committed together with it).
+    at most once (a once-key is committed together with it). ``app`` (the Mini App): nothing goes to the chat, the
+    outcome is returned for ``Job.result``.
 
     Only the time changes (when / repetition / lead of the model's patch; a title, category or "удали" read into
     the answer is dropped). An answer without a usable time changes nothing: "🤷 Не понял время…" and 🤔.
@@ -265,13 +279,14 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
     item_id = int(payload["item_id"])
     text = str(payload.get("text") or "").strip()
     message_id = _opt_int(payload.get("message_id"))
+    app = bool(payload.get("app"))
     if not text:
-        return
+        return _outcome(False, "empty", TIME_NOT_UNDERSTOOD_TEXT) if app else None
     key = f"edit-time-done:{item_id}:{message_id}" if message_id is not None else None
     if key is not None:
         async with ctx.sessionmaker() as session:
             if await session.get(OnceKey, key) is not None:
-                return
+                return None
     prefs = await _prefs(ctx)
     await _check_budget(ctx, prefs, [], message_id=message_id)
     now = _payload_time(payload.get("now")) or clock.utcnow()
@@ -281,8 +296,8 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
         inp = ExtractInput(text=f"перенеси на: {text}", source="text", now=now, prefs=prefs, reply_item=snapshot)
         out = await _extract(ctx, prefs, inp)
     except items_svc.NotFoundError:
-        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=message_id, purpose="answer")
-        return
+        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=message_id, purpose="answer", app=app)
+        return _outcome(False, "gone", ITEM_GONE_TEXT) if app else None
     except AIUnavailable:
         await _defer(ctx, [], message_id=message_id)
         raise
@@ -290,25 +305,32 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
         await _config_problem(ctx, prefs, e, [], message_id=message_id)
         raise RetryLater(CONFIG_RETRY, "AI config error", count_attempt=False) from e
     except AIBadResponse as e:
-        await _give_up(ctx, prefs, [], FAILED_EDIT_TEXT, e, reply_to=message_id)
-        return
+        await _give_up(ctx, prefs, [], FAILED_EDIT_TEXT, e, reply_to=message_id, app=app)
+        return _outcome(False, "failed", FAILED_EDIT_TEXT) if app else None
 
     patch = _time_patch(out.extraction.edit, now, prefs)
     if patch is None:
-        await _send(ctx, TIME_NOT_UNDERSTOOD_TEXT, prefs=prefs, reply_to=message_id, purpose="answer")
+        await _send(ctx, TIME_NOT_UNDERSTOOD_TEXT, prefs=prefs, reply_to=message_id, purpose="answer", app=app)
         if message_id:
             await sender.react(ctx, message_id, sender.REACT_ASK)
-        return
+        return _outcome(False, "not_understood", TIME_NOT_UNDERSTOOD_TEXT) if app else None
     async with ctx.sessionmaker() as session:
         if key is not None and not await try_once(session, key):
-            return  # applied by an earlier run of this job
+            return None  # applied by an earlier run of this job
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
         view = await _patch_view(session, result, prefs)
         await session.commit()
-    await _send_patch_card(ctx, prefs, view, result, reply_to=message_id)
+    if not app:
+        await _send_patch_card(ctx, prefs, view, result, reply_to=message_id)
     if message_id:
         await sender.react(ctx, message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
+    return _outcome(True, item_id=item_id, warnings=list(result.warnings)) if app else None
+
+
+def _outcome(ok: bool, reason: str | None = None, message: str | None = None, **extra: Any) -> dict[str, Any]:
+    """``Job.result`` of a job started from the Mini App: ``{"ok", "reason", "message", …}`` (message in Russian)."""
+    return {"ok": ok, "reason": reason, "message": message, **extra}
 
 
 def _time_patch(edit: EditPatch | None, now: datetime, prefs: Prefs) -> EditPatch | None:
@@ -327,13 +349,16 @@ def _usable_when(when: When, now: datetime, prefs: Prefs) -> bool:
     return due is not None or precision == "someday"
 
 
-async def handle_split(ctx: AppContext, payload: dict[str, Any]) -> None:
-    """Job "split" ``{item_id, message_id?, now?}`` from the card's [🪄 Разбить на шаги]: the AI breaks the task into
-    steps and the card (``message_id``) turns into the checklist."""
+async def handle_split(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Job "split" ``{item_id, message_id?, now?, app?}`` from the card's [🪄 Разбить на шаги]: the AI breaks the task
+    into steps and the card (``message_id``) turns into the checklist. ``app`` (the Mini App): nothing goes to the
+    chat, the outcome is returned for ``Job.result``."""
     prefs = await _prefs(ctx)
     now = _payload_time(payload.get("now")) or clock.utcnow()
     card = _opt_int(payload.get("message_id"))
-    await _split(ctx, prefs, int(payload["item_id"]), now=now, note=None, card_message=card)
+    app = bool(payload.get("app"))
+    outcome = await _split(ctx, prefs, int(payload["item_id"]), now=now, note=None, card_message=card, app=app)
+    return outcome if app else None
 
 
 async def _split(
@@ -347,48 +372,73 @@ async def _split(
     raws: Sequence[RawMessage] = (),
     once_key: str | None = None,
     image_text: str | None = None,
-) -> None:
+    app: bool = False,
+) -> dict[str, Any]:
     """Break the item into steps (the "split" call, ``note`` = the owner's words) and show its checklist: the card
     ``card_message`` is redrawn in place (the button), or a new card replies to the owner's message (``raws``, done
     afterwards; ``once_key`` is committed with the steps). Nothing to split (closed, a series, a step, has steps,
-    the model found no steps) -> a short note with the card."""
+    the model found no steps) -> a short note with the card. For the Mini App (``app``, or ``raws`` from the app)
+    nothing is shown in the chat. Returns the outcome (``_outcome``)."""
     raws = list(raws)
+    app = app or _is_app(raws)
     reply_to = raws[0].message_id if raws else card_message
+    raw_id = raws[0].id if raws else None
     async with ctx.sessionmaker() as session:
         item = await items_svc.get_item(session, item_id)
         problem = await _split_problem(session, item)
         snapshot = await items_svc.item_snapshot(session, item_id, prefs, now) if problem is None else None
     if item is None or item.status == "deleted":
-        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=reply_to, purpose="answer")
-        await _mark_done(ctx, raws, image_text)
-        return
+        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=reply_to, purpose="answer", app=app)
+        await _mark_done(ctx, raws, image_text, note=ITEM_GONE_TEXT)
+        return _outcome(False, "gone", ITEM_GONE_TEXT)
     if problem is not None or snapshot is None:
-        await _mark_done(ctx, raws, image_text)
-        await _show_split(ctx, prefs, item_id, problem, reply_to=reply_to, raw_id=raws[0].id if raws else None)
+        await _mark_done(ctx, raws, image_text, note=problem, edited=[item_id])
+        if not app:
+            await _show_split(ctx, prefs, item_id, problem, reply_to=reply_to, raw_id=raw_id)
         await _react(ctx, raws, sender.REACT_SAVED)
-        return
+        return _outcome(False, "has_steps" if problem == HAS_STEPS_TEXT else "cant_split", problem)
     task = {k: v for k, v in snapshot.items() if k in SPLIT_TASK_FIELDS and v not in (None, "", [])}
-    out = await _split_call(ctx, prefs, SplitInput(task=task, now=now, prefs=prefs, note=note), raws, card_message)
+    inp = SplitInput(task=task, now=now, prefs=prefs, note=note)
+    out = await _split_call(ctx, prefs, inp, raws, card_message, app=app)
     if out is None:
-        return
+        return _outcome(False, "failed", FAILED_SPLIT_TEXT)
     async with ctx.sessionmaker() as session:
         if once_key is not None and not await try_once(session, once_key):
-            return  # applied by an earlier run of this job
+            return _outcome(True, steps=0)  # applied by an earlier run of this job
         created = await items_svc.add_steps(
             session, item_id, out.steps, prefs, now, model=out.model, prompt_version=out.prompt_version
         )
-        _finish(await _reload(session, raws), image_text)
+        why = None if created else NO_STEPS_TEXT if not out.steps else HAS_STEPS_TEXT  # or split / closed meanwhile
+        fresh = await _reload(session, raws)
+        _finish(fresh, image_text)
+        _app_update(fresh, note=why, edited=[item_id])
         await session.commit()
-    raw_id = raws[0].id if raws else None
-    if not created:
-        why = NO_STEPS_TEXT if not out.steps else HAS_STEPS_TEXT  # or it was split / closed meanwhile
-        await _show_split(ctx, prefs, item_id, why, reply_to=reply_to, raw_id=raw_id)
-    elif card_message is not None and not raws:
-        await _redraw_card(ctx, prefs, item_id, card_message)
-    else:
-        await _show_split(ctx, prefs, item_id, None, reply_to=reply_to, raw_id=raw_id)
+    if not app:
+        await _present_split(ctx, prefs, item_id, why, created=bool(created), card_message=card_message, raws=raws)
     await _react(ctx, raws, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()  # steps with a time have reminders
+    if not created:
+        return _outcome(False, "no_steps" if not out.steps else "has_steps", why)
+    return _outcome(True, steps=len(created))
+
+
+async def _present_split(
+    ctx: AppContext,
+    prefs: Prefs,
+    item_id: int,
+    why: str | None,
+    *,
+    created: bool,
+    card_message: int | None,
+    raws: Sequence[RawMessage],
+) -> None:
+    """The checklist in the chat: the button's card redrawn in place, else a new card (``why`` above it)."""
+    reply_to = raws[0].message_id if raws else card_message
+    raw_id = raws[0].id if raws else None
+    if created and card_message is not None and not raws:
+        await _redraw_card(ctx, prefs, item_id, card_message)
+    else:
+        await _show_split(ctx, prefs, item_id, why, reply_to=reply_to, raw_id=raw_id)
 
 
 async def _split_problem(session: AsyncSession, item: Any) -> str | None:
@@ -401,7 +451,13 @@ async def _split_problem(session: AsyncSession, item: Any) -> str | None:
 
 
 async def _split_call(
-    ctx: AppContext, prefs: Prefs, inp: SplitInput, raws: list[RawMessage], card_message: int | None
+    ctx: AppContext,
+    prefs: Prefs,
+    inp: SplitInput,
+    raws: list[RawMessage],
+    card_message: int | None,
+    *,
+    app: bool = False,
 ) -> SplitOutput | None:
     """``split_steps`` behind the budget check, with the processor's error handling; None when it gave up."""
     reply_to = raws[0].message_id if raws else card_message
@@ -425,7 +481,7 @@ async def _split_call(
             await _give_up(ctx, prefs, raws, FAILED_SPLIT_TEXT, e, reply_to=reply_to)
         else:  # the button: its message is the bot's own card, so no 😢 reaction
             log.warning("split: no usable AI result (%s)", describe_error(e))
-            await _send(ctx, FAILED_SPLIT_TEXT, prefs=prefs, reply_to=card_message, purpose="notice")
+            await _send(ctx, FAILED_SPLIT_TEXT, prefs=prefs, reply_to=card_message, purpose="notice", app=app)
         return None
 
 
@@ -482,12 +538,16 @@ async def on_dead(ctx: AppContext, job: Job) -> None:
     """A job gave up: mark its raw message failed, tell the owner, react 😢 on the source message."""
     try:
         raw = await _fail_raws(ctx, job)
+        if (job.payload or {}).get("app"):  # the Mini App shows the dead job itself (GET /api/jobs/{id})
+            return
         text = FAILED_EDIT_TEXT if job.kind in ("edit", "edit_time") else FAILED_MESSAGE_TEXT
         if job.kind == "split":
             text = FAILED_SPLIT_TEXT
         elif job.kind not in HANDLERS:
             text = f"😢 Не смог выполнить фоновую задачу «{views.esc(job.kind)}»."
         reply_to = raw.message_id if raw is not None else _opt_int((job.payload or {}).get("message_id"))
+        if raw is not None and _is_app([raw]):  # no chat message to reply to or react on: a plain notice
+            reply_to = None
         prefs = await _prefs(ctx)
         await _send(ctx, text, prefs=prefs, reply_to=reply_to, purpose="notice", raw_message_id=raw.id if raw else None)
         if reply_to and job.kind != "split":  # a split job's message is the bot's own card
@@ -634,14 +694,17 @@ async def _save(
             created = await items_svc.replace_items_for_raw(session, head.id, raw=head, **kwargs)
         else:
             created = await items_svc.create_items(session, raw=head, **kwargs)
-        shown = [] if ask is not None else await _cards(session, created, prefs, now_view, every=note is not None)
+        quiet_chat = ask is not None or _is_app(fresh)  # the Mini App reads the items, no cards
+        shown = [] if quiet_chat else await _cards(session, created, prefs, now_view, every=note is not None)
         if ask is not None:
             head.raw_json = {**(head.raw_json or {}), ASK_KEY: ask.model_dump(mode="json")}
         _finish(fresh, image_text)
+        _app_update(fresh, note=note)
         await session.commit()
 
     if ask is not None:
-        await _send_ask(ctx, prefs, raws, ask)
+        if not _is_app(raws):  # the app shows the question from raw_json and answers it with POST …/answer
+            await _send_ask(ctx, prefs, raws, ask)
         return
     for created_item, (text, markup) in shown:
         occ = created_item.occurrence
@@ -692,25 +755,18 @@ async def _reply_query(
     image_text: str | None,
 ) -> None:
     """Rows for the QuerySpec as a list, or a short prose answer (the list when no answer comes). Sent before the raw
-    is marked done."""
+    is marked done; for a message from the Mini App kept with it instead (``APP_KEY`` "answer")."""
     primary = raws[0]
-    now = _msg_now(primary)
-    async with ctx.sessionmaker() as session:
-        rows = await query.run_query(session, spec, prefs, now)
+    found = await run_question(ctx, content.text.strip() or spec.text or "", spec, prefs, _msg_now(primary))
+    if _is_app(raws):
+        answer = {"text": found.text, "item_ids": [r.item_id for r in found.rows], "title": found.title}
+        await _mark_done(ctx, raws, image_text, answer=answer)
+        return
     markup: InlineKeyboardMarkup | None = None
-    text: str | None = None
-    if spec.answer == "summary":
-        question = content.text.strip() or spec.text or ""
-        try:
-            answer = await answer_query(ctx.ai, ctx.settings, question, query.rows_for_llm(rows, prefs), now, prefs)
-        except (AIUnavailable, AIBadResponse) as e:
-            # The rows are found already: the list beats a retry that would pay for the extraction again.
-            log.warning("message %s: no prose answer (%s), sending the list", primary.message_id, describe_error(e))
-        else:
-            text = views.fit(views.esc(answer))
-    if text is None:
-        title = f"🔎 По запросу «{spec.text}»" if spec.text else "🔎 Вот что нашёл"
-        text, markup = views.rows_list(title, rows, prefs, clock.utcnow(), empty=NOTHING_FOUND)
+    if found.text is not None:
+        text = views.fit(views.esc(found.text))
+    else:
+        text, markup = views.rows_list(found.title, found.rows, prefs, clock.utcnow(), empty=NOTHING_FOUND)
     await sender.send(
         ctx,
         text,
@@ -722,6 +778,43 @@ async def _reply_query(
     )
     await _mark_done(ctx, raws, image_text)
     await _react(ctx, raws, sender.REACT_SAVED)
+
+
+@dataclass
+class QueryAnswer:
+    """What a question found: the rows, the prose answer (plain text, None -> show the rows) and a list title."""
+
+    rows: list[Row]
+    text: str | None
+    title: str
+    spec: QuerySpec
+
+
+async def run_question(ctx: AppContext, question: str, spec: QuerySpec, prefs: Prefs, now: datetime) -> QueryAnswer:
+    """Rows of the QuerySpec and, when the model asked for a summary, a short prose answer. ``AIUnavailable`` /
+    ``AIBadResponse`` of the answer only leave it out: the rows are found already, and the list beats a retry that
+    would pay for the extraction again."""
+    async with ctx.sessionmaker() as session:
+        rows = await query.run_query(session, spec, prefs, now)
+    text: str | None = None
+    if spec.answer == "summary":
+        try:
+            text = await answer_query(ctx.ai, ctx.settings, question, query.rows_for_llm(rows, prefs), now, prefs)
+        except (AIUnavailable, AIBadResponse) as e:
+            log.warning("no prose answer (%s), showing the list", describe_error(e))
+    title = f"🔎 По запросу «{spec.text}»" if spec.text else "🔎 Вот что нашёл"
+    return QueryAnswer(rows=rows, text=text, title=title, spec=spec)
+
+
+async def ask_question(ctx: AppContext, question: str, prefs: Prefs, now: datetime) -> QueryAnswer:
+    """A question from the Mini App (``POST /api/ask``): the "?" path without a saved message — the budget check
+    (``RetryLater`` when it is exhausted), ``extract()`` forced into a query, then ``run_question``. AI errors of the
+    extraction propagate (``AIUnavailable``, ``AIConfigError``, ``AIBadResponse``)."""
+    await _check_budget(ctx, prefs, [])
+    inp = ExtractInput(text=question, source="text", now=now, prefs=prefs, force_query=True)
+    out = await _extract(ctx, prefs, inp)
+    spec = out.extraction.query or QuerySpec(text=question[:120])
+    return await run_question(ctx, question, spec, prefs, now)
 
 
 async def _edit_by_target(
@@ -761,10 +854,13 @@ async def _edit_by_target(
     async with ctx.sessionmaker() as session:
         result = await items_svc.apply_patch(session, rows[0].item_id, patch, prefs, now)
         view = await _patch_view(session, result, prefs)
-        _finish(await _reload(session, raws), image_text)
+        fresh = await _reload(session, raws)
+        _finish(fresh, image_text)
+        _app_update(fresh, edited=[rows[0].item_id])
         await session.commit()
         events = items_svc.take_parent_events(session)
-    await _send_patch_card(ctx, prefs, view, result, reply_to=primary.message_id, raw_message_id=primary.id)
+    if not _is_app(raws):
+        await _send_patch_card(ctx, prefs, view, result, reply_to=primary.message_id, raw_message_id=primary.id)
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, raws, sender.REACT_SAVED)
 
@@ -780,6 +876,9 @@ async def _send_candidates(
         [head] = await _reload(session, [primary])
         head.raw_json = {**(head.raw_json or {}), CANDIDATES_KEY: [r.item_id for r in rows]}
         await session.commit()
+    if _is_app(raws):  # the app lists them from raw_json and picks with POST /api/inbox/{raw_id}/pick
+        await _mark_done(ctx, raws, image_text)
+        return
     text, markup = views.edit_candidates(rows, primary.id, prefs, clock.utcnow())
     await sender.send(
         ctx,
@@ -838,15 +937,16 @@ async def _save_unparsed(
     and the owner is told (😢)."""
     primary = raws[0]
     log.warning("message %s: no usable AI result (%s), saved without AI", primary.message_id, describe_error(error))
-    await _store_without_ai(ctx, raws, prefs, content)
-    await _send(
-        ctx, FAILED_MESSAGE_TEXT, prefs=prefs, reply_to=primary.message_id, purpose="notice", raw_message_id=primary.id
-    )
+    await _store_without_ai(ctx, raws, prefs, content, note=FAILED_MESSAGE_TEXT)
+    await _tell(ctx, raws, FAILED_MESSAGE_TEXT, prefs=prefs, purpose="notice")
     await _react(ctx, raws, sender.REACT_FAILED)
 
 
-async def _store_without_ai(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, content: _Content) -> None:
-    """One item and raws ``done``: a note with the text of ``content``, or an "other" item titled by type."""
+async def _store_without_ai(
+    ctx: AppContext, raws: list[RawMessage], prefs: Prefs, content: _Content, *, note: str | None = None
+) -> None:
+    """One item and raws ``done``: a note with the text of ``content``, or an "other" item titled by type
+    (``note``: what a message from the Mini App is told)."""
     text = content.text.strip()
     if text:
         extraction = _fallback_note(text, None)
@@ -873,6 +973,7 @@ async def _store_without_ai(ctx: AppContext, raws: list[RawMessage], prefs: Pref
             prompt_version=None,
         )
         _finish(fresh, None)
+        _app_update(fresh, note=note)
         await session.commit()
 
 
@@ -1219,21 +1320,38 @@ async def _config_problem(
 
 
 async def _give_up(
-    ctx: AppContext, prefs: Prefs, raws: list[RawMessage], text: str, error: AIBadResponse, *, reply_to: int | None
+    ctx: AppContext,
+    prefs: Prefs,
+    raws: list[RawMessage],
+    text: str,
+    error: AIBadResponse,
+    *,
+    reply_to: int | None,
+    app: bool = False,
 ) -> None:
     """``AIBadResponse``: the same request would give the same result, so the job ends now (no retries) like
-    ``on_dead`` would end it: unfinished raws -> failed, ``text`` to the owner, 😢."""
+    ``on_dead`` would end it: unfinished raws -> failed, ``text`` to the owner (kept with a message from the Mini
+    App, ``app``: not sent), 😢."""
     reason = describe_error(error)
     log.warning("AI result unusable, giving up without retries: %s", reason)
+    app = app or _is_app(raws)
     if raws:
         async with ctx.sessionmaker() as session:
-            for raw in await _reload(session, raws):
+            fresh = await _reload(session, raws)
+            for raw in fresh:
                 if raw.status not in _FINISHED:
                     raw.status = "failed"
                     raw.error = reason[:500]
+            _app_update(fresh, note=text)
             await session.commit()
     await _send(
-        ctx, text, prefs=prefs, reply_to=reply_to, purpose="notice", raw_message_id=raws[0].id if raws else None
+        ctx,
+        text,
+        prefs=prefs,
+        reply_to=reply_to,
+        purpose="notice",
+        raw_message_id=raws[0].id if raws else None,
+        app=app,
     )
     if raws:
         await _react(ctx, raws, sender.REACT_FAILED)
@@ -1278,10 +1396,42 @@ def _finish(raws: Sequence[RawMessage], image_text: str | None) -> None:
         raws[0].image_text = image_text
 
 
-async def _mark_done(ctx: AppContext, raws: list[RawMessage], image_text: str | None) -> None:
+async def _mark_done(ctx: AppContext, raws: list[RawMessage], image_text: str | None, **app: Any) -> None:
+    """Raws done; ``app`` fields go to ``raw_json[APP_KEY]`` of a message from the Mini App."""
+    if not raws:
+        return
     async with ctx.sessionmaker() as session:
-        _finish(await _reload(session, raws), image_text)
+        fresh = await _reload(session, raws)
+        _finish(fresh, image_text)
+        _app_update(fresh, **app)
         await session.commit()
+
+
+def _is_app(raws: Sequence[RawMessage]) -> bool:
+    """A message sent from the Mini App ("закинуть в свалку"): nothing about it goes to the chat."""
+    return bool(raws) and raws[0].source == APP_SOURCE
+
+
+def _app_update(raws: Sequence[RawMessage], **fields: Any) -> None:
+    """Keep what the owner would have been told in the chat with a message from the Mini App
+    (``raw_json[APP_KEY]``: ``note``, ``answer``, ``edited``); no-op for Telegram messages and without fields."""
+    if not fields or not _is_app(raws):
+        return
+    head = raws[0]
+    data = dict(head.raw_json or {})
+    data[APP_KEY] = {**(data.get(APP_KEY) or {}), **fields}
+    head.raw_json = data
+
+
+async def _tell(ctx: AppContext, raws: list[RawMessage], text: str, *, prefs: Prefs, purpose: str) -> None:
+    """A short reply to the message; for a message from the Mini App it is kept as its note instead."""
+    if _is_app(raws):
+        async with ctx.sessionmaker() as session:
+            _app_update(await _reload(session, raws), note=text)
+            await session.commit()
+        return
+    primary = raws[0]
+    await _send(ctx, text, prefs=prefs, reply_to=primary.message_id, purpose=purpose, raw_message_id=primary.id)
 
 
 async def _fail_raws(ctx: AppContext, job: Job) -> RawMessage | None:
@@ -1304,10 +1454,18 @@ async def _fail_raws(ctx: AppContext, job: Job) -> RawMessage | None:
 
 
 async def _send(
-    ctx: AppContext, text: str, markup: InlineKeyboardMarkup | None = None, *, prefs: Prefs, **kwargs: Any
+    ctx: AppContext,
+    text: str,
+    markup: InlineKeyboardMarkup | None = None,
+    *,
+    prefs: Prefs,
+    app: bool = False,
+    **kwargs: Any,
 ) -> int | None:
     """Best-effort send for messages that follow committed data: a failure is logged, not retried. Silent in quiet
-    hours (``_quiet``)."""
+    hours (``_quiet``). Nothing is sent for the Mini App (``app``): it reads the outcome from the job / raw message."""
+    if app:
+        return None
     try:
         return await sender.send(ctx, text, markup, silent=_quiet(prefs), **kwargs)
     except Exception as e:
@@ -1322,9 +1480,11 @@ def _quiet(prefs: Prefs) -> bool:
 
 
 async def _react(ctx: AppContext, raws: Sequence[RawMessage], emoji: str) -> None:
-    """The final reaction on every part of the message (the capture router put 👀 on each album part)."""
+    """The final reaction on every part of the message (the capture router put 👀 on each album part); none on a
+    message from the Mini App (it is not in the chat)."""
     for raw in raws:
-        await sender.react(ctx, raw.message_id, emoji)
+        if raw.source != APP_SOURCE:
+            await sender.react(ctx, raw.message_id, emoji)
 
 
 def _clarified_key(raw_id: int) -> str:

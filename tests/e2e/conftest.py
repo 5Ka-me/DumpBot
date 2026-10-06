@@ -4,7 +4,9 @@ The app is built exactly like ``python -m dumpbot`` builds it (``bot.app.build_a
 polling, OwnerOnly, routers, capture, the job worker, processor, the chutes client, STT, sender and views. Only the
 endpoints differ: ``AiohttpSession(api=TelegramAPIServer.from_base(<fake>))`` for Telegram and ``chutes_base_url`` /
 ``stt_url`` pointing at the fake chutes server, which also plays the local Whisper service (``/local/transcribe``;
-``LOCAL_STT_URL`` is set only when a test module overrides the ``local_whisper`` fixture). Nothing leaves 127.0.0.1.
+``LOCAL_STT_URL`` is set only when a test module overrides the ``local_whisper`` fixture). A test module that
+overrides the ``miniapp`` fixture also gets the Mini App's web server (``WEBAPP_ENABLED``, a free port on 127.0.0.1;
+``E2E.api`` calls it with initData signed like Telegram does). Nothing leaves 127.0.0.1.
 
 Time is frozen (``dumpbot.clock.utcnow`` is monkeypatched). The job worker runs in the background for real; the
 scheduler loop is not started — tests call ``Scheduler.tick(now)`` directly, so reminders and digests fire exactly
@@ -28,8 +30,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import pytest
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
@@ -45,6 +49,7 @@ from dumpbot.bot.app import App, build_app, default_runners
 from dumpbot.config import Settings
 from dumpbot.context import AppContext
 from dumpbot.db.models import Item, Job, Occurrence, RawMessage, Reminder
+from dumpbot.web import auth as web_auth
 from dumpbot.workers.scheduler import Scheduler
 
 WARSAW = ZoneInfo("Europe/Warsaw")
@@ -52,6 +57,7 @@ OWNER = 4242
 STRANGER = 777
 BOT_ID = 123456
 TOKEN = f"{BOT_ID}:TEST-e2e-token"
+MINIAPP_URL = "https://dump.tail1234.ts.net"
 PRIMARY = "google/gemma-4-31B-turbo-TEE"
 FALLBACK = "Qwen/Qwen3-32B-TEE"
 VISION_FALLBACK = "Qwen/Qwen3.6-27B-TEE"
@@ -378,6 +384,9 @@ class FakeTelegram:
     def _m_setMyCommands(self, params: dict[str, Any]) -> Any:
         return True
 
+    def _m_setChatMenuButton(self, params: dict[str, Any]) -> Any:
+        return True
+
     def _m_deleteWebhook(self, params: dict[str, Any]) -> Any:
         return True
 
@@ -630,6 +639,33 @@ class E2E:
     stranger: int = STRANGER
 
     @property
+    def web_url(self) -> str:
+        """Base URL of the Mini App's web server (only with the ``miniapp`` fixture on)."""
+        server = self.app.lifecycle.web
+        assert server is not None and server.bound_port, "the Mini App's web server is not running"
+        return f"http://127.0.0.1:{server.bound_port}"
+
+    def init_data(self, user_id: int = OWNER) -> str:
+        """initData of the Mini App as Telegram signs it for this bot."""
+        fields = {
+            "query_id": "AAH0dGVzdA",
+            "user": json.dumps({"id": user_id, "first_name": "Дима"}, ensure_ascii=False),
+            "auth_date": str(int(self.clock().timestamp())),
+        }
+        return urlencode({**fields, "hash": web_auth.sign(fields, TOKEN)})
+
+    async def api(self, method: str, path: str, body: Any = None) -> tuple[int, Any]:
+        """A request to the Mini App's API as the owner: (status, JSON or bytes)."""
+        headers = {"Authorization": f"tma {self.init_data()}"}
+        async with (
+            aiohttp.ClientSession() as http,
+            http.request(method, f"{self.web_url}{path}", json=body, headers=headers) as response,
+        ):
+            if response.content_type == "application/json":
+                return response.status, await response.json()
+            return response.status, await response.read()
+
+    @property
     def ctx(self) -> AppContext:
         return self.app.ctx
 
@@ -714,7 +750,18 @@ def frozen(monkeypatch: pytest.MonkeyPatch) -> FrozenClock:
     return fc
 
 
-def make_settings(db_url: str, tg_url: str, ai_url: str, heartbeat: Path, *, local_whisper: bool = False) -> Settings:
+def make_settings(
+    db_url: str, tg_url: str, ai_url: str, heartbeat: Path, *, local_whisper: bool = False, webapp: Path | None = None
+) -> Settings:
+    miniapp: dict[str, Any] = {}
+    if webapp is not None:
+        miniapp = {
+            "webapp_enabled": True,
+            "webapp_host": "127.0.0.1",
+            "webapp_port": 0,  # a free port
+            "webapp_url": MINIAPP_URL,
+            "webapp_static_dir": str(webapp),
+        }
     return Settings(
         _env_file=None,  # type: ignore[call-arg]
         bot_token=TOKEN,
@@ -730,6 +777,7 @@ def make_settings(db_url: str, tg_url: str, ai_url: str, heartbeat: Path, *, loc
         default_tz="Europe/Warsaw",
         heartbeat_file=str(heartbeat),
         scheduler_interval_s=30.0,
+        **miniapp,
     )
 
 
@@ -740,8 +788,14 @@ def local_whisper() -> bool:
 
 
 @pytest.fixture
+def miniapp() -> bool:
+    """Whether the Mini App's web server runs; a test module overrides this fixture to turn it on."""
+    return False
+
+
+@pytest.fixture
 async def e2e(
-    engine: AsyncEngine, db_url: str, frozen: FrozenClock, tmp_path: Path, local_whisper: bool
+    engine: AsyncEngine, db_url: str, frozen: FrozenClock, tmp_path: Path, local_whisper: bool, miniapp: bool
 ) -> AsyncIterator[E2E]:
     """Fake servers up, the app polling them; on teardown polling stops and the app shuts down cleanly.
 
@@ -755,7 +809,12 @@ async def e2e(
     tg_url = str(tg_server.make_url("")).rstrip("/")
     ai_url = str(ai_server.make_url("")).rstrip("/")
 
-    settings = make_settings(db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper)
+    webapp: Path | None = None
+    if miniapp:
+        webapp = tmp_path / "webapp"
+        webapp.mkdir()
+        (webapp / "index.html").write_text("<!doctype html><title>Свалка</title>", encoding="utf-8")
+    settings = make_settings(db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper, webapp=webapp)
     exits: list[int] = []
     bot_session = AiohttpSession(api=TelegramAPIServer.from_base(tg_url))
     app = await build_app(settings, bot_session=bot_session, runners=worker_only, exit_func=exits.append)
@@ -765,6 +824,8 @@ async def e2e(
         await wait_until(lambda: tg.of("setMyCommands") or polling.done(), "startup")
         assert not polling.done(), "polling stopped during startup"
         await wait_until(lambda: "jobs" in app.lifecycle.tasks, "background job worker")
+        if miniapp:
+            await wait_until(lambda: app.lifecycle.web is not None, "the Mini App's web server")
         yield env
     finally:
         try:

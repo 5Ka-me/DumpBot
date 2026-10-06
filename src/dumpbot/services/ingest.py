@@ -2,11 +2,16 @@
 
 Saving is fast and AI-free: the capture router stores the message, reacts 👀 and enqueues a job; the job worker
 does the rest. Only Telegram metadata is stored for files (``file_id`` etc.), never the bytes.
+
+"Закинуть в свалку" from the Mini App (docs/features/iteration-2.md §D) is saved the same way by ``save_app_text``:
+``source="app"``, a synthetic negative message id; the processor then keeps its replies with the raw message
+(``APP_KEY``) instead of sending them to the chat.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
 
@@ -28,6 +33,8 @@ from dumpbot.workers import jobs
 
 __all__ = [
     "ALBUM_DELAY",
+    "APP_KEY",
+    "APP_SOURCE",
     "ASK_KEY",
     "CANDIDATES_KEY",
     "enqueue_processing",
@@ -36,7 +43,9 @@ __all__ = [
     "message_to_raw_fields",
     "normalize_origin",
     "picked_item",
+    "save_app_text",
     "save_incoming",
+    "text_urls",
     "was_asked",
 ]
 
@@ -47,6 +56,10 @@ ALBUM_DELAY: Final = timedelta(seconds=2)
 # RawMessage.raw_json keys written by the processor and read when the owner answers by replying with text:
 ASK_KEY: Final = "_ask"  # the clarifying question asked about the message (AskCb only carries the option index)
 CANDIDATES_KEY: Final = "_candidates"  # item ids of the "Какую запись изменить?" list, in list order
+APP_KEY: Final = "_app"  # a message from the Mini App: what the owner was told about it ({note, answer, edited})
+APP_SOURCE: Final = "app"  # RawMessage.source of "закинуть в свалку" from the Mini App ("telegram" otherwise)
+_TEXT_URL_RE: Final = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"'«»]+")
+_URL_TAIL: Final = ".,;:!?)]}…"
 _FILE_FIELDS: Final = (
     "file_id",
     "file_unique_id",
@@ -180,6 +193,17 @@ def _normalize_url(url: str) -> str | None:
     return url
 
 
+def text_urls(text: str) -> list[str]:
+    """URLs typed in plain text (a message from the Mini App has no Telegram entities): ``http(s)://…`` and
+    ``www.…``, trailing punctuation dropped, in order, unique."""
+    out: list[str] = []
+    for match in _TEXT_URL_RE.finditer(text or ""):
+        url = _normalize_url(match.group(0).rstrip(_URL_TAIL))
+        if url and url not in out:
+            out.append(url)
+    return out
+
+
 # --- forward origin ---------------------------------------------------------------------------------------------
 
 
@@ -266,6 +290,30 @@ async def save_incoming(
         raise RuntimeError(f"message {fields['message_id']} neither inserted nor found")
     log.info("message %s already saved", existing.message_id)
     return existing, False
+
+
+async def save_app_text(session: AsyncSession, chat_id: int, text: str, now: datetime) -> RawMessage:
+    """Text sent from the Mini App as a raw message (``source="app"``, status new). Its message id is the negative
+    of its own id, so it can never clash with a Telegram message; "?" at the start makes it a question, like in the
+    chat. Does not commit."""
+    raw_id = int(await session.scalar(select(func.nextval(func.pg_get_serial_sequence("raw_messages", "id")))))
+    raw = RawMessage(
+        id=raw_id,
+        chat_id=chat_id,
+        message_id=-raw_id,
+        content_type="text",
+        text=text,
+        urls=text_urls(text),
+        force_query=text.lstrip().startswith("?"),
+        tg_date=_aware(now),
+        status="new",
+        raw_json={},
+        source=APP_SOURCE,
+    )
+    session.add(raw)
+    await session.flush()
+    log.info("saved app message %s", raw.id)
+    return raw
 
 
 async def message_raw_ids(session: AsyncSession, chat_id: int, message_id: int) -> list[int]:
