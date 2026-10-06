@@ -8,7 +8,10 @@ Rules:
   so ``fit`` can drop whole lines to stay within Telegram's 4096-character limit (counted in UTF-16 units);
 - dates are rendered in Russian by ``domain.fmt`` relative to the ``now`` argument (never the wall clock);
 - fuzzy time (docs/features/iteration-2.md §A) has its own time lines: "🗓 на этой неделе (до вс 11 окт) · напомню
-  пт в 19:00", "⏳ до пт 9 окт · напомню чт в 19:00 и пт в 10:00", "🌙 когда-нибудь".
+  пт в 19:00", "⏳ до пт 9 окт · напомню чт в 19:00 и пт в 10:00", "🌙 когда-нибудь";
+- checklists and related items (§C): a parent's card lists its steps "☐ 1. Упаковать вещи" with a [☐ 1] / [☑ 1]
+  toggle each; a step's card and reminder name the parent; list rows read "📌 Заказать машину (из «Переезд»)" and
+  "📌 Переезд (2/5)"; "🔗 похоже на: «Купить наушники Sony» (12 сен)" with a [🔗 Похожее] button.
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / lead / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -80,7 +83,7 @@ from dumpbot.domain.recurrence import describe_rrule_ru
 if TYPE_CHECKING:
     from dumpbot.ai.schemas import Ask
     from dumpbot.db.models import Item, Occurrence, Reminder
-    from dumpbot.dto import DigestData, Row, UsageSummary
+    from dumpbot.dto import CardExtras, DigestData, RelatedRef, Row, Step, UsageSummary
 
 View = tuple[str, InlineKeyboardMarkup | None]
 MenuView = tuple[str, InlineKeyboardMarkup]
@@ -97,6 +100,11 @@ URL_LABEL_MAX: Final = 40
 HREF_MAX: Final = 1000
 QUESTION_MAX: Final = 300
 CANDIDATES_MAX: Final = 5
+STEP_TITLE_MAX: Final = 80
+PARENT_TITLE_MAX: Final = 60
+RELATED_SHOWN: Final = 2  # titles named on the card's "🔗 похоже на" line
+RELATED_SENT: Final = 3  # cards sent by [🔗 Похожее]
+SPLIT_KINDS: Final[frozenset[str]] = frozenset({"task"})  # cards with [🪄 Разбить на шаги]
 # Room kept free for lines that follow a long list (section headers, counters).
 _TAIL_RESERVE: Final = 300
 
@@ -486,6 +494,62 @@ def _warning_lines(item: Item, warnings: Sequence[str]) -> list[str]:
     return [f"⚠️ {esc(w)}" for w in seen[:WARNINGS_SHOWN]]
 
 
+def _parent_line(parent_title: str | None) -> str | None:
+    return f"↳ шаг из «{q(parent_title, PARENT_TITLE_MAX)}»" if parent_title else None
+
+
+def _step_when(step: Step, prefs: Prefs, now: datetime) -> str | None:
+    """Time of a checklist step: "чт 8 окт 15:00", or the date alone when it has no time of day."""
+    if step.due_at is None:
+        return None
+    tz = prefs.zone
+    if step.precision in ("date", "fallback", "period", "soon"):
+        return fmt_date(_local(step.due_at, tz).date(), today=_local(now, tz).date())
+    return fmt_dt(step.due_at, tz, now=now)
+
+
+def checklist_lines(steps: Sequence[Step], prefs: Prefs, now: datetime) -> list[str]:
+    """ "📋 Шаги: 1/3", then "☑ 1. Упаковать вещи", "☐ 2. Заказать машину · чт 8 окт 15:00"…"""
+    if not steps:
+        return []
+    lines = [f"📋 Шаги: {sum(s.done for s in steps)}/{len(steps)}"]
+    for step in steps:
+        when = _step_when(step, prefs, now)
+        line = f"{'☑' if step.done else '☐'} {step.position}. {q(step.title, STEP_TITLE_MAX)}"
+        lines.append(f"{line} · {when}" if when else line)
+    return lines
+
+
+def _short_day(d: date, today: date) -> str:
+    """ "12 сен", with the year when it is another one: "12 сен 2025"."""
+    day = f"{d.day} {MONTHS_SHORT[d.month - 1]}"
+    return day if d.year == today.year else f"{day} {d.year}"
+
+
+def related_line(related: Sequence[RelatedRef], prefs: Prefs, now: datetime) -> str | None:
+    """ "🔗 похоже на: «Купить наушники Sony» (12 сен), «Чехол» (3 авг) и ещё 1" (the dates the items were saved)."""
+    if not related:
+        return None
+    tz = prefs.zone
+    today = _local(now, tz).date()
+    names = [
+        f"«{q(r.title, 60)}» ({_short_day(_local(r.created_at, tz).date(), today)})" for r in related[:RELATED_SHOWN]
+    ]
+    more = len(related) - RELATED_SHOWN
+    return "🔗 похоже на: " + ", ".join(names) + (f" и ещё {more}" if more > 0 else "")
+
+
+def _can_split(item: Item, steps: Sequence[Step]) -> bool:
+    """[🪄 Разбить на шаги]: an open top-level task without steps that is not a series (``items.can_split``)."""
+    return (
+        item.kind in SPLIT_KINDS
+        and item.status == "open"
+        and item.parent_id is None
+        and not item.rec_active
+        and not steps
+    )
+
+
 def item_card(
     item: Item,
     occ: Occurrence | None,
@@ -493,21 +557,36 @@ def item_card(
     prefs: Prefs,
     now: datetime,
     warnings: Sequence[str] = (),
+    *,
+    extras: CardExtras | None = None,
 ) -> View:
-    """Card for a saved item: title, time and reminders, recurrence, category/tags, source, details, warnings."""
+    """Card for a saved item: title, its parent (a step), time and reminders, recurrence, the checklist, category/tags,
+    source, details, related items, warnings. ``extras`` (``query.card_extras``) carries the checklist, the related
+    items and the parent; without it the card shows the item alone."""
     if item.status == "deleted":
         return deleted_card(item)
     if item.someday:  # no date on purpose: an old (cancelled or done) occurrence says nothing about it any more
         occ = None
+    steps = extras.steps if extras is not None else ()
+    related = extras.related if extras is not None else ()
     done = _occ_done(item, occ)
     lines = [f"{_kind_emoji(item.kind)} <b>{q(item.title)}</b>"]
-    lines += filter(None, [_time_line(item, occ, reminders, prefs, now), _recurrence_line(item)])
+    lines += filter(
+        None,
+        [
+            _parent_line(extras.parent_title if extras is not None else None),
+            _time_line(item, occ, reminders, prefs, now),
+            _recurrence_line(item),
+        ],
+    )
     if done:
         lines.append("✅ сделано")
+    lines += checklist_lines(steps, prefs, now)
     lines.append(_tags_line(item))
     lines += filter(None, [_source_line(item), _link_line(item)])
     if item.details and clip(item.details, DETAILS_MAX) != clip(item.title, DETAILS_MAX):
         lines.append(f"<i>{q(item.details, DETAILS_MAX)}</i>")
+    lines += filter(None, [related_line(related, prefs, now)])
     lines += _warning_lines(item, warnings)
     kb = item_card_keyboard(
         item.id,
@@ -516,8 +595,16 @@ def item_card(
         done=done,
         has_reminders=bool(_pending(reminders)) and not done,
         recurring=bool(item.rrule and item.rec_active),
+        steps=[(s.item_id, s.position, s.done) for s in steps],
+        split=extras is not None and _can_split(item, steps),  # unknown steps (no extras): no offer
+        related=bool(related),
     )
     return fit("\n".join(lines)), kb
+
+
+def steps_closed_text(title: str) -> str:
+    """The separate message when the last step of a checklist is done."""
+    return f"🎉 Все шаги выполнены — «{q(title)}» закрыт"
 
 
 def deleted_card(item: Item) -> MenuView:
@@ -580,14 +667,22 @@ def _details_line(item: Item) -> str | None:
     return f"<i>{q(item.details, DETAILS_MAX)}</i>" if item.details else None
 
 
-def reminder_message(item: Item, occ: Occurrence, reminder: Reminder | None, prefs: Prefs, now: datetime) -> MenuView:
+def reminder_message(
+    item: Item,
+    occ: Occurrence,
+    reminder: Reminder | None,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    parent_title: str | None = None,
+) -> MenuView:
     """Reminder: "🔔 <b>Купить наушники</b>", "через 5 мин · сегодня 13:00", then [✅ Готово] / [⏰ 15 мин]
-    [⏰ 1 час] [📅 Завтра].
+    [⏰ 1 час] [📅 Завтра]. A step of a checklist names its parent (``parent_title``): "↳ шаг из «Переезд»".
 
     ``reminder`` is accepted for the contract; the text depends only on the occurrence and ``now``.
     """
     lines = [f"🔔 <b>{q(item.title)}</b>", _reminder_when(item, occ, prefs, now)]
-    lines += filter(None, [_recurrence_line(item), _details_line(item)])
+    lines += filter(None, [_parent_line(parent_title), _recurrence_line(item), _details_line(item)])
     return fit("\n".join(lines)), reminder_keyboard(occ.id)
 
 
@@ -642,8 +737,14 @@ def _row_done(row: Row) -> bool:
 
 
 def _row_title(row: Row) -> str:
+    """ "📌 Купить наушники" (struck through when done); a step "(из «Переезд»)", a parent its progress "(2/5)",
+    a series "🔁"."""
     title = q(row.title, LIST_TITLE_MAX)
     body = f"{_kind_emoji(row.kind)} {f'<s>{title}</s>' if _row_done(row) else title}"
+    if row.parent_title:
+        body += f" (из «{q(row.parent_title, PARENT_TITLE_MAX)}»)"
+    elif row.steps_total:
+        body += f" ({row.steps_done}/{row.steps_total})"
     return f"{body} 🔁" if row.rrule else body
 
 
@@ -771,6 +872,7 @@ PURPOSE_LABELS: Final[dict[str, str]] = {
     "vision": "картинки",
     "stt": "голосовые",
     "answer": "ответы на вопросы",
+    "split": "разбивка на шаги",
     "models": "прайс-лист",
 }
 
@@ -833,6 +935,14 @@ def help_text() -> str:
             "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
             "• в тихие часы приходят только напоминания с явно заданным временем",
             "• по утрам — план на день, вечером — итоги",
+            "",
+            "<b>Шаги и похожее</b>",
+            "• «переезд в субботу, распиши по шагам» — задача с чек-листом; или кнопка «🪄 Разбить на шаги» в карточке,"
+            " или ответ на карточку «разбей на шаги»",
+            "• отмечай шаги кнопками ☐/☑ под карточкой; когда все отмечены, задача закроется сама 🎉",
+            "• шаг без времени не напоминает и виден только в карточке; шаг со временем — как обычная задача"
+            " с пометкой «(из «Переезд»)», в /tasks у задачи прогресс 2/5",
+            "• «🔗 похоже на …» — подсказка о похожих старых записях (кнопка «🔗 Похожее»); дубли не объединяю",
             "",
             "<b>Команды</b>",
             "/today — план на сегодня",

@@ -445,6 +445,17 @@ class ChatRequest:
         return self.body["messages"][0]["content"] == prompts.ANSWER_SYSTEM_PROMPT
 
     @property
+    def is_split(self) -> bool:
+        """The "split" call (🪄 Разбить на шаги / "разбей на шаги")."""
+        return self.body["messages"][0]["content"] == prompts.SPLIT_SYSTEM_PROMPT
+
+    @property
+    def task(self) -> dict[str, Any]:
+        """The TASK of a split prompt (always its last line)."""
+        line = self.line("TASK ")
+        return json.loads(line.removeprefix("TASK ")) if line else {}
+
+    @property
     def msg(self) -> str:
         """The MSG block of an extraction prompt (always last)."""
         text = self.user_text
@@ -463,11 +474,13 @@ Script = dict[str, Any] | Callable[[ChatRequest], dict[str, Any]]
 
 @dataclass
 class FakeChutes:
-    """chat/completions answers with the extraction scripted for the prompt's MSG text (``script``), or a prose
-    ``answer`` for answer_query prompts. ``outage`` (an HTTP status) makes every chat/STT call fail, ``stt_outage``
-    only the STT chute. ``/local/transcribe`` is the local Whisper service (no key, ``local_transcripts``)."""
+    """chat/completions answers with the extraction scripted for the prompt's MSG text (``script``), the steps
+    scripted for a split prompt's TASK title (``script_split``), or a prose ``answer`` for answer_query prompts.
+    ``outage`` (an HTTP status) makes every chat/STT call fail, ``stt_outage`` only the STT chute.
+    ``/local/transcribe`` is the local Whisper service (no key, ``local_transcripts``)."""
 
     scripts: dict[str, Script] = field(default_factory=dict)
+    split_scripts: dict[str, Script] = field(default_factory=dict)
     pages: dict[str, str] = field(default_factory=dict)  # /pages/{name} -> HTML (for link titles)
     page_hits: list[str] = field(default_factory=list)
     transcripts: dict[bytes, str] = field(default_factory=dict)
@@ -496,8 +509,15 @@ class FakeChutes:
         CLARIFICATION or REPLYING TO ITEM)."""
         self.scripts[msg.strip()] = extraction
 
+    def script_split(self, title: str, answer: Script) -> None:
+        """The answer (``{"steps": [...]}``) for split prompts whose TASK title is ``title``."""
+        self.split_scripts[title.strip()] = answer
+
     def extraction_requests(self) -> list[ChatRequest]:
-        return [r for r in self.chat_requests if not r.is_answer]
+        return [r for r in self.chat_requests if not r.is_answer and not r.is_split]
+
+    def split_requests(self) -> list[ChatRequest]:
+        return [r for r in self.chat_requests if r.is_split]
 
     def _authorized(self, request: web.Request) -> bool:
         ok = request.headers.get("Authorization") == "Bearer test-chutes-key"
@@ -514,6 +534,13 @@ class FakeChutes:
             return web.Response(status=self.outage, text='{"detail":"No instances available (yet) for chute"}')
         if req.is_answer:
             content = self.answer
+        elif req.is_split:
+            title = str(req.task.get("title") or "")
+            split = self.split_scripts.get(title)
+            if split is None:
+                self.unscripted.append(f"split: {title}")
+                split = {"steps": []}
+            content = json.dumps(split(req) if callable(split) else split, ensure_ascii=False)
         else:
             script = self.scripts.get(req.msg)
             if script is None:

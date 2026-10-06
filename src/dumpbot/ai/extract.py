@@ -7,6 +7,8 @@ Output cut at ``max_tokens`` (``finish_reason == "length"``) is first asked agai
 too -> ``AIUnavailable``. A 404 from the fallback never turns a paid primary answer into a config error: the primary's
 ``AIUnavailable`` is raised if there was one, ``AIModelNotFound`` only when both models are missing, else
 ``AIBadResponse``. Images route to vision-capable models (``llm_model`` / ``vision_fallback_model``).
+
+``split_steps`` (docs/features/iteration-2.md §C2) breaks one task into checklist steps by the same ladder.
 """
 
 from __future__ import annotations
@@ -19,16 +21,34 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from dumpbot.ai import prompts
 from dumpbot.ai.client import AIBadResponse, AIModelNotFound, AIUnavailable, ChutesClient, parse_json_object
-from dumpbot.ai.schemas import EditPatch, Extraction, QuerySpec, extraction_json_schema
+from dumpbot.ai.schemas import (
+    MAX_STEPS,
+    EditPatch,
+    Extraction,
+    QuerySpec,
+    SplitResult,
+    StepSpec,
+    extraction_json_schema,
+    split_json_schema,
+)
 from dumpbot.config import Settings
 from dumpbot.domain.kinds import SourceKind
 from dumpbot.domain.prefs import Prefs
 
-__all__ = ["PROMPT_VERSION", "ExtractInput", "ExtractOutput", "answer_query", "extract"]
+__all__ = [
+    "PROMPT_VERSION",
+    "ExtractInput",
+    "ExtractOutput",
+    "SplitInput",
+    "SplitOutput",
+    "answer_query",
+    "extract",
+    "split_steps",
+]
 
 log = logging.getLogger(__name__)
 
@@ -53,6 +73,8 @@ class ExtractInput:
     force_query: bool = False  # the message started with "?"
     reply_item: dict | None = None  # snapshot of the item whose card was replied to -> intent=edit
     clarification: str | None = None  # the chosen option of a previous Ask
+    # Earlier items with similar words, {id, kind, title, date} (the "RELATED CANDIDATES" line, §C1).
+    related: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -63,25 +85,99 @@ class ExtractOutput:
     missing_model: str | None = None  # the primary model answered 404: ``model`` is the fallback
 
 
+@dataclass
+class SplitInput:
+    task: dict[str, Any]  # the item as the prompt sees it (``items.item_snapshot`` without its id)
+    now: datetime  # aware; for CAL and the steps' times
+    prefs: Prefs
+    note: str | None = None  # the owner's words ("разбей на шаги", "на 3 шага, начни с документов")
+
+
+@dataclass
+class SplitOutput:
+    steps: list[StepSpec]
+    model: str
+    prompt_version: str
+    missing_model: str | None = None
+
+
 @functools.cache
 def _schema() -> dict[str, Any]:
     return extraction_json_schema()
 
 
+@functools.cache
+def _split_schema() -> dict[str, Any]:
+    return split_json_schema()
+
+
 async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -> ExtractOutput:
     """Run the fallback ladder and apply the ``force_query`` / ``reply_item`` overrides to the result."""
     has_images = bool(inp.images)
-    purpose = "vision" if has_images else "extract"
-    primary = settings.llm_model
     fallback = settings.vision_fallback_model if has_images else settings.llm_fallback_model
-    messages = _messages(inp)
+    ext, model, missing = await _ladder(
+        client,
+        settings,
+        _messages(inp),
+        purpose="vision" if has_images else "extract",
+        fallback=fallback,
+        out_cls=Extraction,
+        schema=_schema(),
+        schema_name="extraction",
+    )
+    return _output(ext, inp, model, missing_model=missing)
 
+
+async def split_steps(client: ChutesClient, settings: Settings, inp: SplitInput) -> SplitOutput:
+    """The "split" call (🪄 Разбить на шаги, "разбей на шаги"): the steps of one task, by the same fallback ladder
+    as ``extract`` (text models, ``ai_usage.purpose = "split"``). An empty list means "nothing sensible to split"."""
+    messages = [
+        {"role": "system", "content": prompts.SPLIT_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": prompts.build_split_text(task=inp.task, now=inp.now, prefs=inp.prefs, note=inp.note),
+        },
+    ]
+    result, model, missing = await _ladder(
+        client,
+        settings,
+        messages,
+        purpose="split",
+        fallback=settings.llm_fallback_model,
+        out_cls=SplitResult,
+        schema=_split_schema(),
+        schema_name="steps",
+    )
+    steps = [s for s in result.steps if s.title.strip()][:MAX_STEPS]
+    log.info("split with %s: %d step(s)", model, len(steps))
+    return SplitOutput(steps=steps, model=model, prompt_version=PROMPT_VERSION, missing_model=missing)
+
+
+async def _ladder[M: BaseModel](
+    client: ChutesClient,
+    settings: Settings,
+    messages: list[dict],
+    *,
+    purpose: str,
+    fallback: str | None,
+    out_cls: type[M],
+    schema: dict[str, Any],
+    schema_name: str,
+) -> tuple[M, str, str | None]:
+    """Primary model (one repair retry) -> fallback model; returns (result, model, missing primary model or None).
+
+    ``AIUnavailable`` or ``AIModelNotFound`` (404) of the primary skips to the fallback. A 404 of the fallback never
+    turns a paid primary answer into a config error: the primary's ``AIUnavailable`` is raised if there was one,
+    ``AIModelNotFound`` only when both models are missing, else ``AIBadResponse``.
+    """
+    primary = settings.llm_model
+    call = functools.partial(_attempt, client, settings, out_cls=out_cls, schema=schema, schema_name=schema_name)
     unavailable: AIUnavailable | None = None
     missing: AIModelNotFound | None = None
     try:
-        ext = await _attempt(client, settings, primary, messages, purpose, retries=1)
-        if ext is not None:
-            return _output(ext, inp, primary)
+        out = await call(primary, messages, purpose, retries=1)
+        if out is not None:
+            return out, primary, None
     except AIUnavailable as e:
         unavailable = e
         log.warning("primary model %s unavailable (%s), trying %s", primary, e, fallback)
@@ -91,7 +187,7 @@ async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -
 
     if fallback and fallback != primary:
         try:
-            ext = await _attempt(client, settings, fallback, messages, purpose, retries=0)
+            out = await call(fallback, messages, purpose, retries=0)
         except AIModelNotFound as e:
             log.error("fallback model %s not found (%s)", fallback, e)
             if unavailable is not None:
@@ -99,19 +195,28 @@ async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -
             if missing is not None:
                 raise missing from e  # both models are missing: the owner has to fix the model IDs
             # The primary answered (and was paid for) with unusable output: a retry would pay for the same again.
-            raise AIBadResponse("no valid extraction from the primary model, the fallback model is missing") from e
-        if ext is not None:
-            return _output(ext, inp, fallback, missing_model=primary if missing is not None else None)
+            raise AIBadResponse(f"no valid {schema_name} from the primary model, the fallback model is missing") from e
+        if out is not None:
+            return out, fallback, primary if missing is not None else None
     elif missing is not None:
         raise missing  # no fallback model configured: the owner has to fix the model ID
     if unavailable is not None:
         raise unavailable  # the primary may come back: let the queue retry
-    raise AIBadResponse("no valid extraction from the primary and fallback models")
+    raise AIBadResponse(f"no valid {schema_name} from the primary and fallback models")
 
 
-async def _attempt(
-    client: ChutesClient, settings: Settings, model: str, messages: list[dict], purpose: str, *, retries: int
-) -> Extraction | None:
+async def _attempt[M: BaseModel](
+    client: ChutesClient,
+    settings: Settings,
+    model: str,
+    messages: list[dict],
+    purpose: str,
+    *,
+    retries: int,
+    out_cls: type[M],
+    schema: dict[str, Any],
+    schema_name: str,
+) -> M | None:
     """Call ``model`` and validate; on invalid output retry up to ``retries`` times. None = unusable output.
 
     Output cut at ``max_tokens`` is not "invalid": the same request is sent once more with ``LONG_MAX_TOKENS``
@@ -126,15 +231,15 @@ async def _attempt(
                 purpose=purpose,
                 model=model,
                 messages=current,
-                json_schema=_schema(),
-                schema_name="extraction",
+                json_schema=schema,
+                schema_name=schema_name,
                 max_tokens=max_tokens,
             )
         except AIBadResponse as e:
             log.warning("model %s gave an unusable response: %s", model, e)
             return None
         try:
-            return Extraction.model_validate(parse_json_object(res.content))
+            return out_cls.model_validate(parse_json_object(res.content))
         except ValueError as e:  # JSONDecodeError and pydantic ValidationError are both ValueErrors
             if res.finish_reason == "length" and max_tokens < LONG_MAX_TOKENS:
                 log.warning(
@@ -144,7 +249,7 @@ async def _attempt(
                 continue
             attempt += 1
             summary = _error_summary(e)
-            log.warning("model %s returned an invalid extraction (attempt %d): %s", model, attempt, summary)
+            log.warning("model %s returned an invalid %s (attempt %d): %s", model, schema_name, attempt, summary)
             if attempt > retries:
                 return None
             current = [
@@ -179,6 +284,7 @@ def _messages(inp: ExtractInput) -> list[dict]:
         reply_item=inp.reply_item,
         clarification=inp.clarification,
         force_query=inp.force_query,
+        related=inp.related,
     )
     content: str | list[dict] = user_text
     if inp.images:
@@ -211,10 +317,13 @@ def _apply_overrides(ext: Extraction, inp: ExtractInput) -> Extraction:
 
 
 def _edit_from_items(ext: Extraction) -> EditPatch:
-    """The model saved a new item instead of editing: reuse its time / repetition / lead as the change."""
+    """The model saved a new item instead of editing: reuse its time / repetition / lead as the change (its steps
+    as "split": the item replied to is the one to break down)."""
     if not ext.items:
         return EditPatch()
     item = ext.items[0]
+    if item.steps:
+        return EditPatch(action="split")
     return EditPatch(when=item.when, rrule=item.rrule, lead=item.lead)
 
 

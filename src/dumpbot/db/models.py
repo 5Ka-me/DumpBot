@@ -2,7 +2,9 @@
 
 Overview:
 - raw_messages  — every incoming Telegram message, saved first (source of truth for re-processing)
-- items         — what the AI extracted: tasks, events, ideas, notes, links, memes...
+- items         — what the AI extracted: tasks, events, ideas, notes, links, memes... (a step of a checklist is an
+                  item with ``parent_id``)
+- item_links    — "🔗 похоже на …": an item and an earlier one the AI found related (a hint, never a merge)
 - occurrences   — dated instances of an item (one for one-off items, a rolling next one for recurring)
 - reminders     — when to ping about an occurrence (several per occurrence possible: "за день и за час")
 - bot_messages  — bot-sent message -> item/occurrence mapping (reply-to-edit, editing cards in place)
@@ -107,10 +109,15 @@ class Item(Base):
         Index("ix_items_created", "created_at"),
         Index("ix_items_raw", "raw_message_id"),
         Index("ix_items_period", "period_start", "period_end"),
+        Index("ix_items_parent", "parent_id", "position"),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     raw_message_id: Mapped[int | None] = mapped_column(ForeignKey("raw_messages.id", ondelete="SET NULL"))
+    # Subtasks (docs/features/iteration-2.md §C2): a step of a checklist is an item with the id of its parent and
+    # its place in the list (1, 2, …); both NULL for top-level items. Steps are one level deep.
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"))
+    position: Mapped[int | None] = mapped_column(Integer)
 
     kind: Mapped[str] = mapped_column(String(16))  # domain.kinds.Kind
     title: Mapped[str] = mapped_column(Text)
@@ -164,6 +171,19 @@ class Item(Base):
     occurrences: Mapped[list[Occurrence]] = relationship(
         back_populates="item", cascade="all, delete-orphan", passive_deletes=True, lazy="raise"
     )
+
+
+class ItemLink(Base):
+    """ "🔗 похоже на …" (docs/features/iteration-2.md §C1): ``item_id`` was saved later than ``related_id`` and the AI
+    found them really related (``kind`` similar). Shown in both items' cards; the items are never merged."""
+
+    __tablename__ = "item_links"
+    __table_args__ = (Index("ix_item_links_related", "related_id"),)
+
+    item_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), primary_key=True)
+    related_id: Mapped[int] = mapped_column(ForeignKey("items.id", ondelete="CASCADE"), primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16), server_default="similar", default="similar")
+    created_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
 
 
 class Occurrence(Base):

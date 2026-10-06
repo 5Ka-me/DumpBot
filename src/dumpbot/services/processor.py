@@ -19,6 +19,12 @@ the same request gives the same result) -> no retries: the message is saved with
 edit is reported as failed, 😢; Telegram download errors -> ``RetryLater(5 min)``. The fallback model standing in
 for a missing (404) primary -> notice once a day.
 
+Related items and checklists (docs/features/iteration-2.md §C): before ``extract()`` up to 5 earlier items with words
+of the message go into the prompt (RELATED CANDIDATES), and only their ids are kept from the model's ``related``;
+"переезд, распиши по шагам" comes back with ``steps``; "разбей на шаги" (a reply, or by target) and the card's
+[🪄 Разбить на шаги] (job "split") run the separate "split" call and show the checklist. Edits that close a parent
+by its last step are followed by "🎉 Все шаги выполнены" (``cards.after_steps``).
+
 Data changes are committed before their cards are sent (a lost card never duplicates items); replies that change
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
 Everything sent in quiet hours is silent (a deferred message can be processed at night); the final reaction goes on
@@ -43,10 +49,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from dumpbot import clock
 from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
-from dumpbot.ai.extract import ExtractInput, ExtractOutput, answer_query, extract
+from dumpbot.ai.extract import ExtractInput, ExtractOutput, SplitInput, SplitOutput, answer_query, extract, split_steps
 from dumpbot.ai.linkinfo import fetch_titles
 from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QuerySpec, When
-from dumpbot.bot import sender, views
+from dumpbot.bot import cards, sender, views
 from dumpbot.context import AppContext
 from dumpbot.db.models import Job, OnceKey, RawMessage
 from dumpbot.domain import quiet, timeresolve
@@ -66,6 +72,7 @@ __all__ = [
     "handle_edit",
     "handle_edit_time",
     "handle_message",
+    "handle_split",
     "on_dead",
 ]
 
@@ -99,6 +106,13 @@ ITEM_GONE_TEXT: Final = "🤷 Не нашёл эту запись — возмо
 NOTHING_FOUND: Final = "Ничего не нашёл 🤷"
 FAILED_MESSAGE_TEXT: Final = "😢 Не смог обработать сообщение — оно сохранено, но разобрать его не получилось."
 FAILED_EDIT_TEXT: Final = "😢 Не смог применить изменение — попробуй ещё раз или через «✏️ Изменить»."
+FAILED_SPLIT_TEXT: Final = "😢 Не смог разбить на шаги — попробуй ещё раз."
+SPLIT_WAIT_TEXT: Final = "✍ ИИ сейчас недоступен — разобью на шаги, как только получится."
+NO_STEPS_TEXT: Final = "🤷 Не вижу, на какие шаги это разбить."
+HAS_STEPS_TEXT: Final = "📋 У задачи уже есть шаги."
+CANT_SPLIT_TEXT: Final = "🤷 Эту запись не разбить на шаги: она уже закрыта, повторяется или сама — шаг."
+# Snapshot fields the "split" prompt gets (the task, not its bookkeeping).
+SPLIT_TASK_FIELDS: Final = ("kind", "title", "details", "tags", "due_local", "period", "someday")
 
 _MEDIA_TITLES: Final[dict[str, str]] = {
     "video": "Видео",
@@ -220,14 +234,20 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         return
 
     patch = out.extraction.edit or EditPatch()
+    image_text = _image_text(out.extraction)
+    if patch.action == "split":  # "разбей на шаги" in reply to the card
+        await _split(ctx, prefs, item_id, now=now, note=content.text, raws=[raw], once_key=key, image_text=image_text)
+        return
     async with ctx.sessionmaker() as session:
         if not await try_once(session, key):
             return  # applied concurrently
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
-        view = _patch_view(result, prefs)
-        _finish(await _reload(session, [raw]), _image_text(out.extraction))
+        view = await _patch_view(session, result, prefs)
+        _finish(await _reload(session, [raw]), image_text)
         await session.commit()
+        events = items_svc.take_parent_events(session)
     await _send_patch_card(ctx, prefs, view, result, reply_to=raw.message_id, raw_message_id=raw.id)
+    await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await sender.react(ctx, raw.message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
 
@@ -283,7 +303,7 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> None:
         if key is not None and not await try_once(session, key):
             return  # applied by an earlier run of this job
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
-        view = _patch_view(result, prefs)
+        view = await _patch_view(session, result, prefs)
         await session.commit()
     await _send_patch_card(ctx, prefs, view, result, reply_to=message_id)
     if message_id:
@@ -307,12 +327,154 @@ def _usable_when(when: When, now: datetime, prefs: Prefs) -> bool:
     return due is not None or precision == "someday"
 
 
+async def handle_split(ctx: AppContext, payload: dict[str, Any]) -> None:
+    """Job "split" ``{item_id, message_id?, now?}`` from the card's [🪄 Разбить на шаги]: the AI breaks the task into
+    steps and the card (``message_id``) turns into the checklist."""
+    prefs = await _prefs(ctx)
+    now = _payload_time(payload.get("now")) or clock.utcnow()
+    card = _opt_int(payload.get("message_id"))
+    await _split(ctx, prefs, int(payload["item_id"]), now=now, note=None, card_message=card)
+
+
+async def _split(
+    ctx: AppContext,
+    prefs: Prefs,
+    item_id: int,
+    *,
+    now: datetime,
+    note: str | None,
+    card_message: int | None = None,
+    raws: Sequence[RawMessage] = (),
+    once_key: str | None = None,
+    image_text: str | None = None,
+) -> None:
+    """Break the item into steps (the "split" call, ``note`` = the owner's words) and show its checklist: the card
+    ``card_message`` is redrawn in place (the button), or a new card replies to the owner's message (``raws``, done
+    afterwards; ``once_key`` is committed with the steps). Nothing to split (closed, a series, a step, has steps,
+    the model found no steps) -> a short note with the card."""
+    raws = list(raws)
+    reply_to = raws[0].message_id if raws else card_message
+    async with ctx.sessionmaker() as session:
+        item = await items_svc.get_item(session, item_id)
+        problem = await _split_problem(session, item)
+        snapshot = await items_svc.item_snapshot(session, item_id, prefs, now) if problem is None else None
+    if item is None or item.status == "deleted":
+        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=reply_to, purpose="answer")
+        await _mark_done(ctx, raws, image_text)
+        return
+    if problem is not None or snapshot is None:
+        await _mark_done(ctx, raws, image_text)
+        await _show_split(ctx, prefs, item_id, problem, reply_to=reply_to, raw_id=raws[0].id if raws else None)
+        await _react(ctx, raws, sender.REACT_SAVED)
+        return
+    task = {k: v for k, v in snapshot.items() if k in SPLIT_TASK_FIELDS and v not in (None, "", [])}
+    out = await _split_call(ctx, prefs, SplitInput(task=task, now=now, prefs=prefs, note=note), raws, card_message)
+    if out is None:
+        return
+    async with ctx.sessionmaker() as session:
+        if once_key is not None and not await try_once(session, once_key):
+            return  # applied by an earlier run of this job
+        created = await items_svc.add_steps(
+            session, item_id, out.steps, prefs, now, model=out.model, prompt_version=out.prompt_version
+        )
+        _finish(await _reload(session, raws), image_text)
+        await session.commit()
+    raw_id = raws[0].id if raws else None
+    if not created:
+        why = NO_STEPS_TEXT if not out.steps else HAS_STEPS_TEXT  # or it was split / closed meanwhile
+        await _show_split(ctx, prefs, item_id, why, reply_to=reply_to, raw_id=raw_id)
+    elif card_message is not None and not raws:
+        await _redraw_card(ctx, prefs, item_id, card_message)
+    else:
+        await _show_split(ctx, prefs, item_id, None, reply_to=reply_to, raw_id=raw_id)
+    await _react(ctx, raws, sender.REACT_SAVED)
+    ctx.scheduler_wakeup.set()  # steps with a time have reminders
+
+
+async def _split_problem(session: AsyncSession, item: Any) -> str | None:
+    """Why the item gets no steps now (None: it can be split)."""
+    if item is None or item.status == "deleted":
+        return ITEM_GONE_TEXT
+    if (await query.card_extras(session, item)).steps:
+        return HAS_STEPS_TEXT
+    return None if items_svc.can_split(item) else CANT_SPLIT_TEXT
+
+
+async def _split_call(
+    ctx: AppContext, prefs: Prefs, inp: SplitInput, raws: list[RawMessage], card_message: int | None
+) -> SplitOutput | None:
+    """``split_steps`` behind the budget check, with the processor's error handling; None when it gave up."""
+    reply_to = raws[0].message_id if raws else card_message
+    try:
+        await _check_budget(ctx, prefs, raws)
+        return await split_steps(ctx.ai, ctx.settings, inp)
+    except AIUnavailable:
+        await _defer(ctx, raws)
+        if not raws and card_message is not None:  # the button has no message to put ✍ on: say it once
+            async with ctx.sessionmaker() as session:
+                first = await try_once(session, f"split-wait:{card_message}")
+                await session.commit()
+            if first:
+                await _send(ctx, SPLIT_WAIT_TEXT, prefs=prefs, reply_to=card_message, purpose="notice")
+        raise
+    except AIConfigError as e:
+        await _config_problem(ctx, prefs, e, raws)
+        raise RetryLater(CONFIG_RETRY, "AI config error", count_attempt=False) from e
+    except AIBadResponse as e:
+        if raws:
+            await _give_up(ctx, prefs, raws, FAILED_SPLIT_TEXT, e, reply_to=reply_to)
+        else:  # the button: its message is the bot's own card, so no 😢 reaction
+            log.warning("split: no usable AI result (%s)", describe_error(e))
+            await _send(ctx, FAILED_SPLIT_TEXT, prefs=prefs, reply_to=card_message, purpose="notice")
+        return None
+
+
+async def _show_split(
+    ctx: AppContext, prefs: Prefs, item_id: int, note: str | None, *, reply_to: int | None, raw_id: int | None = None
+) -> None:
+    """A new card of the item (with ``note`` above it) in reply to ``reply_to``."""
+    async with ctx.sessionmaker() as session:
+        item = await items_svc.get_item(session, item_id)
+        if item is None:
+            return
+        text, markup = await cards.card_view(session, item, prefs, clock.utcnow())
+        occ = await items_svc.current_occurrence(session, item_id)
+        await session.commit()
+    await _send(
+        ctx,
+        views.fit(f"{note}\n\n{text}") if note else text,
+        markup,
+        prefs=prefs,
+        reply_to=reply_to,
+        purpose="card",
+        item_id=item_id,
+        occurrence_id=occ.id if occ is not None and item.status != "deleted" else None,
+        raw_message_id=raw_id,
+    )
+
+
+async def _redraw_card(ctx: AppContext, prefs: Prefs, item_id: int, message_id: int) -> None:
+    """The card the button was pressed on, with its new checklist (a new card when it cannot be edited)."""
+    async with ctx.sessionmaker() as session:
+        item = await items_svc.get_item(session, item_id)
+        view = await cards.card_view(session, item, prefs, clock.utcnow()) if item is not None else None
+        await session.commit()
+    if view is None:
+        return
+    try:
+        await sender.edit(ctx, message_id, view[0], view[1])
+    except TelegramAPIError as e:
+        log.info("card %s not redrawn after the split (%s), sending a new one", message_id, type(e).__name__)
+        await _show_split(ctx, prefs, item_id, None, reply_to=message_id)
+
+
 HANDLERS: dict[str, Handler] = {
     "message": handle_message,
     "album": handle_album,
     "edit": handle_edit,
     "clarify": handle_clarify,
     "edit_time": handle_edit_time,
+    "split": handle_split,
 }
 
 
@@ -321,12 +483,14 @@ async def on_dead(ctx: AppContext, job: Job) -> None:
     try:
         raw = await _fail_raws(ctx, job)
         text = FAILED_EDIT_TEXT if job.kind in ("edit", "edit_time") else FAILED_MESSAGE_TEXT
-        if job.kind not in HANDLERS:
+        if job.kind == "split":
+            text = FAILED_SPLIT_TEXT
+        elif job.kind not in HANDLERS:
             text = f"😢 Не смог выполнить фоновую задачу «{views.esc(job.kind)}»."
         reply_to = raw.message_id if raw is not None else _opt_int((job.payload or {}).get("message_id"))
         prefs = await _prefs(ctx)
         await _send(ctx, text, prefs=prefs, reply_to=reply_to, purpose="notice", raw_message_id=raw.id if raw else None)
-        if reply_to:
+        if reply_to and job.kind != "split":  # a split job's message is the bot's own card
             await sender.react(ctx, reply_to, sender.REACT_FAILED)
     except Exception as e:
         log.error("on_dead for job %s failed: %s", job.id, describe_error(e))
@@ -350,8 +514,10 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
             await _save_without_ai(ctx, raws, prefs)
             return
         await _check_budget(ctx, prefs, raws)
-        out = await _extract(ctx, prefs, _extract_input(content, primary, prefs, clarification=clarification))
-        await _dispatch(ctx, raws, content, out, prefs, replace=replace)
+        candidates = await _related_candidates(ctx, raws, content, prefs)
+        inp = _extract_input(content, primary, prefs, clarification=clarification, related=candidates)
+        out = await _extract(ctx, prefs, inp)
+        await _dispatch(ctx, raws, content, out, prefs, replace=replace, related=[c["id"] for c in candidates])
     except AIUnavailable:
         await _defer(ctx, raws)
         raise
@@ -385,18 +551,43 @@ async def _extract(ctx: AppContext, prefs: Prefs, inp: ExtractInput) -> ExtractO
 
 
 async def _dispatch(
-    ctx: AppContext, raws: list[RawMessage], content: _Content, out: ExtractOutput, prefs: Prefs, *, replace: bool
+    ctx: AppContext,
+    raws: list[RawMessage],
+    content: _Content,
+    out: ExtractOutput,
+    prefs: Prefs,
+    *,
+    replace: bool,
+    related: Sequence[int] = (),
 ) -> None:
     ext = out.extraction
     log.info("message %s: intent=%s items=%d (%s)", raws[0].message_id, ext.intent, len(ext.items), out.model)
     if ext.intent == "query" and ext.query is not None:
         await _reply_query(ctx, raws, content, ext.query, prefs, _image_text(ext))
     elif ext.intent == "edit" and ext.edit is not None and not content.forward_origin:
-        await _edit_by_target(ctx, raws, content, out, prefs, replace=replace)
+        await _edit_by_target(ctx, raws, content, out, prefs, replace=replace, related=related)
     else:
         # A forwarded post is someone else's words ("встреча отменяется, удали"): it is saved, never applied to the
         # owner's items; edits come from replies to cards and the ✏️ menu.
-        await _save(ctx, raws, content, out, prefs, replace=replace)
+        await _save(ctx, raws, content, out, prefs, replace=replace, related=related)
+
+
+async def _related_candidates(
+    ctx: AppContext, raws: Sequence[RawMessage], content: _Content, prefs: Prefs
+) -> list[dict[str, Any]]:
+    """Earlier items sharing words with the message (§C1) as the prompt's RELATED CANDIDATES: ``{id, kind, title,
+    date}`` (the local date it was saved). None for questions and messages without text."""
+    if content.force_query or not content.text.strip():
+        return []
+    async with ctx.sessionmaker() as session:
+        rows = await query.related_candidates(
+            session, content.text, _msg_now(raws[0]), exclude_raw_ids=[r.id for r in raws]
+        )
+    tz = prefs.zone
+    return [
+        {"id": r.item_id, "kind": r.kind, "title": r.title, "date": r.created_at.astimezone(tz).date().isoformat()}
+        for r in rows
+    ]
 
 
 async def _save(
@@ -408,11 +599,13 @@ async def _save(
     *,
     replace: bool,
     note: str | None = None,
+    related: Sequence[int] = (),
 ) -> None:
     """Create the items (or replace them after a clarification), then cards / question and the reaction.
 
     ``note`` (why the message was saved, e.g. an edit whose item was not found) goes above the cards, and then
-    every item gets a card, so that it can be fixed with its buttons.
+    every item gets a card, so that it can be fixed with its buttons. ``related``: the ids of the RELATED CANDIDATES
+    the model was shown (only these may be linked).
     """
     primary = raws[0]
     ext = out.extraction
@@ -435,12 +628,13 @@ async def _save(
             "now": _msg_now(head),
             "model": out.model,
             "prompt_version": out.prompt_version,
+            "related_allowed": related,
         }
         if replace:
             created = await items_svc.replace_items_for_raw(session, head.id, raw=head, **kwargs)
         else:
             created = await items_svc.create_items(session, raw=head, **kwargs)
-        cards = [] if ask is not None else _cards(created, prefs, now_view, every=note is not None)
+        shown = [] if ask is not None else await _cards(session, created, prefs, now_view, every=note is not None)
         if ask is not None:
             head.raw_json = {**(head.raw_json or {}), ASK_KEY: ask.model_dump(mode="json")}
         _finish(fresh, image_text)
@@ -449,7 +643,7 @@ async def _save(
     if ask is not None:
         await _send_ask(ctx, prefs, raws, ask)
         return
-    for created_item, (text, markup) in cards:
+    for created_item, (text, markup) in shown:
         occ = created_item.occurrence
         await _send(
             ctx,
@@ -465,16 +659,19 @@ async def _save(
     await _react(ctx, raws, sender.REACT_SAVED)
 
 
-def _cards(
-    created: Sequence[CreatedItem], prefs: Prefs, now: datetime, *, every: bool = False
+async def _cards(
+    session: AsyncSession, created: Sequence[CreatedItem], prefs: Prefs, now: datetime, *, every: bool = False
 ) -> list[tuple[CreatedItem, View]]:
-    """Cards for items with reminders, actionable kinds, or something to confirm (``every``: all items); the rest
-    only get 👌."""
+    """Cards for items with reminders, actionable kinds, a checklist or related items, or something to confirm
+    (``every``: all items); the rest only get 👌."""
     out: list[tuple[CreatedItem, View]] = []
     for c in created:
         res = c.resolution
-        if every or c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or res.warnings:
-            out.append((c, views.item_card(c.item, c.occurrence, c.reminders, prefs, now, warnings=res.warnings)))
+        extras = await query.card_extras(session, c.item)
+        shown = every or c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or res.warnings
+        if shown or extras.steps or extras.related:
+            view = views.item_card(c.item, c.occurrence, c.reminders, prefs, now, warnings=res.warnings, extras=extras)
+            out.append((c, view))
     return out
 
 
@@ -535,6 +732,7 @@ async def _edit_by_target(
     prefs: Prefs,
     *,
     replace: bool,
+    related: Sequence[int] = (),
 ) -> None:
     """ "перенеси встречу с Олегом на 16": the item is looked up by ``edit.target``. Only an exact match (every word
     of the target) of a non-destructive change is applied at once; a loose match (some word, a tag), several
@@ -552,17 +750,22 @@ async def _edit_by_target(
         if not exact:
             rows = await query.find_edit_candidates(session, target, prefs, now)
     if not rows:
-        await _save(ctx, raws, content, out, prefs, replace=replace, note=NOT_FOUND_TEXT)
+        await _save(ctx, raws, content, out, prefs, replace=replace, note=NOT_FOUND_TEXT, related=related)
         return
     if len(rows) > 1 or not exact or patch.action in CONFIRM_ACTIONS:
         await _send_candidates(ctx, prefs, raws, rows, image_text)
         return
+    if patch.action == "split":  # "разбей переезд на шаги"
+        await _split(ctx, prefs, rows[0].item_id, now=now, note=content.text, raws=raws, image_text=image_text)
+        return
     async with ctx.sessionmaker() as session:
         result = await items_svc.apply_patch(session, rows[0].item_id, patch, prefs, now)
-        view = _patch_view(result, prefs)
+        view = await _patch_view(session, result, prefs)
         _finish(await _reload(session, raws), image_text)
         await session.commit()
+        events = items_svc.take_parent_events(session)
     await _send_patch_card(ctx, prefs, view, result, reply_to=primary.message_id, raw_message_id=primary.id)
+    await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, raws, sender.REACT_SAVED)
 
 
@@ -591,12 +794,8 @@ async def _send_candidates(
     await _react(ctx, raws, sender.REACT_ASK)
 
 
-def _patch_view(result: PatchResult, prefs: Prefs) -> View:
-    if result.deleted or result.item.status == "deleted":
-        return views.deleted_card(result.item)
-    return views.item_card(
-        result.item, result.occurrence, result.reminders, prefs, clock.utcnow(), warnings=result.warnings
-    )
+async def _patch_view(session: AsyncSession, result: PatchResult, prefs: Prefs) -> View:
+    return await cards.patch_card(session, result, prefs, clock.utcnow())
 
 
 async def _send_patch_card(
@@ -825,6 +1024,7 @@ def _extract_input(
     *,
     clarification: str | None = None,
     reply_item: dict[str, Any] | None = None,
+    related: list[dict[str, Any]] | None = None,
 ) -> ExtractInput:
     return ExtractInput(
         text=content.text,
@@ -837,6 +1037,7 @@ def _extract_input(
         force_query=content.force_query,
         reply_item=reply_item,
         clarification=clarification,
+        related=related or [],
     )
 
 

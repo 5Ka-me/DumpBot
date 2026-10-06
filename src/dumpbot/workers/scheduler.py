@@ -222,7 +222,10 @@ class Scheduler:
                         await self._finish(reminder_id, status="pending", fire_at=later)
                     log.info("automatic reminder %s not sent in quiet hours", reminder_id)
                     return True
-                text, markup = views.reminder_message(item, occ, reminder, prefs, now)
+                parent_title = None
+                if item.parent_id is not None:  # a step of a checklist names its parent
+                    parent_title = await session.scalar(select(Item.title).where(Item.id == item.parent_id))
+                text, markup = views.reminder_message(item, occ, reminder, prefs, now, parent_title=parent_title)
                 item_id, occ_id = item.id, occ.id
             # No transaction is held while waiting for Telegram.
             message_id = await sender.send(

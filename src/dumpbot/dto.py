@@ -70,6 +70,43 @@ class Row:
     period_start: date | None = None
     period_end: date | None = None
     someday: bool = False
+    # Checklists (docs/features/iteration-2.md §C2): a step names its parent ("(из «Переезд»)"), a parent counts its
+    # steps ("2/5"; deleted steps are not counted).
+    parent_id: int | None = None
+    parent_title: str | None = None
+    steps_done: int = 0
+    steps_total: int = 0
+
+
+@dataclass(frozen=True)
+class Step:
+    """One line of a parent's checklist: "☑ 2. Заказать машину · чт 8 окт 15:00"."""
+
+    item_id: int
+    position: int
+    title: str
+    done: bool
+    due_at: datetime | None = None  # due of the step's current occurrence (a step with a time of its own)
+    precision: str | None = None
+
+
+@dataclass(frozen=True)
+class RelatedRef:
+    """An item the AI found related to this one (``item_links``, either direction)."""
+
+    item_id: int
+    kind: str
+    title: str
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class CardExtras:
+    """What an item card shows besides the item itself: its checklist, related items, its parent."""
+
+    steps: tuple[Step, ...] = ()
+    related: tuple[RelatedRef, ...] = ()  # newest first, all of them (the card names two)
+    parent_title: str | None = None  # the item is a step of this parent
 
 
 @dataclass

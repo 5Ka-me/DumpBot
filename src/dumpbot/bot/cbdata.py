@@ -20,6 +20,8 @@ ItemCb    ``i:<a>:<item id>``           Item card actions (``a``):
                                         ``tags``    ask for new tags as text (FSM -> items.set_tags)
                                         ``done``    mark the item's current occurrence done; used on cards only
                                                     when the card has no occurrence (otherwise OccCb is used)
+                                        ``split``   🪄 break the task into steps (job "split" -> the AI)
+                                        ``rel``     🔗 send the cards of the related items (up to 3)
 OccCb     ``o:<a>:<occurrence id>``     Occurrence actions (cards and reminders): ``done``, ``undone``,
                                         ``s15`` / ``s60`` (snooze 15 / 60 min), ``tmr`` (snooze to tomorrow)
 KindCb    ``k:<item id>:<kind>``        Set the item's category; ``k`` is a ``domain.kinds.Kind`` code
@@ -33,6 +35,9 @@ DigestCb  ``d:<a>:<YYYYMMDD>``          Digest actions: ``tmr`` = move the not-d
                                         arrives the next morning, so the day is in the data; buttons sent before
                                         it was (``d:tmr``) use the local date of the digest message.
 SetCb     ``s:<key>:<v>``               Settings menu; every key/value is documented in ``bot.views``.
+SubCb     ``c:<a>:<step item id>``      A checklist line of a parent's card: ``done`` (☐ pressed) / ``undo``
+                                        (☑ pressed). The wanted state is in the data, so a stale card never flips
+                                        a step the wrong way.
 ========  ============================  =============================================================================
 """
 
@@ -45,8 +50,24 @@ from aiogram.filters.callback_data import CallbackData
 MAX_CALLBACK_BYTES: Final = 64
 
 ITEM_ACTIONS: Final[frozenset[str]] = frozenset(
-    {"edit", "del", "undel", "norem", "stoprec", "kind", "lead", "back", "time", "title", "tags", "done"}
+    {
+        "edit",
+        "del",
+        "undel",
+        "norem",
+        "stoprec",
+        "kind",
+        "lead",
+        "back",
+        "time",
+        "title",
+        "tags",
+        "done",
+        "split",
+        "rel",
+    }
 )
+STEP_ACTIONS: Final[frozenset[str]] = frozenset({"done", "undo"})
 OCC_ACTIONS: Final[frozenset[str]] = frozenset({"done", "undone", "s15", "s60", "tmr"})
 # Snooze actions -> minutes (None = tomorrow, same local time).
 SNOOZE_MINUTES: Final[dict[str, int | None]] = {"s15": 15, "s60": 60, "tmr": None}
@@ -94,4 +115,19 @@ class SetCb(CallbackData, prefix="s"):
     v: str = ""
 
 
-ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (ItemCb, OccCb, KindCb, LeadCb, AskCb, PickCb, DigestCb, SetCb)
+class SubCb(CallbackData, prefix="c"):
+    a: str
+    id: int
+
+
+ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
+    ItemCb,
+    OccCb,
+    KindCb,
+    LeadCb,
+    AskCb,
+    PickCb,
+    DigestCb,
+    SetCb,
+    SubCb,
+)

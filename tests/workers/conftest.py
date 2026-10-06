@@ -27,8 +27,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from dumpbot import clock
-from dumpbot.ai.extract import ExtractInput, ExtractOutput
-from dumpbot.ai.schemas import ExtractedItem, Extraction
+from dumpbot.ai.extract import ExtractInput, ExtractOutput, SplitInput, SplitOutput
+from dumpbot.ai.schemas import ExtractedItem, Extraction, StepSpec
 from dumpbot.ai.stt import RoutedSTT
 from dumpbot.config import Settings
 from dumpbot.context import AppContext
@@ -166,11 +166,14 @@ class FakeSTT:
 
 
 class FakeAI:
-    """Scripted ``extract`` / ``answer_query`` / ``fetch_titles`` (patched into the processor module)."""
+    """Scripted ``extract`` / ``split_steps`` / ``answer_query`` / ``fetch_titles`` (patched into the processor
+    module)."""
 
     def __init__(self) -> None:
         self.outputs: list[Extraction | ExtractOutput | BaseException] = []
         self.inputs: list[ExtractInput] = []
+        self.splits: list[list[str] | BaseException] = []  # step titles per "split" call
+        self.split_inputs: list[SplitInput] = []
         self.answers: list[str | BaseException] = []
         self.answer_calls: list[dict[str, Any]] = []
         self.titles: dict[str, str] = {}
@@ -188,6 +191,14 @@ class FakeAI:
         if isinstance(out, ExtractOutput):
             return out
         return ExtractOutput(extraction=out, model="fake-model", prompt_version="v1")
+
+    async def split_steps(self, client: Any, settings: Any, inp: SplitInput) -> SplitOutput:
+        self.split_inputs.append(inp)
+        result = self.splits.pop(0) if self.splits else []
+        if isinstance(result, BaseException):
+            raise result
+        steps = [StepSpec(title=title) for title in result]
+        return SplitOutput(steps=steps, model="fake-model", prompt_version="v3")
 
     async def answer_query(
         self, client: Any, settings: Any, question: str, rows: list[dict], now: datetime, prefs: Prefs
@@ -234,6 +245,7 @@ def with_local_stt(ctx: AppContext, stt: FakeSTT, local_stt: FakeSTT) -> Callabl
 def fake_ai(monkeypatch: pytest.MonkeyPatch) -> FakeAI:
     ai = FakeAI()
     monkeypatch.setattr(processor, "extract", ai.extract)
+    monkeypatch.setattr(processor, "split_steps", ai.split_steps)
     monkeypatch.setattr(processor, "answer_query", ai.answer_query)
     monkeypatch.setattr(processor, "fetch_titles", ai.fetch_titles)
     return ai

@@ -4,6 +4,11 @@ Every handler follows one pattern: open a session, call the service, commit, ans
 toast and edit the message in place with a fresh view. Unknown or stale ids answer "Запись не найдена". The
 scheduler is woken after anything that changes reminders, the job worker after anything that queues a job.
 
+Checklists (docs/features/iteration-2.md §C2): [☐ N] / [☑ N] (``SubCb``) toggle a step and redraw the parent's
+card; whenever a commit closed a parent by its last step (whatever button did it: a step's reminder too) the
+"🎉 Все шаги выполнены" message follows and other cards of the parent are redrawn (``common.after_steps``).
+[🪄 Разбить на шаги] queues job "split"; [🔗 Похожее] sends the cards of the related items.
+
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
 
@@ -11,22 +16,24 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from typing import TYPE_CHECKING, Final
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
+from sqlalchemy import exists, select
 
 from dumpbot import clock
 from dumpbot.ai.schemas import EditPatch
-from dumpbot.bot import views
+from dumpbot.bot import cards, sender, views
 from dumpbot.bot.cbdata import (
     DIGEST_ACTIONS,
     DIGEST_DAY_FMT,
     OCC_ACTIONS,
     SNOOZE_MINUTES,
+    STEP_ACTIONS,
     AskCb,
     DigestCb,
     ItemCb,
@@ -34,10 +41,11 @@ from dumpbot.bot.cbdata import (
     LeadCb,
     OccCb,
     PickCb,
+    SubCb,
 )
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
-from dumpbot.db.models import Occurrence, RawMessage
+from dumpbot.db.models import Job, Occurrence, RawMessage
 from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import fmt_date, fmt_dt, fmt_duration
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
@@ -56,6 +64,7 @@ log = logging.getLogger(__name__)
 
 MAX_LEAD: Final = 43200  # same cap as the AI schema / items service
 MAX_ASK_OPTIONS: Final = 8
+SPLITTING: Final = "Уже разбиваю на шаги…"
 # Digest buttons sent before the digest day was part of the callback data ("d:tmr").
 OLD_DIGEST_DATA: Final = frozenset(f"{DigestCb.__prefix__}:{a}" for a in DIGEST_ACTIONS)
 
@@ -68,6 +77,8 @@ class Outcome:
     toast: str | None = None
     wake_scheduler: bool = False
     wake_jobs: bool = False
+    # New card messages to send after the edit (🔗 Похожее): (view, item id, occurrence id).
+    cards: list[tuple[views.View, int, int | None]] = field(default_factory=list)
 
 
 Op = Callable[["AsyncSession", "Prefs", datetime], Awaitable[Outcome]]
@@ -81,6 +92,7 @@ def make_router() -> Router:
     router.callback_query.register(on_lead, LeadCb.filter())
     router.callback_query.register(on_ask, AskCb.filter())
     router.callback_query.register(on_pick, PickCb.filter())
+    router.callback_query.register(on_step, SubCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     router.callback_query.register(on_stale)  # buttons of an older version, garbage data
@@ -88,19 +100,24 @@ def make_router() -> Router:
 
 
 async def run(callback: CallbackQuery, ctx: AppContext, op: Op) -> None:
-    """Run ``op`` in one transaction, then toast + edit in place + wake-ups."""
+    """Run ``op`` in one transaction, then toast + edit in place + new cards + checklist follow-ups + wake-ups."""
     now = clock.utcnow()
     try:
         async with ctx.sessionmaker() as session:
             prefs = await ctx.prefs(session)
             outcome = await op(session, prefs, now)
             await session.commit()
+            events = items.take_parent_events(session)
     except items.NotFoundError:
         await common.answer(callback, common.NOT_FOUND)
         return
     await common.answer(callback, outcome.toast)
+    message_id = common.message_id_of(callback)
     if outcome.view is not None:
-        await common.show(ctx, common.message_id_of(callback), outcome.view)
+        await common.show(ctx, message_id, outcome.view)
+    for (text, markup), item_id, occ_id in outcome.cards:
+        await sender.send(ctx, text, markup, reply_to=message_id, purpose="card", item_id=item_id, occurrence_id=occ_id)
+    await cards.after_steps(ctx, events, prefs, now, shown=message_id if outcome.view is not None else None)
     if outcome.wake_scheduler:
         ctx.scheduler_wakeup.set()
     if outcome.wake_jobs:
@@ -147,7 +164,7 @@ async def _done(
     if on_reminder:
         view = views.reminder_done(item, occ, prefs, now)
     else:
-        view = views.item_card(item, occ, [], prefs, now)
+        view = await cards.render_card(session, item, occ, [], prefs, now)
     return Outcome(view, toast, wake_scheduler=True)
 
 
@@ -156,10 +173,15 @@ async def _undone(
 ) -> Outcome:
     occ = await items.mark_undone(session, occ.id, prefs=prefs, now=now)
     if on_reminder:
-        view = views.reminder_message(item, occ, None, prefs, now)
+        view = views.reminder_message(item, occ, None, prefs, now, parent_title=await _parent_title(session, item))
     else:
-        view = views.item_card(item, occ, await items.pending_reminders(session, occ.id), prefs, now)
+        view = await cards.render_card(session, item, occ, await items.pending_reminders(session, occ.id), prefs, now)
     return Outcome(view, "↩️ Не сделано", wake_scheduler=True)
+
+
+async def _parent_title(session: AsyncSession, item: Item) -> str | None:
+    parent = await items.get_item(session, item.parent_id) if item.parent_id is not None else None
+    return parent.title if parent is not None else None
 
 
 async def _snooze(
@@ -188,6 +210,7 @@ class ItemCall:
     prefs: Prefs
     now: datetime
     message_id: int | None
+    callback_id: str = ""
 
 
 async def _edit_menu(c: ItemCall) -> Outcome:
@@ -234,7 +257,46 @@ async def _stop_recurrence(c: ItemCall) -> Outcome:
 async def _item_done(c: ItemCall) -> Outcome:
     """[✅ Готово] from the edit menu: closes the current occurrence (or the item when it has none)."""
     result = await items.apply_patch(c.session, c.item.id, EditPatch(action="done"), c.prefs, c.now)
-    return Outcome(patch_view(result, c.prefs, c.now), "✅ Готово", wake_scheduler=True)
+    return Outcome(await cards.patch_card(c.session, result, c.prefs, c.now), "✅ Готово", wake_scheduler=True)
+
+
+async def _split(c: ItemCall) -> Outcome:
+    """[🪄 Разбить на шаги]: job "split" (the AI breaks the task down, then this card turns into the checklist).
+    While a split of the item is queued or running another press only says so (a redelivered press is deduplicated
+    by its callback id); a failed split can be tried again. An item that has steps already or cannot have them just
+    gets its card redrawn."""
+    extras = await query.card_extras(c.session, c.item)
+    if extras.steps or not items.can_split(c.item):
+        toast = "У задачи уже есть шаги" if extras.steps else "Эту запись не разбить на шаги"
+        return Outcome(await common.card_view(c.session, c.item, c.prefs, c.now), toast)
+    if await _split_pending(c.session, c.item.id):
+        return Outcome(None, SPLITTING)
+    payload = {"item_id": c.item.id, "message_id": c.message_id, "now": c.now.isoformat()}
+    key = f"split:{c.callback_id}" if c.callback_id else None
+    if await jobs.enqueue(c.session, "split", payload, dedupe_key=key) is None:
+        return Outcome(None, SPLITTING)
+    return Outcome(None, "🪄 Разбиваю на шаги…", wake_jobs=True)
+
+
+async def _split_pending(session: AsyncSession, item_id: int) -> bool:
+    pending = exists().where(
+        Job.kind == "split", Job.status.in_(("queued", "running")), Job.payload["item_id"].astext == str(item_id)
+    )
+    return bool(await session.scalar(select(pending)))
+
+
+async def _related(c: ItemCall) -> Outcome:
+    """[🔗 Похожее]: the cards of up to ``views.RELATED_SENT`` related items, newest first, as new messages."""
+    sent: list[tuple[views.View, int, int | None]] = []
+    for ref in (await query.related_refs(c.session, c.item.id))[: views.RELATED_SENT]:
+        item = await common.get_item(c.session, ref.item_id)
+        occ = await items.current_occurrence(c.session, item.id)
+        reminders = await items.pending_reminders(c.session, occ.id) if occ is not None else []
+        view = await cards.render_card(c.session, item, occ, reminders, c.prefs, c.now)
+        sent.append((view, item.id, occ.id if occ is not None else None))
+    if not sent:
+        return Outcome(await common.card_view(c.session, c.item, c.prefs, c.now), "Похожих записей нет")
+    return Outcome(None, f"🔗 Похожих записей: {len(sent)}", cards=sent)
 
 
 ITEM_ACTIONS: Final[dict[str, Callable[[ItemCall], Awaitable[Outcome]]]] = {
@@ -247,6 +309,8 @@ ITEM_ACTIONS: Final[dict[str, Callable[[ItemCall], Awaitable[Outcome]]]] = {
     "norem": _no_reminders,
     "stoprec": _stop_recurrence,
     "done": _item_done,
+    "split": _split,
+    "rel": _related,
 }
 
 
@@ -264,7 +328,7 @@ async def on_item(callback: CallbackQuery, callback_data: ItemCb, ctx: AppContex
         item = await common.get_item(session, callback_data.id)
         if item.status == "deleted" and action != "undel":
             return Outcome(views.deleted_card(item), common.DELETED)
-        return await handler(ItemCall(session, ctx, item, prefs, now, message_id))
+        return await handler(ItemCall(session, ctx, item, prefs, now, message_id, callback.id))
 
     await run(callback, ctx, op)
 
@@ -281,7 +345,8 @@ async def on_kind(callback: CallbackQuery, callback_data: KindCb, ctx: AppContex
             return Outcome(views.deleted_card(item), common.DELETED)
         # apply_patch rather than set_kind: an item that becomes actionable gets its default reminder.
         result = await items.apply_patch(session, item.id, EditPatch(kind=kind), prefs, now)
-        return Outcome(patch_view(result, prefs, now), f"🏷 {KIND_LABELS[kind]}", wake_scheduler=True)
+        view = await cards.patch_card(session, result, prefs, now)
+        return Outcome(view, f"🏷 {KIND_LABELS[kind]}", wake_scheduler=True)
 
     await run(callback, ctx, op)
 
@@ -297,7 +362,8 @@ async def on_lead(callback: CallbackQuery, callback_data: LeadCb, ctx: AppContex
         if item.status == "deleted":
             return Outcome(views.deleted_card(item), common.DELETED)
         result = await items.set_lead(session, item.id, [minutes], prefs, now)
-        return Outcome(patch_view(result, prefs, now), _lead_toast(result, minutes, prefs, now), wake_scheduler=True)
+        view = await cards.patch_card(session, result, prefs, now)
+        return Outcome(view, _lead_toast(result, minutes, prefs, now), wake_scheduler=True)
 
     await run(callback, ctx, op)
 
@@ -313,10 +379,27 @@ def _lead_toast(result: PatchResult, minutes: int, prefs: Prefs, now: datetime) 
     return "⏱ Напомню в момент события" if minutes == 0 else f"⏱ Напомню за {fmt_duration(minutes)}"
 
 
-def patch_view(result: PatchResult, prefs: Prefs, now: datetime) -> views.View:
-    if result.deleted or result.item.status == "deleted":
-        return views.deleted_card(result.item)
-    return views.item_card(result.item, result.occurrence, result.reminders, prefs, now, warnings=result.warnings)
+# --- checklists ---------------------------------------------------------------------------------------------------
+
+
+async def on_step(callback: CallbackQuery, callback_data: SubCb, ctx: AppContext) -> None:
+    """[☐ N] / [☑ N] on a parent's card: the step done / open again (the parent follows), the card redrawn."""
+    if callback_data.a not in STEP_ACTIONS:
+        await common.answer(callback, common.STALE)
+        return
+
+    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
+        step = await common.get_item(session, callback_data.id)
+        if step.parent_id is None:
+            raise items.NotFoundError(f"item {step.id} is not a step")
+        parent = await common.get_item(session, step.parent_id)
+        if step.status == "deleted" or parent.status == "deleted":
+            return Outcome(await common.card_view(session, parent, prefs, now), common.DELETED)
+        await items.toggle_step(session, step.id, done=callback_data.a == "done", prefs=prefs, now=now)
+        toast = f"{'☑' if step.status == 'done' else '☐'} {views.clip(step.title, 100)}"
+        return Outcome(await common.card_view(session, parent, prefs, now), toast, wake_scheduler=True)
+
+    await run(callback, ctx, op)
 
 
 # --- clarifying questions and edit candidates (queue a job) ------------------------------------------------------

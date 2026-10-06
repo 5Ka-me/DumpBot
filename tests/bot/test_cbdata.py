@@ -13,6 +13,7 @@ from dumpbot.bot.cbdata import (
     ITEM_ACTIONS,
     OCC_ACTIONS,
     SNOOZE_MINUTES,
+    STEP_ACTIONS,
     AskCb,
     DigestCb,
     ItemCb,
@@ -21,6 +22,7 @@ from dumpbot.bot.cbdata import (
     OccCb,
     PickCb,
     SetCb,
+    SubCb,
 )
 from dumpbot.bot.views import ASK_FIELDS, SETTINGS_MENUS
 from dumpbot.domain.kinds import KINDS
@@ -37,7 +39,7 @@ def _roundtrip(cb: CallbackData) -> str:
 
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
-    assert prefixes == ["i", "o", "k", "l", "a", "p", "d", "s"]
+    assert prefixes == ["i", "o", "k", "l", "a", "p", "d", "s", "c"]
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -60,7 +62,15 @@ def test_item_actions_match_contract():
         "title",
         "tags",
         "done",
+        "split",
+        "rel",
     }
+
+
+@pytest.mark.parametrize("action", sorted(STEP_ACTIONS))
+def test_step_toggles(action: str):
+    assert STEP_ACTIONS == {"done", "undo"}
+    assert _roundtrip(SubCb(a=action, id=BIG)) == f"c:{action}:{BIG}"
 
 
 @pytest.mark.parametrize("action", sorted(OCC_ACTIONS))

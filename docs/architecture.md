@@ -3,7 +3,7 @@
 Документ — источник правды для реализации. Требования: [requirements.md](requirements.md).
 Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
 Итерация 2 (размытые сроки, локальный Whisper, связи и подзадачи, Mini App): [features/iteration-2.md](features/iteration-2.md)
-— там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B) кратко отмечено в этом документе.
+— там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B, C) кратко отмечено в этом документе.
 
 ## 1. Общая схема
 
@@ -89,8 +89,9 @@ src/dumpbot/
   bot/
     app.py                 build_bot(), build_dispatcher(), on_startup/on_shutdown                    [bot]
     middlewares.py  cbdata.py  keyboards.py  states.py  views.py  sender.py                           [bot]
+    cards.py               карточка + CardExtras (чек-лист, похожие, родитель), 🎉 после закрытия шагов   [bot]
     routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
-migrations/  alembic (env.py async, 0001 initial, 0002 item periods)                                 [infra]
+migrations/  alembic (env.py async, 0001 initial, 0002 item periods, 0003 subtasks + item_links)   [infra]
 whisper/     app.py Dockerfile requirements.txt — локальный Whisper (compose profile whisper)        [infra]
 Dockerfile  compose.yaml  .dockerignore  .env.example  README.md                                     [infra]
 tests/conftest.py (фикстуры БД)                                                                       [foundation ✔]
@@ -103,7 +104,8 @@ tests/<area>/test_*.py                                                          
 ## 4. Контракты
 
 **Общие dataclass-ы контрактов уже определены в `src/dumpbot/dto.py`** (foundation ✔): `ReminderPlan`, `Resolution`,
-`CreatedItem`, `PatchResult`, `Row`, `Agenda`, `UsageSummary`, `BudgetState`, `DigestData`. Модули импортируют их оттуда
+`CreatedItem`, `PatchResult`, `Row`, `Agenda`, `UsageSummary`, `BudgetState`, `DigestData` (итерация 2, C: `Step`,
+`RelatedRef`, `CardExtras`). Модули импортируют их оттуда
 (и могут реэкспортировать: `from dumpbot.dto import Resolution` в `timeresolve.py` и т.п.), а не объявляют заново.
 Ниже их поля приведены для справки.
 
@@ -313,7 +315,7 @@ class RoutedSTT:                           # ctx.stt
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v2" (итерация 2: when.period)
+PROMPT_VERSION: str  # "v3" (итерация 2: when.period; related / steps / edit.action split)
 
 @dataclass
 class ExtractInput:
@@ -327,6 +329,7 @@ class ExtractInput:
     force_query: bool = False                  # сообщение начиналось с "?"
     reply_item: dict | None = None             # снимок записи, на карточку которой ответили → intent=edit
     clarification: str | None = None           # выбранный вариант на предыдущий Ask
+    related: list[dict] = field(default_factory=list)  # RELATED CANDIDATES: {id, kind, title, date} (итерация 2, C1)
 
 @dataclass
 class ExtractOutput:
@@ -349,7 +352,19 @@ async def answer_query(client: ChutesClient, settings: Settings, question: str, 
                        now: datetime, prefs: Prefs) -> str
     """Краткий ответ по-русски простым текстом (без HTML), опираясь только на rows. Основная модель → при
     AIUnavailable / AIBadResponse / AIModelNotFound запасная; если запасной нет (404) → ошибка основной."""
+
+@dataclass
+class SplitInput: task: dict; now: datetime; prefs: Prefs; note: str | None = None   # итерация 2, C2
+@dataclass
+class SplitOutput: steps: list[StepSpec]; model: str; prompt_version: str; missing_model: str | None = None
+async def split_steps(client: ChutesClient, settings: Settings, inp: SplitInput) -> SplitOutput
+    """Вызов "split" (🪄 Разбить на шаги, «разбей на шаги»): SPLIT_SYSTEM_PROMPT + NOW/CAL/NOTE/TASK → схема
+    {steps: [{title, when?}]} (≤ 8), та же лестница основная → запасная, ai_usage.purpose="split". [] — нечего разбивать."""
 ```
+
+Итерация 2, C ([iteration-2.md §C](features/iteration-2.md)): `ExtractedItem.related: list[int]` (≤ 3, id из строки
+`RELATED CANDIDATES`; чужие id отбрасывает `items.create_items`), `ExtractedItem.steps: list[StepSpec]` (≤ 8,
+`{title, when?}`), `EditPatch.action` += `split`. Ответ на карточку с шагами вместо правки превращается в `split`.
 
 Схема `Extraction` (ai/schemas.py): до `MAX_ITEMS=20` записей, `title` ≤ 120, `tags` ≤ 6, `image.text` ≤ 4000 и т.д.
 Ограничения остаются в JSON-схеме (подсказка для constrained decoding), а при валидации слишком длинные строки
@@ -461,6 +476,25 @@ async def move_to_tomorrow(session, occurrence_ids: list[int], prefs: Prefs, now
     `timeresolve.tomorrow`, не раньше сегодня) в то же время, а если и этот момент прошёл — днём позже. Перепланировать."""
 ```
 
+Итерация 2, C ([iteration-2.md §C](features/iteration-2.md)): `Item.parent_id/position` — шаг чек-листа (один
+уровень), таблица `item_links(item_id, related_id, kind='similar')`.
+
+```python
+async def create_items(..., related_allowed: Collection[int] = ()) -> list[CreatedItem]
+    # + шаги ExtractedItem.steps (не у повтора; в результат не входят) и item_links только на id из related_allowed
+def can_split(item: Item) -> bool               # open, не шаг, не активный повтор
+async def add_steps(session, parent_id: int, steps: Sequence[StepSpec], prefs: Prefs, now: datetime, *,
+                    model: str | None = None, prompt_version: str | None = None) -> list[CreatedItem]
+    # строка родителя FOR UPDATE; уже есть шаги / нельзя разбить → []
+async def toggle_step(session, step_id: int, *, done: bool, prefs: Prefs, now: datetime) -> Item
+def take_parent_events(session) -> ParentEvents  # closed: родители, закрытые последним шагом; changed: чей чек-лист менялся
+```
+Шаг без своего времени не получает occurrence (нет дефолтных 19:00), со временем — обычные occurrence и напоминания.
+Последний отмеченный шаг (кнопка, «Готово» в напоминании шага, правка) закрывает родителя (его open occurrences → done,
+pending-напоминания → cancelled), снятие отметки у закрытого родителя открывает его (`mark_undone` / reopen).
+Родитель, закрытый вручную, закрывает свои открытые шаги; удаление родителя удаляет шаги с тем же `deleted_at`,
+`restore_item` возвращает именно их. Родитель-повтор шагами не закрывается.
+
 Внутренние правила: при любом перепланировании pending-напоминания текущего occurrence → cancelled, создаются новые
 по `plan_reminders` (для precision `period` — с `period=(item.period_start, item.period_end)`). Итерация 2: `Item`
 хранит `period_kind/period_start/period_end/someday`; `apply_patch` с `when.period` пересчитывает срок и
@@ -491,6 +525,10 @@ class Row:
     period_start: date | None
     period_end: date | None
     someday: bool
+    parent_id: int | None          # итерация 2, C2: шаг → название родителя; родитель → прогресс шагов
+    parent_title: str | None
+    steps_done: int
+    steps_total: int
 
 @dataclass
 class Agenda:
@@ -522,10 +560,19 @@ async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, 
                                exact: bool = False) -> list[Row]
     # среди open/недавних (30 дней) не deleted: FTS по hint (все слова, или тег = слово; иначе любое слово),
     # приоритет — ближайшие по due. exact=True: только все слова (FTS) или title содержит hint — без тегов и OR
-async def items_of_raw(session, raw_ids: Sequence[int]) -> list[Row]   # не deleted записи этих raw, по id
+async def items_of_raw(session, raw_ids: Sequence[int]) -> list[Row]   # не deleted записи этих raw (без шагов), по id
+async def related_candidates(session, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (),
+                             limit: int = 5) -> list[Row]
+    # итерация 2, C1: to_tsquery('russian', 'a | b | …') по словам текста (без чисел), ts_rank desc; не deleted,
+    # не шаги, created_at за 365 дней, кроме записей exclude_raw_ids
+async def related_refs(session, item_id: int) -> list[RelatedRef]   # item_links в обе стороны, не deleted, новые первыми
+async def card_extras(session, item: Item) -> CardExtras            # шаги (☐/☑, время), похожие, название родителя
 async def usage_summary(session, prefs: Prefs, now: datetime) -> UsageSummary
 def rows_for_llm(rows: list[Row], prefs: Prefs) -> list[dict]      # компактные dict для answer_query (локальные даты)
 ```
+Итерация 2, C2: в `/tasks`, `/recent`, `/someday`, `run_query` шаг попадает только со своим временем (есть
+не отменённое occurrence); повестка и дайджесты строятся по occurrences, так что шаги без времени туда не попадают.
+`search` и `find_edit_candidates` находят и шаги. Строки получают `parent_title` / `steps_done/steps_total`.
 
 ### 4.12 workers/jobs.py  [workers]
 
@@ -579,7 +626,7 @@ ASK_KEY = "_ask"; CANDIDATES_KEY = "_candidates"   # ключи raw_json: зад
 
 ```python
 HANDLERS: dict[str, Handler]   # {"message": handle_message, "album": handle_album, "edit": handle_edit,
-                               #  "clarify": handle_clarify, "edit_time": handle_edit_time}
+                               #  "clarify": handle_clarify, "edit_time": handle_edit_time, "split": handle_split}
 async def on_dead(ctx: AppContext, job: Job) -> None
 ```
 
@@ -633,6 +680,13 @@ text="перенеси на: …")` → `apply_patch` только с when/rrule
 Нет годного времени (нет when/rrule/lead или when не разрешается) → ничего не меняется, ответ «🤷 Не понял время —
 напиши, например, «завтра в 15:00».» + реакция 🤔. С `message_id` — не более одного раза (once_key
 `edit-time-done:{item}:{msg}` коммитится вместе с правкой и проверяется в начале).
+Итерация 2, C: перед `extract()` — `query.related_candidates` по тексту сообщения (не для `?`-вопросов) →
+`ExtractInput.related`; в `create_items` уходят их id (`related_allowed`). Карточку получает и запись с чек-листом или
+похожими. `edit.action == "split"` (ответ на карточку или правка по target) и job `"split"` `{item_id, message_id,
+now}` от кнопки «🪄 Разбить на шаги» → `split_steps` (бюджет проверяется перед вызовом) → `items.add_steps` →
+карточка с чек-листом (кнопка — правка этой карточки; ответ — новая карточка reply). Нечего разбивать / уже есть шаги /
+нельзя → заметка над карточкой. `AIUnavailable` для кнопки — один раз «✍ ИИ сейчас недоступен…», `AIBadResponse` —
+«😢 Не смог разбить на шаги». После правок, закрывших родителя последним шагом, — `cards.after_steps` (🎉).
 `handle_clarify(ctx, {"raw_id","option"})` — повтор `extract(clarification=option)` → `replace_items_for_raw` → карточки.
 Не более одного раза на raw: once_key `clarify-done:{raw_id}` коммитится вместе с новыми записями и проверяется в начале
 (повторный запуск job после рестарта не платит за ИИ и не заменяет записи снова).
@@ -698,6 +752,11 @@ ForceReply).
 Все функции чистые (без I/O), возвращают `(text_html, markup | None)`.
 
 ```python
+# Итерация 2, C: item_card(..., *, extras: CardExtras | None = None) — «↳ шаг из «Переезд»», чек-лист «📋 Шаги: 1/4»,
+# «☑ 1. Упаковать вещи», «☐ 2. Заказать машину · чт 8 окт 15:00» с кнопками [☐ N]/[☑ N] (SubCb), «🔗 похоже на: «…»
+# (12 сен)» (2 названия + «и ещё N») и [🔗 Похожее]; [🪄 Разбить на шаги] — открытая задача без шагов, не повтор, не шаг
+# (только если extras переданы). reminder_message(..., parent_title=None); steps_closed_text(title) — 🎉.
+# Строки списков: «📌 Заказать машину (из «Переезд»)», «📌 Переезд (2/5)».
 def item_card(item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime,
               warnings: Sequence[str] = ()) -> tuple[str, InlineKeyboardMarkup | None]
     # "📌 <b>Купить наушники</b>\n⏰ сегодня 13:00 · напомню в 12:55\n🔁 каждый пн\n🏷 Покупка · #электроника\n⚠️ …"
@@ -744,6 +803,10 @@ def help_text() -> str
 `edited_message` — игнорировать. Сохранение → реакция 👀 → enqueue → `ctx.jobs_wakeup.set()`.
 `/search`, `/ask` без текста (выбраны в меню команд) → подсказка с `ForceReply` (`purpose` search_prompt/ask_prompt).
 
+Итерация 2, C: `SubCb` (`c:done|undo:<step id>`) — отметить / снять шаг, карточка родителя перерисовывается; ItemCb `split`
+(job "split", пока такой job queued/running — «Уже разбиваю на шаги…») и `rel` (карточки до 3 похожих новыми
+сообщениями). После любого коммита, закрывшего родителя последним шагом (в том числе «Готово» в напоминании шага),
+`cards.after_steps`: перерисовать последнюю карточку родителя и прислать «🎉 Все шаги выполнены — «…» закрыт».
 `callbacks` (CallbackData в `cbdata.py`): done/undone/snooze (OccCb), edit/del/undel/norem/stoprec/kind/lead/back (ItemCb),
 выбор категории (KindCb), ответ на Ask (AskCb → job "clarify"), выбор записи для правки (PickCb → job "edit"),
 перенос невыполненного (DigestCb: день дайджеста D из данных кнопки, у старых кнопок `d:tmr` — дата сообщения;

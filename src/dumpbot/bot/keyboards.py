@@ -9,7 +9,7 @@ from typing import Final, Literal
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import DIGEST_DAY_FMT, DigestCb, ItemCb, OccCb
+from dumpbot.bot.cbdata import DIGEST_DAY_FMT, DigestCb, ItemCb, OccCb, SubCb
 
 # Button colours (Bot API 9.4); clients that do not support them show a normal button.
 Style = Literal["success", "danger", "primary"]
@@ -17,6 +17,7 @@ Style = Literal["success", "danger", "primary"]
 BUTTON_TEXT_MAX: Final = 64  # longer labels get cut by clients anyway
 
 BACK = "← Назад"
+STEP_BUTTONS_PER_ROW: Final = 4
 
 
 def clip_label(text: str, limit: int = BUTTON_TEXT_MAX) -> str:
@@ -48,12 +49,21 @@ def item_card_keyboard(
     done: bool,
     has_reminders: bool,
     recurring: bool,
+    steps: Sequence[tuple[int, int, bool]] = (),
+    split: bool = False,
+    related: bool = False,
 ) -> InlineKeyboardMarkup:
-    """[↩️ Не сделано] / [✏️ Изменить] [🔕 Без напоминания] [🗑 Удалить] / [⏹ Стоп повтор].
+    """[☐ 1] [☑ 2] … / [↩️ Не сделано] / [✏️ Изменить] [🔕 Без напоминания] [🗑 Удалить] / [🪄 Разбить на шаги]
+    [🔗 Похожее] / [⏹ Стоп повтор].
 
+    ``steps``: (step item id, number, done) of the checklist; each button asks for the opposite state (SubCb).
     No [✅ Готово] here: the card is the "saved" confirmation, and a big done button right under it gets in the way.
     Done lives on reminder messages and in the edit menu.
     """
+    toggles = [
+        button(f"{'☑' if is_done else '☐'} {n}", SubCb(a="undo" if is_done else "done", id=step_id))
+        for step_id, n, is_done in steps
+    ]
     first: list[InlineKeyboardButton] = []
     if actionable and done and occurrence_id is not None:
         first.append(button("↩️ Не сделано", OccCb(a="undone", id=occurrence_id)))
@@ -61,8 +71,13 @@ def item_card_keyboard(
     if has_reminders:
         second.append(button("🔕 Без напоминания", ItemCb(a="norem", id=item_id)))
     second.append(button("🗑 Удалить", ItemCb(a="del", id=item_id), style="danger"))
-    third = [button("⏹ Стоп повтор", ItemCb(a="stoprec", id=item_id))] if recurring else []
-    return markup(first, second, third)
+    extra: list[InlineKeyboardButton] = []
+    if split:
+        extra.append(button("🪄 Разбить на шаги", ItemCb(a="split", id=item_id)))
+    if related:
+        extra.append(button("🔗 Похожее", ItemCb(a="rel", id=item_id)))
+    last = [button("⏹ Стоп повтор", ItemCb(a="stoprec", id=item_id))] if recurring else []
+    return markup(*chunked(toggles, STEP_BUTTONS_PER_ROW), first, second, extra, last)
 
 
 def reminder_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:

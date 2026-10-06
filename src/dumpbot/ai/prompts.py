@@ -6,6 +6,8 @@ Instructions are in English (fewer tokens); the model answers in the language of
 
 v2 (iteration 2, docs/features/iteration-2.md §A): ``when.period`` for fuzzy spans ("на этой неделе", "в октябре",
 "летом", "на днях", "когда-нибудь") and deadlines "до конца недели / месяца".
+v3 (§C): ``RELATED CANDIDATES`` in the input and ``items[].related``; ``items[].steps`` ("распиши по шагам") and
+``edit.action = "split"``; a separate prompt for the "split" call (🪄 Разбить на шаги).
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v2"
+PROMPT_VERSION = "v3"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -122,6 +124,38 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
         },
     ),
     (
+        "переезд в субботу, распиши по шагам",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Переезд",
+                    "when": {"text": "в субботу", "day": "SA"},
+                    "steps": [
+                        {"title": "Упаковать вещи"},
+                        {"title": "Заказать машину"},
+                        {"title": "Перевезти вещи"},
+                        {"title": "Отдать ключи"},
+                    ],
+                }
+            ]
+        },
+    ),
+    (
+        'RELATED CANDIDATES [{"id":12,"kind":"purchase","title":"Купить наушники Sony","date":"2026-09-12"},'
+        '{"id":31,"kind":"note","title":"Соседи шумят","date":"2026-08-02"}] | купить чехол для наушников Sony',
+        {
+            "items": [
+                {
+                    "kind": "purchase",
+                    "title": "Купить чехол для наушников Sony",
+                    "tags": ["электроника"],
+                    "related": [12],
+                }
+            ]
+        },
+    ),
+    (
         "через 2 часа забрать посылку, а завтра позвонить маме",
         {
             "items": [
@@ -174,6 +208,10 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
         {"intent": "edit", "edit": {"when": {"text": "на следующей неделе", "period": "next_week"}}},
     ),
     (
+        'REPLYING TO ITEM {"id":5,"title":"Ремонт на кухне"} | разбей на шаги',
+        {"intent": "edit", "edit": {"action": "split"}},
+    ),
+    (
         "SRC photo | (cat meme with the text 'Код заработал с первого раза')",
         {
             "image": {"text": "Код заработал с первого раза", "description": "Мем с удивлённым котом"},
@@ -197,7 +235,8 @@ Never invent facts. Omit empty, null and default fields.
 
 INPUT lines: NOW, CAL (next 7 days), SRC (text | voice = transcript, may have errors | photo = image attached, \
 MSG is its caption | forward | link | other), FORWARDED FROM, LINKS (url: title), REPLYING TO ITEM, \
-CLARIFICATION (owner's answer to your question: apply it, don't ask again), MODE query, MSG.
+CLARIFICATION (owner's answer to your question: apply it, don't ask again), MODE query, RELATED CANDIDATES (earlier \
+items with similar words), MSG.
 
 INTENT: save (default) | query = asks about OWN saved data or schedule ("что у меня завтра?", \
 "какие идеи я сохранял?"); MODE query → always query | edit = changes an EXISTING item ("перенеси", "отмени", \
@@ -209,6 +248,10 @@ kind: task = something to do | event = meeting, appointment, something happening
 to buy | idea | note = thought, fact, diary | link = saved link/article | meme = humor, meme image | quote | other.
 title: short (max 120 chars), imperative for tasks, in the message language. details: extra info only \
 (max 600 chars). tags: 0-4 lowercase, no "#". conf: high|med|low.
+related: ids from RELATED CANDIDATES really about the same thing (same purchase, project, follow-up), max 3; a shared \
+word is not enough; usually omit. steps: only if the owner asks to plan it step by step (распиши по шагам, разбей на \
+шаги, чек-лист) or lists the stages of ONE task: 2-8 short steps in order {{title, when only if the message gives \
+that step a time}}; the item is the whole task.
 
 TIME: describe it, NEVER compute dates. when = {{text: verbatim phrase, day, time, in_min, at, period, role}}
 - day: +N days (+0 сегодня, +1 завтра, +2 послезавтра) | +Nw | +Nmo | +Ny | MO TU WE TH FR SA SU = nearest such day | \
@@ -243,8 +286,8 @@ range: today|tomorrow|yesterday|this_week|next_week|last_week|this_month|last_mo
 |YYYY-MM-DD..YYYY-MM-DD
 
 edit = {{target (which item, only without REPLYING TO ITEM), action: update|done|undone|delete|no_reminder\
-|stop_recurrence, title, kind, tags_add, tags_remove, when (the new time; if only the time changes, keep the \
-date of due_local as day YYYY-MM-DD), rrule, lead}}
+|stop_recurrence|split (разбей на шаги), title, kind, tags_add, tags_remove, when (the new time; if only the time \
+changes, keep the date of due_local as day YYYY-MM-DD), rrule, lead}}
 
 EXAMPLES (NOW 2026-10-06T14:05 Tue)
 {_render_examples()}
@@ -257,6 +300,18 @@ Use ONLY the rows given as JSON. Never invent items, dates or details. If the ro
 say so briefly.
 Reply in Russian, plain text (no HTML, no Markdown), at most 8 short lines. Dates in rows are local time; \
 write them like "пт 9 окт 15:00" or "завтра 10:00" relative to NOW.
+/no_think"""
+
+
+SPLIT_SYSTEM_PROMPT = """\
+Break ONE task of the owner of a personal tasks bot into 2-8 concrete steps in a sensible order. JSON only: \
+{"steps": [{"title": "...", "when": {...}}]}. Never invent facts.
+title: short imperative (max 80 chars) in the language of the task; every step needed to finish it, no filler \
+("подготовиться", "начать"). The owner's NOTE (e.g. "на 3 шага", "начни с документов") wins.
+when: only if TASK or NOTE gives that step a time, usually omit. NEVER compute dates: {"text": verbatim phrase, \
+"day": "+N" | "MO".."SU" | "dN" | "YYYY-MM-DD", "time": "HH:MM" | "morning" | "lunch" | "afternoon" | "evening" \
+| "after_work" | "night"}; use CAL.
+Nothing sensible to split → {"steps": []}.
 /no_think"""
 
 
@@ -286,8 +341,13 @@ def build_user_text(
     reply_item: dict | None = None,
     clarification: str | None = None,
     force_query: bool = False,
+    related: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Dynamic part of the extraction prompt: NOW, CAL, SRC, optional context lines, then MSG (always last)."""
+    """Dynamic part of the extraction prompt: NOW, CAL, SRC, optional context lines, then MSG (always last).
+
+    ``related``: earlier items with similar words (``{id, kind, title, date}``), one JSON line
+    ``RELATED CANDIDATES [...]``; the model may name some of them in ``items[].related``.
+    """
     local = now.astimezone(prefs.zone)
     lines = [now_line(now, prefs), calendar_line(local), f"SRC {source}"]
     if forward_from:
@@ -301,10 +361,26 @@ def build_user_text(
         lines.append(f"CLARIFICATION {_one_line(clarification)}")
     if force_query:
         lines.append("MODE query")
+    if related:
+        lines.append("RELATED CANDIDATES " + _compact_json(related))
     msg = (text or "").strip()[:MAX_MSG_CHARS]
     lines.append("MSG")
     lines.append(msg or "(empty)")
     return "\n".join(lines)
+
+
+def build_split_text(*, task: dict[str, Any], now: datetime, prefs: Prefs, note: str | None = None) -> str:
+    """User message of the "split" call: NOW, CAL, the owner's NOTE (their words, e.g. "разбей на 3 шага"), then
+    TASK (the item as JSON, always last)."""
+    lines = [now_line(now, prefs), calendar_line(now.astimezone(prefs.zone))]
+    if note and note.strip():
+        lines.append(f"NOTE {_one_line(note, 500)}")
+    lines.append("TASK " + _compact_json(task))
+    return "\n".join(lines)
+
+
+def _compact_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
 def build_answer_text(question: str, rows: list[dict], now: datetime, prefs: Prefs) -> str:

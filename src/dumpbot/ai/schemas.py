@@ -42,6 +42,8 @@ RANGE_RE = (
 
 MAX_LEAD_MINUTES = 43200  # 30 days
 MAX_ITEMS = 20  # the prompt asks to merge long shopping lists into one item well before this
+MAX_STEPS = 8  # steps of one checklist (docs/features/iteration-2.md §C2)
+MAX_RELATED = 3  # related earlier items per item (§C1)
 
 
 class _S(BaseModel):
@@ -91,6 +93,13 @@ class When(_S):
     role: Literal["event", "remind", "deadline"] = "event"
 
 
+class StepSpec(_S):
+    """One step of a checklist, in order: ``ExtractedItem.steps`` and the answer of the "split" call."""
+
+    title: str = Field(min_length=1, max_length=120)
+    when: When | None = Field(None, description="only if the message gives this step a time")
+
+
 class ExtractedItem(_S):
     kind: Kind
     title: str = Field(min_length=1, max_length=120)
@@ -100,8 +109,26 @@ class ExtractedItem(_S):
     rrule: str | None = Field(None, pattern=RRULE_RE)
     lead: list[int] | None = Field(None, max_length=3, description="minutes before the event")
     conf: Literal["high", "med", "low"] = "high"
+    related: list[int] = Field(
+        default_factory=list, max_length=MAX_RELATED, description="ids from RELATED CANDIDATES really about it"
+    )
+    steps: list[StepSpec] = Field(default_factory=list, max_length=MAX_STEPS, description="checklist, only if asked")
 
     _tags = field_validator("tags", mode="before")(_norm_tags)
+
+    @field_validator("related", mode="before")
+    @classmethod
+    def _related_ids(cls, v: Any) -> list[int]:
+        """Positive integer ids, unique; anything else (a title, null) is dropped instead of failing the message."""
+        out: list[int] = []
+        for x in v or []:
+            try:
+                n = int(x)
+            except (TypeError, ValueError):
+                continue
+            if n > 0 and n not in out and not isinstance(x, bool):
+                out.append(n)
+        return out
 
     @field_validator("lead")
     @classmethod
@@ -139,7 +166,7 @@ class EditPatch(_S):
     """A change to an existing item (reply to a bot card, or "перенеси встречу с Олегом на 16")."""
 
     target: str | None = Field(None, max_length=120, description="which item, when not replying to it")
-    action: Literal["update", "done", "undone", "delete", "no_reminder", "stop_recurrence"] = "update"
+    action: Literal["update", "done", "undone", "delete", "no_reminder", "stop_recurrence", "split"] = "update"
     title: str | None = Field(None, max_length=120)
     kind: Kind | None = None
     tags_add: list[str] = Field(default_factory=list, max_length=6)
@@ -155,6 +182,12 @@ class EditPatch(_S):
     @classmethod
     def _lead_range(cls, v: list[int] | None) -> list[int] | None:
         return ExtractedItem._lead_range(v)
+
+
+class SplitResult(_S):
+    """Answer of the "split" call (🪄 Разбить на шаги, "разбей на шаги"): the steps of one task, in order."""
+
+    steps: list[StepSpec] = Field(default_factory=list, max_length=MAX_STEPS)
 
 
 class ImageInfo(_S):
@@ -184,3 +217,8 @@ class Extraction(_S):
 def extraction_json_schema() -> dict[str, Any]:
     """JSON schema for ``response_format={"type": "json_schema", ...}``."""
     return Extraction.model_json_schema()
+
+
+def split_json_schema() -> dict[str, Any]:
+    """JSON schema of the "split" call's answer."""
+    return SplitResult.model_json_schema()

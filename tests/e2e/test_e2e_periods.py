@@ -68,7 +68,7 @@ async def test_this_week_card_digest_section_and_friday_reminder(e2e: Any) -> No
         "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00",
         "🏷 Задача · #raspberry_pi",
     ]
-    assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить"]
+    assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить", "🪄 Разбить на шаги"]
     item = await e2e.item("Посмотреть Raspberry Pi")
     assert (item.period_kind, item.period_start, item.period_end) == ("week", date(2026, 10, 5), date(2026, 10, 11))
     [occ] = await e2e.occurrences(item.id)
@@ -193,7 +193,7 @@ async def test_someday_lives_in_its_own_list_until_it_gets_a_week(e2e: Any) -> N
     message_id = e2e.tg.push_message("когда-нибудь выучить испанский")
     card = await e2e.card_for(message_id)
     assert card.text.split("\n")[1] == "🌙 когда-нибудь"
-    assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🗑 Удалить"]
+    assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🗑 Удалить", "🪄 Разбить на шаги"]
     item = await e2e.item("Выучить испанский")
     assert item.someday and await e2e.occurrences(item.id) == []
 

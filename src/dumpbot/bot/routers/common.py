@@ -1,4 +1,5 @@
-"""Helpers shared by the routers: card rendering, prompt restore, small text utilities."""
+"""Helpers shared by the routers: prompt restore, small text utilities (cards: ``bot.cards``, re-exported
+``card_view``)."""
 
 from __future__ import annotations
 
@@ -12,6 +13,7 @@ from aiogram.types import CallbackQuery, Message
 
 from dumpbot import clock
 from dumpbot.bot import sender, views
+from dumpbot.bot.cards import card_view  # the routers call it as common.card_view
 from dumpbot.bot.cbdata import ItemCb
 from dumpbot.bot.keyboards import button, markup
 from dumpbot.bot.states import ANSWER_TTL, PROMPT_TTL, EditStates, SettingsStates, expired
@@ -50,15 +52,6 @@ async def get_item(session: AsyncSession, item_id: int) -> Item:
     if item is None:
         raise items.NotFoundError(f"item {item_id} not found")
     return item
-
-
-async def card_view(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> View:
-    """Fresh card of an item: current occurrence and its pending reminders (deleted -> ``deleted_card``)."""
-    if item.status == "deleted":
-        return views.deleted_card(item)
-    occ = await items.current_occurrence(session, item.id)
-    reminders = await items.pending_reminders(session, occ.id) if occ is not None else []
-    return views.item_card(item, occ, reminders, prefs, now)
 
 
 def recurring_view(rows: Sequence[Row], prefs: Prefs, now: datetime) -> View:

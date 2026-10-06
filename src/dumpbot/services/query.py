@@ -7,6 +7,11 @@ Nothing here writes. Deleted items are always excluded. Search uses the persiste
 Fuzzy time (docs/features/iteration-2.md §A): an open item whose calendar period (week / month / season) contains
 the day is listed in ``Agenda.period_items`` instead of open / overdue; "когда-нибудь" items are only in
 ``someday_items``; a due-date query also finds items whose period overlaps its range.
+
+Checklists and related items (§C): a step shows in the top-level lists (/tasks, /recent, digests, queries) only
+when it has a time of its own, named after its parent ("(из «Переезд»)"); a parent row counts its steps ("2/5").
+``related_candidates`` finds earlier items with any word of a new message for the "RELATED CANDIDATES" prompt line;
+``card_extras`` loads what an item card shows besides the item (checklist, related items, parent).
 """
 
 from __future__ import annotations
@@ -18,17 +23,17 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
-from sqlalchemy import ColumnElement, DateTime, Select, and_, func, literal, literal_column, or_, select
+from sqlalchemy import ColumnElement, DateTime, Select, and_, exists, func, literal, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 from sqlalchemy.sql.selectable import Subquery
 
 from dumpbot.ai.schemas import QuerySpec
-from dumpbot.db.models import AiUsage, Item, Occurrence
+from dumpbot.db.models import AiUsage, Item, ItemLink, Occurrence
 from dumpbot.domain import recurrence, timeresolve
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
-from dumpbot.dto import Agenda, Row, UsageSummary
+from dumpbot.dto import Agenda, CardExtras, RelatedRef, Row, Step, UsageSummary
 from dumpbot.services.items import current_occurrence_order
 
 __all__ = [
@@ -36,11 +41,14 @@ __all__ = [
     "Row",
     "UsageSummary",
     "agenda",
+    "card_extras",
     "find_edit_candidates",
     "items_of_raw",
     "open_tasks",
     "recent",
     "recurring",
+    "related_candidates",
+    "related_refs",
     "rows_for_llm",
     "run_query",
     "search",
@@ -75,6 +83,10 @@ _RU = literal_column("'russian'::regconfig")
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
 _ACTIONABLE_KINDS: Final = tuple(sorted(ACTIONABLE))
 _CALENDAR_PERIODS: Final = tuple(sorted(CALENDAR_PERIODS))
+RELATED_DAYS: Final = 365  # related candidates are items saved within this many days
+RELATED_LIMIT: Final = 5
+_CANDIDATE_WORDS: Final = 30  # words of a message that go into the OR query
+_LEXEME_RE = re.compile(r"[^\W_]+", re.UNICODE)  # letters and digits only: safe in to_tsquery syntax
 
 
 # --- agenda / lists --------------------------------------------------------------------------------------------
@@ -152,7 +164,7 @@ async def open_tasks(session: AsyncSession, prefs: Prefs, now: datetime, limit: 
     occ = _occ_subquery(open_only=True)
     stmt = (
         _item_select(occ)
-        .where(Item.kind.in_(_ACTIONABLE_KINDS), Item.status == "open", Item.someday.is_(False))
+        .where(Item.kind.in_(_ACTIONABLE_KINDS), Item.status == "open", Item.someday.is_(False), _listed())
         .order_by(occ.c.due_at.asc().nulls_last(), Item.created_at.desc(), Item.id.desc())
         .limit(limit)
     )
@@ -164,7 +176,7 @@ async def someday_items(session: AsyncSession, limit: int = 50) -> list[Row]:
     occ = _occ_subquery(open_only=True)
     stmt = (
         _item_select(occ)
-        .where(Item.someday.is_(True), Item.status == "open")
+        .where(Item.someday.is_(True), Item.status == "open", _listed())
         .order_by(Item.created_at.desc(), Item.id.desc())
         .limit(limit)
     )
@@ -172,10 +184,13 @@ async def someday_items(session: AsyncSession, limit: int = 50) -> list[Row]:
 
 
 async def recent(session: AsyncSession, limit: int = 15) -> list[Row]:
-    """Latest saved items (by created_at), not deleted."""
+    """Latest saved items (by created_at), not deleted (steps only with a time of their own)."""
     occ = _occ_subquery(open_only=False)
     stmt = (
-        _item_select(occ).where(Item.status != "deleted").order_by(Item.created_at.desc(), Item.id.desc()).limit(limit)
+        _item_select(occ)
+        .where(Item.status != "deleted", _listed())
+        .order_by(Item.created_at.desc(), Item.id.desc())
+        .limit(limit)
     )
     return await _item_rows(session, stmt)
 
@@ -193,12 +208,131 @@ async def recurring(session: AsyncSession) -> list[Row]:
 
 async def items_of_raw(session: AsyncSession, raw_ids: Sequence[int]) -> list[Row]:
     """Not deleted items saved from these raw messages (a message or the parts of an album), oldest first, with
-    their current occurrence."""
+    their current occurrence. Steps of a checklist are not counted: a reply to the message edits the task."""
     if not raw_ids:
         return []
     occ = _occ_subquery(open_only=False)
-    stmt = _item_select(occ).where(Item.raw_message_id.in_(list(raw_ids)), Item.status != "deleted").order_by(Item.id)
+    stmt = (
+        _item_select(occ)
+        .where(Item.raw_message_id.in_(list(raw_ids)), Item.status != "deleted", Item.parent_id.is_(None))
+        .order_by(Item.id)
+    )
     return await _item_rows(session, stmt)
+
+
+# --- related items and checklists ------------------------------------------------------------------------------
+
+
+async def related_candidates(
+    session: AsyncSession, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (), limit: int = RELATED_LIMIT
+) -> list[Row]:
+    """Earlier items that share a word with ``text`` (§C1, for the "RELATED CANDIDATES" line): full text with an OR
+    of its lexemes (``to_tsquery('russian', 'a | b | …')``), best ``ts_rank`` first, then newest. Not deleted,
+    top-level, saved in the last ``RELATED_DAYS`` days, not from ``exclude_raw_ids`` (the message itself)."""
+    words = _candidate_words(text)
+    if not words:
+        return []
+    tsq = func.to_tsquery(_RU, " | ".join(words))
+    cutoff = _utc(now) - timedelta(days=RELATED_DAYS)
+    stmt = _item_select(_occ_subquery(open_only=False)).where(
+        Item.status != "deleted",
+        Item.parent_id.is_(None),
+        Item.created_at >= cutoff,
+        Item.search_tsv.op("@@", is_comparison=True)(tsq),
+    )
+    if exclude_raw_ids:
+        stmt = stmt.where(or_(Item.raw_message_id.is_(None), Item.raw_message_id.not_in(list(exclude_raw_ids))))
+    stmt = stmt.order_by(func.ts_rank(Item.search_tsv, tsq).desc(), Item.created_at.desc(), Item.id.desc())
+    return await _item_rows(session, stmt.limit(limit))
+
+
+def _candidate_words(text: str) -> list[str]:
+    """Unique words of the message for the OR query: letters/digits only (no tsquery operators), no bare numbers
+    ("в 15:00" must not match every item with a 15), at most ``_CANDIDATE_WORDS``."""
+    words = dict.fromkeys(w.lower() for w in _LEXEME_RE.findall(text or ""))
+    return [w for w in words if len(w) > 1 and not w.isdigit()][:_CANDIDATE_WORDS]
+
+
+async def related_refs(session: AsyncSession, item_id: int) -> list[RelatedRef]:
+    """Items linked to this one in either direction (``item_links``), not deleted, newest first."""
+    linked = or_(
+        and_(ItemLink.item_id == item_id, ItemLink.related_id == Item.id),
+        and_(ItemLink.related_id == item_id, ItemLink.item_id == Item.id),
+    )
+    stmt = (
+        select(Item.id, Item.kind, Item.title, Item.created_at)
+        .join(ItemLink, linked)
+        .where(Item.status != "deleted", Item.id != item_id)
+        .distinct()
+        .order_by(Item.created_at.desc(), Item.id.desc())
+    )
+    rows = (await session.execute(stmt)).all()
+    return [RelatedRef(item_id=i, kind=kind, title=title, created_at=created) for i, kind, title, created in rows]
+
+
+async def card_extras(session: AsyncSession, item: Item) -> CardExtras:
+    """What the item's card shows besides the item: its checklist (a top-level item), the related items, the title
+    of its parent (a step)."""
+    steps = await _steps(session, item.id) if item.parent_id is None else []
+    parent_title = None
+    if item.parent_id is not None:
+        parent_title = await session.scalar(select(Item.title).where(Item.id == item.parent_id))
+    related = await related_refs(session, item.id)
+    return CardExtras(steps=tuple(steps), related=tuple(related), parent_title=parent_title)
+
+
+async def _steps(session: AsyncSession, parent_id: int) -> list[Step]:
+    """Not deleted steps in order, numbered 1..n, with the due of their current occurrence (not a cancelled one)."""
+    occ = _occ_subquery(open_only=False)
+    stmt = (
+        select(Item.id, Item.title, Item.status, occ.c.due_at, occ.c.precision, occ.c.occ_status)
+        .outerjoin(occ, occ.c.item_id == Item.id)
+        .where(Item.parent_id == parent_id, Item.status != "deleted")
+        .order_by(Item.position.asc().nulls_last(), Item.id)
+    )
+    out: list[Step] = []
+    for n, (step_id, title, status, due_at, precision, occ_status) in enumerate((await session.execute(stmt)).all(), 1):
+        timed = due_at is not None and occ_status != "cancelled"
+        out.append(
+            Step(
+                item_id=step_id,
+                position=n,
+                title=title,
+                done=status == "done",
+                due_at=due_at if timed else None,
+                precision=precision if timed else None,
+            )
+        )
+    return out
+
+
+def _listed() -> ColumnElement[bool]:
+    """Top-level lists show a step only when it has a time of its own; the others live in the parent's card."""
+    timed = exists().where(Occurrence.item_id == Item.id, Occurrence.status != "cancelled")
+    return or_(Item.parent_id.is_(None), timed)
+
+
+async def _with_family(session: AsyncSession, rows: list[Row]) -> list[Row]:
+    """Fill ``parent_title`` of steps and ``steps_done/steps_total`` of parents (two small queries)."""
+    parent_ids = {r.parent_id for r in rows if r.parent_id is not None}
+    if parent_ids:
+        result = await session.execute(select(Item.id, Item.title).where(Item.id.in_(parent_ids)))
+        titles = {item_id: title for item_id, title in result.tuples()}
+        for row in rows:
+            if row.parent_id is not None:
+                row.parent_title = titles.get(row.parent_id)
+    top_ids = {r.item_id for r in rows if r.parent_id is None}
+    if top_ids:
+        stmt = (
+            select(Item.parent_id, func.count(), func.count().filter(Item.status == "done"))
+            .where(Item.parent_id.in_(top_ids), Item.status != "deleted")
+            .group_by(Item.parent_id)
+        )
+        progress = {pid: (int(done), int(total)) for pid, total, done in (await session.execute(stmt)).tuples()}
+        for row in rows:
+            if row.item_id in progress:
+                row.steps_done, row.steps_total = progress[row.item_id]
+    return rows
 
 
 # --- search ----------------------------------------------------------------------------------------------------
@@ -294,7 +428,7 @@ async def run_query(session: AsyncSession, spec: QuerySpec, prefs: Prefs, now: d
         return await _run_due_query(session, spec, conds, window, prefs)
 
     occ = _occ_subquery(open_only=False)
-    stmt = _item_select(occ).where(*conds)
+    stmt = _item_select(occ).where(*conds, _listed())
     if window is not None:  # date_field == "created"
         stmt = stmt.where(Item.created_at >= window[0], Item.created_at < window[1])
     if spec.status != "any":
@@ -392,6 +526,10 @@ def rows_for_llm(rows: Sequence[Row], prefs: Prefs) -> list[dict[str, Any]]:
             entry["someday"] = True
         elif row.period_start is not None and row.period_end is not None:
             entry["period"] = f"{row.period_start.isoformat()}..{row.period_end.isoformat()}"
+        if row.parent_title:
+            entry["step_of"] = row.parent_title
+        if row.steps_total:
+            entry["steps_done"] = f"{row.steps_done}/{row.steps_total}"
         entry["created"] = row.created_at.astimezone(tz).strftime(_LOCAL_FMT)
         if row.snippet:
             entry["snippet"] = row.snippet
@@ -412,6 +550,7 @@ def _occ_subquery(*, open_only: bool) -> Subquery:
         Occurrence.id.label("occ_id"),
         Occurrence.due_at.label("due_at"),
         Occurrence.status.label("occ_status"),
+        Occurrence.precision.label("precision"),
     ).distinct(Occurrence.item_id)
     if open_only:
         stmt = stmt.where(Occurrence.status == "open").order_by(Occurrence.item_id, Occurrence.due_at, Occurrence.id)
@@ -430,10 +569,11 @@ def _item_select(occ: Subquery) -> Select[Any]:
 
 async def _item_rows(session: AsyncSession, stmt: Select[Any]) -> list[Row]:
     result = await session.execute(stmt)
-    return [
+    rows = [
         _row(item, occurrence_id=occ_id, due_at=due_at, occ_status=occ_status)
         for item, occ_id, due_at, occ_status in result.all()
     ]
+    return await _with_family(session, rows)
 
 
 async def _occ_rows(
@@ -453,7 +593,8 @@ async def _occ_rows(
     if limit is not None:
         stmt = stmt.limit(limit)
     result = await session.execute(stmt)
-    return [_row(item, occurrence_id=occ.id, due_at=occ.due_at, occ_status=occ.status) for item, occ in result.all()]
+    rows = [_row(item, occurrence_id=occ.id, due_at=occ.due_at, occ_status=occ.status) for item, occ in result.all()]
+    return await _with_family(session, rows)
 
 
 def _row(item: Item, *, occurrence_id: int | None, due_at: datetime | None, occ_status: str | None) -> Row:
@@ -474,6 +615,7 @@ def _row(item: Item, *, occurrence_id: int | None, due_at: datetime | None, occ_
         period_start=item.period_start,
         period_end=item.period_end,
         someday=bool(item.someday),
+        parent_id=item.parent_id,
     )
 
 
