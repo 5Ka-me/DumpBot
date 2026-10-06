@@ -1,6 +1,7 @@
 # Dump Bot: PostgreSQL + one-shot migrations + the bot (long polling, no inbound ports).
 #   docker compose up -d --build      # build, migrate, start
 #   docker compose logs -f bot        # logs
+#   docker compose --profile whisper up -d --build   # + the optional local Whisper (LOCAL_STT_URL, README.md)
 # Secrets and settings come from .env (copy .env.example). Postgres is reachable from the host only on 127.0.0.1.
 
 name: dumpbot
@@ -83,5 +84,38 @@ services:
       retries: 3
       start_period: 90s
 
+  # Optional local speech-to-text (faster-whisper on the CPU), docs/features/iteration-2.md, B. Started only with
+  # "--profile whisper"; the bot uses it when .env has LOCAL_STT_URL=http://whisper:9000. Not published on the host:
+  # only the bot reaches it, over the compose network.
+  whisper:
+    profiles: ["whisper"]
+    build:
+      context: ./whisper
+    image: dumpbot-whisper:local
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_THREADS: ${WHISPER_THREADS:-0}
+      WHISPER_BEAM_SIZE: ${WHISPER_BEAM_SIZE:-1}
+      WHISPER_MAX_AUDIO_S: ${WHISPER_MAX_AUDIO_S:-120}
+    volumes:
+      # The model is downloaded here on the first request (once) and read from here afterwards, without network.
+      - whisper-models:/models
+    # small int8 needs about 1 GB while it works; medium needs WHISPER_MEM_LIMIT=4g.
+    mem_limit: ${WHISPER_MEM_LIMIT:-2g}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/health', timeout=5)"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 10s
+    logging: *logging
+
 volumes:
   pgdata:
+  whisper-models:
