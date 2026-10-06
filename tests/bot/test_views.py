@@ -597,6 +597,7 @@ def test_help_text_lists_all_commands(check_view):
     for command in ("/today", "/tasks", "/recent", "/search", "/ask", "/recurring", "/settings", "/usage", "/help"):
         assert f"\n{command} " in text
     assert "«?»" in text and "reply" in text
+    assert "аудиофайлы (до 5 мин)" in text and "кружочки сохраняю без распознавания" in text
 
 
 # --- settings ----------------------------------------------------------------------------------------------------
@@ -622,7 +623,7 @@ def test_settings_menu_shows_all_values(check_view, buttons):
         "Тихие часы: 23:00–08:00 (выкл)",
         "утро 09:00 (вкл), вечер 21:00 (выкл)",
         "Бюджет: $7.50 в месяц",
-        "Язык голосовых: English",
+        "Голос: язык English, распознавание авто",
         "новых напоминаний",
     ):
         assert expected in text
@@ -661,7 +662,35 @@ def test_settings_marks_current_values(check_view, buttons):
     assert ("🔕 Включить тихие часы", "s:quiet_toggle:") in buttons(views.settings_quiet_menu(prefs)[1])
     auto = Prefs()
     assert ("✓ Авто", "s:stt:auto") in buttons(views.settings_stt_menu(auto)[1])
+    assert ("✓ 🔀 Авто: chutes, при сбое — локальный", "s:stt_mode:auto") in buttons(views.settings_stt_menu(auto)[1])
     assert ("✓ 5 мин", "s:lead:5") not in buttons(views.settings_lead_menu(prefs)[1])
+
+
+@pytest.mark.parametrize("local_stt", [True, False])
+def test_settings_voice_menu_language_and_mode(local_stt, check_view, buttons):
+    prefs = Prefs(stt_language="en", stt_mode="local")
+    text, kb = check_view(views.settings_view("stt", prefs, local_stt=local_stt))
+    assert text.startswith("🎙 <b>Голос</b>\nЯзык: English\nРаспознавание: локальный")
+    assert "кружочки — нет" in text and "до 5 минут" in text
+    assert ("LOCAL_STT_URL пуст" in text) is not local_stt
+    note = "" if local_stt else " (не настроен)"
+    assert buttons(kb) == [
+        ("Авто", "s:stt:auto"),
+        ("Русский", "s:stt:ru"),
+        ("✓ English", "s:stt:en"),
+        ("🔀 Авто: chutes, при сбое — локальный", "s:stt_mode:auto"),
+        (f"✓ 💻 Локальный, при сбое — chutes{note}", "s:stt_mode:local"),
+        ("☁️ Только chutes", "s:stt_mode:chutes"),
+        ("← Назад", "s:menu:main"),
+    ]
+    # One mode per row: the long labels are not cut on a phone screen.
+    assert [len(row) for row in kb.inline_keyboard] == [3, 1, 1, 1, 1]
+
+
+def test_settings_voice_menu_marks_chutes_only(buttons):
+    _, kb = views.settings_stt_menu(Prefs(stt_mode="chutes"), local_stt=True)
+    assert ("✓ ☁️ Только chutes", "s:stt_mode:chutes") in buttons(kb)
+    assert "распознавание только chutes" in views.settings_menu(Prefs(stt_mode="chutes"))[0]
 
 
 def test_settings_digest_toggles(check_view, buttons):
@@ -711,6 +740,7 @@ def test_every_emitted_set_callback_is_documented(buttons):
     emitted: set[tuple[str, str]] = set()
     for prefs in variants:
         views_to_check = [fn(prefs) for fn in views.SETTINGS_MENUS.values()]
+        views_to_check.append(views.settings_view("stt", prefs, local_stt=True))
         views_to_check += [views.settings_ask(f, prefs) for f in views.ASK_FIELDS]
         for _, kb in views_to_check:
             emitted |= {(cb.key, cb.v) for cb in (SetCb.unpack(data) for _, data in buttons(kb))}
@@ -733,6 +763,7 @@ def test_every_emitted_set_callback_is_documented(buttons):
         "quiet_toggle",
         "digest_toggle",
         "stt",
+        "stt_mode",
         "budget",
         "ask",
     }

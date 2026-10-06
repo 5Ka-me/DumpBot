@@ -55,7 +55,9 @@ def main() -> None:
     logging_setup.setup()
     settings = load_settings()
     logging_setup.setup(settings.log_level)
-    log.info("starting (owner %s)", settings.owner_id or "not set")
+    log.info(
+        "starting (owner %s, local Whisper %s)", settings.owner_id or "not set", settings.local_stt_url.strip() or "off"
+    )
     try:
         asyncio.run(run(settings))
     except KeyboardInterrupt:  # Ctrl+C on Windows (no signal handlers there); shutdown has already run

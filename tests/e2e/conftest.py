@@ -3,7 +3,8 @@
 The app is built exactly like ``python -m dumpbot`` builds it (``bot.app.build_app`` + ``__main__.poll``): long
 polling, OwnerOnly, routers, capture, the job worker, processor, the chutes client, STT, sender and views. Only the
 endpoints differ: ``AiohttpSession(api=TelegramAPIServer.from_base(<fake>))`` for Telegram and ``chutes_base_url`` /
-``stt_url`` pointing at the fake chutes server. Nothing leaves 127.0.0.1.
+``stt_url`` pointing at the fake chutes server, which also plays the local Whisper service (``/local/transcribe``;
+``LOCAL_STT_URL`` is set only when a test module overrides the ``local_whisper`` fixture). Nothing leaves 127.0.0.1.
 
 Time is frozen (``dumpbot.clock.utcnow`` is monkeypatched). The job worker runs in the background for real; the
 scheduler loop is not started — tests call ``Scheduler.tick(now)`` directly, so reminders and digests fire exactly
@@ -463,7 +464,8 @@ Script = dict[str, Any] | Callable[[ChatRequest], dict[str, Any]]
 @dataclass
 class FakeChutes:
     """chat/completions answers with the extraction scripted for the prompt's MSG text (``script``), or a prose
-    ``answer`` for answer_query prompts. ``outage`` (an HTTP status) makes every chat/STT call fail."""
+    ``answer`` for answer_query prompts. ``outage`` (an HTTP status) makes every chat/STT call fail, ``stt_outage``
+    only the STT chute. ``/local/transcribe`` is the local Whisper service (no key, ``local_transcripts``)."""
 
     scripts: dict[str, Script] = field(default_factory=dict)
     pages: dict[str, str] = field(default_factory=dict)  # /pages/{name} -> HTML (for link titles)
@@ -471,6 +473,9 @@ class FakeChutes:
     transcripts: dict[bytes, str] = field(default_factory=dict)
     answer: str = "Сегодня ничего важного."
     outage: int | None = None
+    stt_outage: int | None = None
+    local_transcripts: dict[bytes, str] = field(default_factory=dict)
+    local_requests: list[dict[str, Any]] = field(default_factory=list)
     chat_requests: list[ChatRequest] = field(default_factory=list)
     stt_requests: list[dict[str, Any]] = field(default_factory=list)
     failed_calls: int = 0
@@ -482,6 +487,7 @@ class FakeChutes:
         app.router.add_post("/v1/chat/completions", self._chat)
         app.router.add_get("/v1/models", self._models)
         app.router.add_post("/stt/whisper", self._stt)
+        app.router.add_post("/local/transcribe", self._local_stt)
         app.router.add_get("/pages/{name}", self._page)
         return app
 
@@ -551,11 +557,28 @@ class FakeChutes:
             return web.Response(status=401, text="Invalid token")
         body = await request.json()
         self.stt_requests.append(body)
-        if self.outage is not None:
+        outage = self.outage or self.stt_outage
+        if outage is not None:
             self.failed_calls += 1
-            return web.Response(status=self.outage, text="No instances available")
+            return web.Response(status=outage, text="No instances available")
         audio = base64.b64decode(body["audio_b64"])
         return web.json_response({"text": self.transcripts.get(audio, "")})
+
+    async def _local_stt(self, request: web.Request) -> web.Response:
+        # The local service has no key: the chutes key must never be sent there.
+        self.bad_auth += request.headers.get("Authorization") is not None
+        body = await request.json()
+        self.local_requests.append(body)
+        audio = base64.b64decode(body["audio_b64"])
+        return web.json_response(
+            {
+                "text": self.local_transcripts.get(audio, ""),
+                "language": body.get("language") or "ru",
+                "duration": 3.0,
+                "processing_ms": 850,
+                "model": "small",
+            }
+        )
 
 
 # --- the running application -------------------------------------------------------------------------------------
@@ -664,7 +687,7 @@ def frozen(monkeypatch: pytest.MonkeyPatch) -> FrozenClock:
     return fc
 
 
-def make_settings(db_url: str, tg_url: str, ai_url: str, heartbeat: Path) -> Settings:
+def make_settings(db_url: str, tg_url: str, ai_url: str, heartbeat: Path, *, local_whisper: bool = False) -> Settings:
     return Settings(
         _env_file=None,  # type: ignore[call-arg]
         bot_token=TOKEN,
@@ -676,6 +699,7 @@ def make_settings(db_url: str, tg_url: str, ai_url: str, heartbeat: Path) -> Set
         llm_fallback_model=FALLBACK,
         vision_fallback_model=VISION_FALLBACK,
         stt_url=f"{ai_url}/stt/whisper",
+        local_stt_url=f"{ai_url}/local" if local_whisper else "",
         default_tz="Europe/Warsaw",
         heartbeat_file=str(heartbeat),
         scheduler_interval_s=30.0,
@@ -683,7 +707,15 @@ def make_settings(db_url: str, tg_url: str, ai_url: str, heartbeat: Path) -> Set
 
 
 @pytest.fixture
-async def e2e(engine: AsyncEngine, db_url: str, frozen: FrozenClock, tmp_path: Path) -> AsyncIterator[E2E]:
+def local_whisper() -> bool:
+    """Whether LOCAL_STT_URL points at the fake local Whisper; a test module overrides this fixture to turn it on."""
+    return False
+
+
+@pytest.fixture
+async def e2e(
+    engine: AsyncEngine, db_url: str, frozen: FrozenClock, tmp_path: Path, local_whisper: bool
+) -> AsyncIterator[E2E]:
     """Fake servers up, the app polling them; on teardown polling stops and the app shuts down cleanly.
 
     ``engine`` (tests/conftest.py) is requested so the tables are truncated after the test.
@@ -696,7 +728,7 @@ async def e2e(engine: AsyncEngine, db_url: str, frozen: FrozenClock, tmp_path: P
     tg_url = str(tg_server.make_url("")).rstrip("/")
     ai_url = str(ai_server.make_url("")).rstrip("/")
 
-    settings = make_settings(db_url, tg_url, ai_url, tmp_path / "heartbeat")
+    settings = make_settings(db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper)
     exits: list[int] = []
     bot_session = AiohttpSession(api=TelegramAPIServer.from_base(tg_url))
     app = await build_app(settings, bot_session=bot_session, runners=worker_only, exit_func=exits.append)

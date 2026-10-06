@@ -359,7 +359,8 @@ async def test_build_app_and_cleanup(settings_factory, tg) -> None:
     assert app.ctx.settings is settings
     assert app.dp.startup.handlers and app.dp.shutdown.handlers
     http = app.ctx.ai._http  # the shared session
-    assert http is app.ctx.stt._http and not http.closed
+    assert http is app.ctx.stt._backends["chutes"]._http and not http.closed
+    assert not app.ctx.stt.local_configured  # LOCAL_STT_URL is empty
 
     await app.dp.emit_startup(bot=app.bot)
     await _settle()
@@ -367,3 +368,19 @@ async def test_build_app_and_cleanup(settings_factory, tg) -> None:
     assert http.closed and tg.closed
     await app.cleanup()  # second close (main's finally) is a no-op
     assert sorted(runners.cancelled) == ["jobs", "scheduler"]
+
+
+async def test_build_app_with_the_local_whisper(settings_factory, tg) -> None:
+    settings = settings_factory(
+        database_url="postgresql+asyncpg://nobody:x@127.0.0.1:1/none", local_stt_url="http://whisper:9000"
+    )
+    app = await build_app(settings, bot_session=tg, runners=Runners(), exit_func=lambda code: None)
+    try:
+        stt = app.ctx.stt
+        assert stt.local_configured
+        assert stt.order("auto") == ["chutes", "local"] and stt.order("local") == ["local", "chutes"]
+        local = stt._backends["local"]
+        assert local._url == "http://whisper:9000/transcribe"
+        assert local._http is app.ctx.ai._http  # the shared session, closed once by cleanup
+    finally:
+        await app.cleanup()

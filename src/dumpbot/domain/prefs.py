@@ -6,12 +6,14 @@ Adding a field with a default needs no DB migration: old rows simply get the def
 from __future__ import annotations
 
 from datetime import time
-from typing import Literal
+from typing import Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 SlotName = Literal["morning", "lunch", "afternoon", "evening", "after_work", "night"]
+SttMode = Literal["auto", "local", "chutes"]
+STT_MODES: tuple[str, ...] = get_args(SttMode)
 SLOT_NAMES: tuple[str, ...] = ("morning", "lunch", "afternoon", "evening", "after_work", "night")
 
 SLOT_LABELS: dict[str, str] = {
@@ -55,6 +57,9 @@ class Prefs(BaseModel):
 
     budget_usd: float = Field(5.0, ge=0)
     stt_language: Literal["ru", "en"] | None = None  # None = auto-detect
+    # Speech-to-text: auto = chutes, the local Whisper when chutes fails; local = the reverse; chutes = chutes only.
+    # Without LOCAL_STT_URL every mode works as "chutes".
+    stt_mode: SttMode = "auto"
 
     missed_grace_minutes: int = Field(360, ge=1)  # older due reminders are marked missed, not sent
 

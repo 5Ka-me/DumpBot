@@ -1,5 +1,6 @@
 """Local fakes for the AI tests: an aiohttp server mimicking chutes.ai (/v1/chat/completions, /v1/models),
-the AudioDojo STT chute (/stt/whisper) and arbitrary web pages (/pages/{name}) for link titles.
+the AudioDojo STT chute (/stt/whisper), the local Whisper service (/local/transcribe) and arbitrary web pages
+(/pages/{name}) for link titles.
 
 Test files cannot import each other (``--import-mode=importlib``), so helpers live on the ``FakeChutes`` object
 and in fixtures.
@@ -73,6 +74,9 @@ class FakeChutes:
         self.stt_queue: list[Reply] = []
         self.stt_requests: list[dict] = []
         self.stt_auth: list[str | None] = []
+        self.local_queue: list[Reply] = []
+        self.local_requests: list[dict] = []
+        self.local_auth: list[str | None] = []
         self.pages: dict[str, Reply] = {}
         self.page_hits: list[str] = []
 
@@ -132,6 +136,21 @@ class FakeChutes:
     def stt_raw(self, body: Any, status: int = 200) -> None:
         self.stt_queue.append(Reply(status=status, body=body))
 
+    def local_ok(self, text: str, *, duration: float = 3.5, model: str = "small", delay: float = 0.0) -> None:
+        body = {"text": text, "language": "ru", "duration": duration, "processing_ms": 420, "model": model}
+        self.local_queue.append(Reply(body=body, delay=delay))
+
+    def local_error(self, status: int, body: Any = "error") -> None:
+        self.local_queue.append(Reply(status=status, body=body))
+
+    def local_raw(self, body: Any, status: int = 200) -> None:
+        self.local_queue.append(Reply(status=status, body=body))
+
+    @property
+    def local_url(self) -> str:
+        """``LOCAL_STT_URL`` of the fake local Whisper."""
+        return f"{self.base}/local"
+
     def page(self, name: str, body: str | bytes, **kwargs: Any) -> str:
         """Serve ``body`` at /pages/{name}; returns the absolute URL."""
         kwargs.setdefault("content_type", "text/html")
@@ -152,6 +171,7 @@ class FakeChutes:
         app.router.add_post("/v1/chat/completions", self._chat)
         app.router.add_get("/v1/models", self._models)
         app.router.add_post("/stt/whisper", self._stt)
+        app.router.add_post("/local/transcribe", self._local)
         app.router.add_get("/pages/{name}", self._page)
         return app
 
@@ -170,6 +190,12 @@ class FakeChutes:
         self.stt_requests.append(await request.json())
         self.stt_auth.append(request.headers.get("Authorization"))
         reply = self.stt_queue.pop(0) if self.stt_queue else Reply(status=418, body="no scripted reply")
+        return await _respond(reply)
+
+    async def _local(self, request: web.Request) -> web.StreamResponse:
+        self.local_requests.append(await request.json())
+        self.local_auth.append(request.headers.get("Authorization"))
+        reply = self.local_queue.pop(0) if self.local_queue else Reply(status=418, body="no scripted reply")
         return await _respond(reply)
 
     async def _page(self, request: web.Request) -> web.StreamResponse:

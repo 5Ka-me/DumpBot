@@ -2,12 +2,14 @@
 
 Pipeline of a message (an album is processed as one message, attached to its first part):
 1. load the raw message(s) (done/ignored -> nothing to do) and prefs; "now" is the message date;
-2. media without any text (stickers, videos, …) -> one "other" item without AI, reaction 👌;
-3. budget: exhausted -> ✍, raw ``deferred``, notice once a month, ``RetryLater(next month after its quiet hours,
+2. media without any text (stickers, videos, video notes…) -> one "other" item without AI, reaction 👌;
+3. content: voice notes and audio files (forwarded ones too) up to ``stt_max_duration_s`` -> download -> STT routed
+   by ``Prefs.stt_mode`` (chutes / the local Whisper; the transcript is committed at once, so a retry does not pay
+   again); pictures up to ``MAX_IMAGE_BYTES`` (``MAX_REQUEST_IMAGE_BYTES`` together) -> download (the bytes are never
+   stored); links -> page titles (no AI); nothing to read (a silent voice note) -> saved without AI;
+4. budget, checked right before each paid call (chutes STT, ``extract()``), never before the free local Whisper:
+   exhausted -> ✍, raw ``deferred``, notice once a month, ``RetryLater(next month after its quiet hours,
    count_attempt=False)``; >= 80 % -> notice once a month;
-4. content: voice/audio up to ``stt_max_duration_s`` -> download -> STT (the transcript is committed at once, so a
-   retry does not pay again); pictures up to ``MAX_IMAGE_BYTES`` (``MAX_REQUEST_IMAGE_BYTES`` together) -> download
-   (the bytes are never stored); links -> page titles (no AI);
 5. ``extract()`` -> save (items, cards, 👌 / clarifying question 🤔), query (list or prose answer) or edit;
 6. raw ``done``, scheduler woken.
 
@@ -192,11 +194,11 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     if raw.status == "done" and raw.reply_item_id == item_id:  # answered as a "?" query on an earlier run
         return
     prefs = await _prefs(ctx)
-    await _check_budget(ctx, prefs, [raw])
     now = _msg_now(raw)
     try:
         # A picked candidate re-reads an already processed message: reuse its OCR text instead of the pictures.
         content = await _gather(ctx, [raw], prefs, with_images=not raw.image_text)
+        await _check_budget(ctx, prefs, [raw])
         async with ctx.sessionmaker() as session:
             snapshot = await items_svc.item_snapshot(session, item_id, prefs, now)
         out = await _extract(ctx, prefs, _extract_input(content, raw, prefs, reply_item=snapshot))
@@ -334,7 +336,6 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
     if not replace and not any(_needs_ai(r) for r in raws):
         await _save_without_ai(ctx, raws, prefs)
         return
-    await _check_budget(ctx, prefs, raws)
     content: _Content | None = None
     try:
         # A clarification reuses the stored OCR text instead of paying for the pictures again.
@@ -342,6 +343,7 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
         if content.empty and not replace:
             await _save_without_ai(ctx, raws, prefs)
             return
+        await _check_budget(ctx, prefs, raws)
         out = await _extract(ctx, prefs, _extract_input(content, primary, prefs, clarification=clarification))
         await _dispatch(ctx, raws, content, out, prefs, replace=replace)
     except AIUnavailable:
@@ -696,7 +698,7 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
         urls.extend(u for u in raw.urls or [] if u not in urls)
         origin = origin or raw.forward_origin
         if raw.content_type in VOICE_TYPES:
-            transcript = await _transcript(ctx, raw, prefs)
+            transcript = await _transcript(ctx, raw, prefs, raws)
             if transcript:
                 texts.append(transcript)
         elif raw.content_type in IMAGE_TYPES and with_images and len(images) < MAX_IMAGES:
@@ -721,11 +723,13 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
     )
 
 
-async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs) -> str:
+async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list[RawMessage]) -> str:
     """Stored transcript, or download + STT and commit it right away (a retry must not pay twice).
 
-    Audio longer than ``stt_max_duration_s`` is not transcribed (STT is billed per GPU second and a long file can
-    outlast the STT timeout): it is saved by its caption, or as «Аудио: name».
+    STT goes to chutes and / or the local Whisper in the order of ``prefs.stt_mode``; the budget is checked only
+    before chutes (paid; exhausted -> ``raws`` deferred, ``RetryLater``), the local Whisper is free.
+    Audio longer than ``stt_max_duration_s`` is not transcribed by either (chutes bills GPU seconds, and a long file
+    outlasts the timeouts): it is saved by its caption, or as «Аудио: name» / «Голосовое сообщение».
     """
     if raw.transcript is not None:
         return raw.transcript
@@ -735,7 +739,14 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs) -> str:
     audio = await _download(ctx, raw)
     if audio is None:
         return ""
-    text = (await ctx.stt.transcribe(audio, mime_type=raw.mime_type, language=prefs.stt_language)).strip()
+
+    async def before_paid() -> None:
+        await _check_budget(ctx, prefs, raws)
+
+    text = await ctx.stt.transcribe(
+        audio, mime_type=raw.mime_type, language=prefs.stt_language, mode=prefs.stt_mode, before_paid=before_paid
+    )
+    text = text.strip()
     async with ctx.sessionmaker() as session:
         await session.execute(update(RawMessage).where(RawMessage.id == raw.id).values(transcript=text))
         await session.commit()

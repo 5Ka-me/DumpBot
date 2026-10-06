@@ -2,6 +2,8 @@
 
 Документ — источник правды для реализации. Требования: [requirements.md](requirements.md).
 Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
+Итерация 2 (размытые сроки, локальный Whisper, связи и подзадачи, Mini App): [features/iteration-2.md](features/iteration-2.md)
+— там изменения и дополнения к контрактам ниже.
 
 ## 1. Общая схема
 
@@ -14,7 +16,8 @@ Telegram ──long polling──► aiogram Dispatcher
                               │
            JobWorker (asyncio task) ◄── jobs table (FOR UPDATE SKIP LOCKED, backoff, RetryLater)
               handle_message / handle_album / handle_edit / handle_clarify   (services/processor.py)
-                 голос → STT (chutes Whisper chute) ; фото → vision в том же вызове LLM ; ссылки → заголовки
+                 голос/аудио → STT (RoutedSTT: chutes Whisper и/или локальный Whisper по Prefs.stt_mode) ;
+                 фото → vision в том же вызове LLM ; ссылки → заголовки
                  → ai.extract() (structured output) → services.items.create_items() / query / apply_patch
                  → bot.views.* + bot.sender.send() → карточки, реакции 👌/✍/🤔
                               │
@@ -30,7 +33,9 @@ Telegram ──long polling──► aiogram Dispatcher
 (await без ответа, заблокированный event loop) ловит watchdog-поток (`watchdog.py`): цикл, который дольше своего лимита
 не отметился в `ctx.watchdog`, → лог + `os._exit(1)`. Все запросы к БД ограничены `command_timeout` (60 с).
 
-Контейнеры: `db` (postgres:18), `migrate` (alembic upgrade head, one-shot), `bot`.
+Контейнеры: `db` (postgres:18), `migrate` (alembic upgrade head, one-shot), `bot`; необязательный `whisper`
+(compose profile `whisper`, `whisper/app.py`: faster-whisper на CPU, `POST /transcribe`, `GET /health`, модель в томе
+`whisper-models`, наружу не публикуется — [iteration-2.md, B](features/iteration-2.md)).
 
 ## 2. Ключевые решения
 
@@ -38,7 +43,7 @@ Telegram ──long polling──► aiogram Dispatcher
 |---|---|
 | ИИ | chutes.ai, OpenAI-совместимый `POST {base}/chat/completions` через **aiohttp** (без openai SDK). Основная модель `google/gemma-4-31B-turbo-TEE` (текст+картинки, structured outputs, $0.12/$0.37 за 1M). Запасные: `Qwen/Qwen3-32B-TEE` (текст), `Qwen/Qwen3.6-27B-TEE` (картинки). ID — в `.env`. |
 | Structured output | `response_format={"type":"json_schema","json_schema":{"name":..,"schema":..,"strict":true}}`; ответ **всегда** валидируется Pydantic (слишком длинные строки/списки обрезаются, а не отвергаются); при ошибке — 1 повтор с текстом ошибки, затем запасная модель; ответ, обрезанный по max_tokens, — 1 повтор с большим лимитом. Если API отверг json_schema (400) — повтор с `{"type":"json_object"}`. Thinking выключаем: `chat_template_kwargs={"enable_thinking": false}`; `<think>…</think>` вырезаем из ответа на всякий случай. |
-| Голос | Community-chute AudioDojo: `POST https://vonkaiser-audiodojo.chutes.ai/stt/whisper`, JSON `{"audio_b64", "language"?, "return_timestamps": false}` → `{"text"}`. URL в конфиге. Опционально ffmpeg → WAV (`STT_CONVERT_WAV`). Недоступен → retry-очередь. |
+| Голос | Community-chute AudioDojo: `POST https://vonkaiser-audiodojo.chutes.ai/stt/whisper`, JSON `{"audio_b64", "language"?, "return_timestamps": false}` → `{"text"}`. URL в конфиге. Опционально ffmpeg → WAV (`STT_CONVERT_WAV`). Недоступен → retry-очередь. Итерация 2: локальный Whisper (`LOCAL_STT_URL`) — запасной или основной по `Prefs.stt_mode` (`auto`/`local`/`chutes`), бесплатный. |
 | Картинки | Отправляются в vision-модель **в том же вызове**, что и разбор: модель возвращает `image.text` (OCR) + `image.description` + items. |
 | Время | LLM описывает время (`When`), Python вычисляет (`domain.timeresolve`). `now` = `message.date` (а не время обработки). Хранение в UTC, повторы — RRULE в локальном времени `rec_tz`. |
 | Очередь | Таблица `jobs`, без Redis. Ошибки ИИ → экспоненциальный backoff `min(2**attempts мин, 6 ч)`. |
@@ -275,6 +280,22 @@ class ChutesWhisperSTT:
 
 Стоимость — `stt_usd_per_second · max(1, ceil(latency_s))`, в том числе при таймауте ответа (chute продолжает
 работать и тарифицироваться, когда мы перестали ждать); ошибки соединения не тарифицируются.
+
+Итерация 2 ([iteration-2.md, B](features/iteration-2.md)):
+
+```python
+class LocalWhisperSTT:                     # тот же протокол; POST {local_stt_url}/transcribe, таймаут local_stt_timeout_s
+    ...                                    # ai_usage(purpose="stt", model="local:<model>", audio_seconds=длительность, cost=0)
+                                           # сеть/таймаут/5xx → AIUnavailable; 413 (длиннее лимита сервиса)/400 → AIBadResponse
+class RoutedSTT:                           # ctx.stt
+    def __init__(self, chutes: SpeechToText, local: SpeechToText | None = None) -> None
+    def order(self, mode: str) -> list[str]   # ORDER_BY_MODE: auto → chutes, local; local → local, chutes; chutes → chutes
+    async def transcribe(self, audio, *, mime_type=None, language=None, mode="auto",
+                         before_paid: Callable[[], Awaitable[object]] | None = None) -> str
+```
+Без `local_stt_url` все режимы — `chutes`. Любая `AIError` бэкенда → следующий; если упали все — `AIUnavailable`,
+иначе `AIConfigError`, иначе последняя. `before_paid` (проверка бюджета процессором) вызывается перед chutes и может
+прервать распознавание (`RetryLater`).
 
 ### 4.7 ai/extract.py  [ai]
 
@@ -542,8 +563,10 @@ async def on_dead(ctx: AppContext, job: Job) -> None
 2. Бюджет: `budget_state` исчерпан → реакция ✍, `raw.status=deferred`, уведомление один раз за месяц
    (`once_keys` `budget100:YYYY-MM`) → `RetryLater(at=next_month_start, count_attempt=False)`.
    ≥ 80% → уведомление один раз (`budget80:YYYY-MM`), продолжаем.
-3. Контент: голос/аудио → `bot.download` → `stt.transcribe(language=prefs.stt_language)` → `raw.transcript` (commit сразу,
-   чтобы при повторе не платить снова); длиннее `settings.stt_max_duration_s` (300 с) — без STT (остаётся подпись или
+   Итерация 2: бюджет проверяется только перед платными вызовами — перед chutes STT (`before_paid`) и перед
+   `extract()` (после сбора контента); локальный Whisper бесплатен, голосовое без текста сохраняется без ИИ.
+3. Контент: голос/аудио → `bot.download` → `stt.transcribe(language=prefs.stt_language, mode=prefs.stt_mode)` →
+   `raw.transcript` (commit сразу, чтобы при повторе не платить снова); длиннее `settings.stt_max_duration_s` (300 с) — без STT (остаётся подпись или
    запись «Аудио: name»); фото/image_document → скачать байты (в БД не хранить) → images; картинка больше
    `MAX_IMAGE_BYTES` (8 МБ, по `raw.file_size` до скачивания или по факту) или не влезающая в `MAX_REQUEST_IMAGE_BYTES`
    (12 МБ на запрос) модели не отправляется (загрузка входит в `llm_timeout_s`);
@@ -713,7 +736,8 @@ def help_text() -> str
 `settings`: меню (views.settings_menu): часовой пояс (кнопки Europe/Warsaw, Europe/Berlin, Europe/Minsk, Europe/Kyiv +
 ввод IANA), задача без времени, слоты (утро/обед/день/вечер/после работы/ночь, выходные, дата без времени),
 напоминать за (0/5/10/15/30), тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время), бюджет ($),
-язык голосовых (авто/ru/en). Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
+«🎙 Голос»: язык (авто/ru/en) и режим распознавания (`stt_mode`: авто/локальный/только chutes; «локальный» с пометкой
+«(не настроен)», пока пуст `LOCAL_STT_URL`). Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
 Существующие напоминания при смене настроек не перепланируются (сказать об этом в тексте меню).
 
 ### 4.20 bot/app.py и __main__.py  [bot]

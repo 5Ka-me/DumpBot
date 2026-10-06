@@ -50,6 +50,9 @@ async def test_menu_navigation_and_close(feed, updates, tg, get_buttons) -> None
         ("digest_toggle", "evening", lambda p: p.digest_evening_enabled is False and p.digest_morning_enabled),
         ("stt", "ru", lambda p: p.stt_language == "ru"),
         ("stt", "auto", lambda p: p.stt_language is None),
+        ("stt_mode", "local", lambda p: p.stt_mode == "local"),
+        ("stt_mode", "chutes", lambda p: p.stt_mode == "chutes"),
+        ("stt_mode", "auto", lambda p: p.stt_mode == "auto"),
         ("budget", "3", lambda p: p.budget_usd == 3.0),
     ],
 )
@@ -65,7 +68,15 @@ async def test_one_tap_changes(feed, updates, seed, tg, ctx, key, value, check) 
 
 @pytest.mark.parametrize(
     ("key", "value"),
-    [("tz", "Mars/Olympus"), ("lead", "abc"), ("lead", "99999"), ("digest_toggle", "noon"), ("stt", "de")],
+    [
+        ("tz", "Mars/Olympus"),
+        ("lead", "abc"),
+        ("lead", "99999"),
+        ("digest_toggle", "noon"),
+        ("stt", "de"),
+        ("stt_mode", "cloud"),
+        ("stt_mode", ""),
+    ],
 )
 async def test_invalid_one_tap_values(feed, updates, seed, tg, ctx, key, value) -> None:
     await feed(updates.callback(SetCb(key=key, v=value)))
@@ -74,6 +85,26 @@ async def test_invalid_one_tap_values(feed, updates, seed, tg, ctx, key, value) 
     assert tg.toasts == ["Неверное значение"]
     assert tg.edits == []
     assert not ctx.scheduler_wakeup.is_set()
+
+
+@pytest.mark.parametrize("local_url", ["", "http://whisper:9000"])
+async def test_voice_menu_says_whether_the_local_whisper_is_configured(
+    feed, updates, seed, tg, ctx, settings_factory, get_buttons, local_url
+) -> None:
+    ctx.settings = settings_factory(local_stt_url=local_url)
+
+    await feed(updates.callback(SetCb(key="menu", v="stt"), message_id=937))
+    await feed(updates.callback(SetCb(key="stt_mode", v="local"), message_id=937))
+
+    menu, changed = tg.edits
+    assert menu.text.startswith("🎙 <b>Голос</b>") and changed.text.startswith("🎙 <b>Голос</b>")
+    assert "Распознавание: локальный" in changed.text
+    configured = bool(local_url)
+    assert ("LOCAL_STT_URL пуст" in changed.text) is not configured
+    local_button = next(text for text, data in get_buttons(changed.reply_markup) if data == "s:stt_mode:local")
+    assert local_button.startswith("✓ 💻 Локальный")
+    assert local_button.endswith("(не настроен)") is not configured
+    assert (await _prefs(seed)).stt_mode == "local"  # saved either way: it works as chutes until configured
 
 
 async def test_unknown_key_is_stale(feed, updates, tg) -> None:

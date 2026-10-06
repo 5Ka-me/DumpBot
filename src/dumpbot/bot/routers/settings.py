@@ -31,7 +31,7 @@ from dumpbot.bot import sender, views
 from dumpbot.bot.cbdata import SetCb
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import SettingsStates, prompt_data
-from dumpbot.domain.prefs import Prefs
+from dumpbot.domain.prefs import STT_MODES, Prefs
 from dumpbot.services.settings_repo import save_prefs
 from dumpbot.workers import jobs
 
@@ -96,6 +96,12 @@ def _set_stt(p: Prefs, v: str) -> None:
     p.stt_language = None if v == "auto" else v  # type: ignore[assignment]
 
 
+def _set_stt_mode(p: Prefs, v: str) -> None:
+    if v not in STT_MODES:
+        raise ValueError(f"unknown speech-to-text mode: {v}")
+    p.stt_mode = v  # type: ignore[assignment]
+
+
 def _set_budget(p: Prefs, v: str) -> None:
     p.budget_usd = parse_money(v)
 
@@ -106,6 +112,7 @@ CHANGES: Final[dict[str, Callable[[Prefs, str], None]]] = {
     "quiet_toggle": _toggle_quiet,
     "digest_toggle": _toggle_digest,
     "stt": _set_stt,
+    "stt_mode": _set_stt_mode,
     "budget": _set_budget,
 }
 
@@ -130,7 +137,7 @@ async def _navigate(
     if await common.is_prompt(state, message_id, SettingsStates):
         await state.clear()  # [✖️ Отмена] of this prompt (a dialog on another message stays open)
     prefs = await _load_prefs(ctx)
-    view = views.settings_view(value, prefs) if key == "menu" else (views.settings_menu(prefs)[0], None)
+    view = _view(ctx, value, prefs) if key == "menu" else (views.settings_menu(prefs)[0], None)
     await common.answer(callback)
     await common.show(ctx, message_id, view)
 
@@ -161,7 +168,7 @@ async def _change(callback: CallbackQuery, ctx: AppContext, key: str, value: str
         budget_raised = await _save(session, ctx, prefs, new, now)
         await session.commit()
     await common.answer(callback, SAVED)
-    await common.show(ctx, message_id, views.settings_view(views.SETTINGS_PARENT.get(key, "main"), new))
+    await common.show(ctx, message_id, _view(ctx, views.SETTINGS_PARENT.get(key, "main"), new))
     _wake(ctx, budget_raised)
 
 
@@ -192,7 +199,7 @@ async def on_value(message: Message, ctx: AppContext, state: FSMContext) -> None
         budget_raised = await _save(session, ctx, prefs, new, now)
         await session.commit()
     await state.clear()
-    await common.show(ctx, data.get("prompt_id"), views.settings_view(spec.menu, new))
+    await common.show(ctx, data.get("prompt_id"), _view(ctx, spec.menu, new))
     await sender.react(ctx, message.message_id, sender.REACT_SAVED)
     _wake(ctx, budget_raised)
 
@@ -262,6 +269,11 @@ def parse_money(text: str) -> float:
 
 
 # --- shared --------------------------------------------------------------------------------------------------------
+
+
+def _view(ctx: AppContext, name: str, prefs: Prefs) -> views.MenuView:
+    """``views.settings_view`` with whether the local Whisper is configured (``LOCAL_STT_URL``)."""
+    return views.settings_view(name, prefs, local_stt=bool(ctx.settings.local_stt_url.strip()))
 
 
 async def _load_prefs(ctx: AppContext) -> Prefs:

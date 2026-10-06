@@ -17,7 +17,7 @@ if TYPE_CHECKING:
     from aiogram import Bot
 
     from dumpbot.ai.client import ChutesClient
-    from dumpbot.ai.stt import SpeechToText
+    from dumpbot.ai.stt import RoutedSTT
 
 
 @dataclass
@@ -26,7 +26,7 @@ class AppContext:
     sessionmaker: async_sessionmaker[AsyncSession]
     bot: Bot
     ai: ChutesClient
-    stt: SpeechToText
+    stt: RoutedSTT  # chutes and the local Whisper, ordered by Prefs.stt_mode
     # Set to make the job worker / scheduler run immediately instead of waiting for their poll interval.
     jobs_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
     scheduler_wakeup: asyncio.Event = field(default_factory=asyncio.Event)
