@@ -6,7 +6,7 @@ scheduler is woken after anything that changes reminders, the job worker after a
 
 Checklists (docs/features/iteration-2.md §C2): [☐ N] / [☑ N] (``SubCb``) toggle a step and redraw the parent's
 card; whenever a commit closed a parent by its last step (whatever button did it: a step's reminder too) the
-"🎉 Все шаги выполнены" message follows and other cards of the parent are redrawn (``common.after_steps``).
+"🎉 Все шаги выполнены" message follows and other cards of the parent are redrawn (``cards.after_steps``).
 [🪄 Разбить на шаги] queues job "split" (one at a time per item; nothing with the month's AI budget spent);
 [🔗 Похожее] sends the cards of the related items.
 
