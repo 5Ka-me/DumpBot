@@ -537,3 +537,39 @@ async def test_without_candidates_no_link_is_made(session, make, now):
     [old] = await make({"kind": "purchase", "title": "Купить наушники Sony"}, now=now)
     await make({"kind": "purchase", "title": "Купить чехол", "related": [old.item.id]}, now=now)
     assert (await session.execute(select(ItemLink))).all() == []
+
+
+async def test_a_related_id_needs_a_common_subject_word(session, make, now, local, prefs):
+    # the live case: the model linked «Прогуглить про визу в Черногорию» to «Покушать» (saved from "напомни через
+    # час покушать"); only a subject word in the titles / details links two items, generic words never do
+    [eat, headphones, plan] = await make(
+        {"kind": "task", "title": "Покушать"},
+        {"kind": "purchase", "title": "Купить наушники"},
+        {"kind": "task", "title": "Купить билеты", "details": "Черногория, виза не нужна?"},
+        now=local(2026, 10, 1, 10, 0),
+        source_text="напомни через час покушать",
+    )
+    allowed = {eat.item.id, headphones.item.id, plan.item.id}
+    specs = [
+        {"kind": "task", "title": "Прогуглить про визу в Черногорию", "related": [eat.item.id, plan.item.id]},
+        {"kind": "purchase", "title": "Купить наушники Sony", "related": [headphones.item.id, eat.item.id]},
+        {"kind": "task", "title": "Купить хлеб", "details": "напомни через час", "related": [eat.item.id]},
+    ]
+    visa, sony, bread = await items.create_items(
+        session,
+        raw=None,
+        extraction=Extraction.model_validate({"items": specs}),
+        source="text",
+        source_text="напомни через час",
+        source_meta=None,
+        urls=[],
+        prefs=prefs,
+        now=now,
+        model=None,
+        prompt_version=None,
+        related_allowed=allowed,
+    )
+    await session.commit()
+    links = (await session.execute(select(ItemLink.item_id, ItemLink.related_id).order_by(ItemLink.item_id))).all()
+    assert [tuple(r) for r in links] == [(visa.item.id, plan.item.id), (sony.item.id, headphones.item.id)]
+    assert bread.item.id not in {r.item_id for r in links}

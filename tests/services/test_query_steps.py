@@ -1,6 +1,7 @@
 """Read side of related items and checklists (docs/features/iteration-2.md §C): RELATED CANDIDATES (OR of the
-message's words, not the same message, 365 days, best rank first), card extras, and the list rules — a step shows in
-top-level lists only with a time of its own, "(из «Переезд»)", a parent counts "2/5".
+message's subject words — no reminder / time words, common verbs or numbers —, open items only, not the same message,
+365 days, best rank first), card extras, and the list rules — a step shows in top-level lists only with a time of its
+own, "(из «Переезд»)", a parent counts "2/5".
 Reference time: Tue 2026-10-06 10:00 Europe/Warsaw (services conftest)."""
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from sqlalchemy import select, update
 
 from dumpbot.ai.schemas import EditPatch, QuerySpec, When
 from dumpbot.bot import views
-from dumpbot.db.models import Item, ItemLink
+from dumpbot.db.models import Item, ItemLink, Occurrence
 from dumpbot.services import items, query
 
 MOVE = {
@@ -39,17 +40,61 @@ async def _link(session, item_id: int, related_id: int) -> None:
 # --- related candidates --------------------------------------------------------------------------------------------
 
 
-async def test_candidates_match_any_word_best_rank_first(session, make, now, local):
-    [sony, cover, milk, _] = await make(
+async def test_candidates_match_any_subject_word_best_rank_first(session, make, now, local):
+    [sony, cover, _, _] = await make(
         {"kind": "purchase", "title": "Купить наушники Sony"},
         {"kind": "purchase", "title": "Чехол для наушников"},
         {"kind": "purchase", "title": "Купить молоко"},
         {"kind": "note", "title": "Погода хорошая"},
         now=local(2026, 9, 12, 10, 0),
     )
-    rows = await query.related_candidates(session, "купить чехол для наушников Sony", now)
-    # every item sharing a word comes up (OR), the one with most words first; "для" is a stop word
-    assert [r.item_id for r in rows] == [sony.item.id, cover.item.id, milk.item.id]
+    rows = await query.related_candidates(session, "купить ещё одни наушники Sony", now)
+    # every item sharing a subject word comes up (OR), the one with most words first; "для" is a stop word and
+    # "купить" a generic verb: «Купить молоко» is not about headphones
+    assert [r.item_id for r in rows] == [sony.item.id, cover.item.id]
+
+
+async def test_generic_words_bring_no_candidates(session, make, now, local):
+    # the live case: «Покушать» was saved from "напомни через час покушать", «Позвонить маме завтра» shares "завтра"
+    [eat] = await make(
+        {"kind": "task", "title": "Покушать"}, now=local(2026, 10, 6, 8, 0), source_text="напомни через час покушать"
+    )
+    await make({"kind": "task", "title": "Позвонить маме завтра"}, now=local(2026, 10, 5, 8, 0))
+    [visa] = await make({"kind": "note", "title": "Виза в Черногорию: нужен паспорт"}, now=local(2026, 9, 1, 8, 0))
+
+    text = "Напомни часов в 17 прогуглить про визу в черногорию"
+    assert [r.item_id for r in await query.related_candidates(session, text, now)] == [visa.item.id]
+    # nothing but reminder / time words, common verbs and numbers -> no candidates at all
+    for text in ("напомни завтра в 10 позвонить", "Напомни через час", "в пятницу вечером купить", "5-го в 17:00"):
+        assert await query.related_candidates(session, text, now) == [], text
+    assert [r.item_id for r in await query.related_candidates(session, "покушать бы", now)] == [eat.item.id]
+
+
+async def test_candidates_are_open_items_only(session, make, now, local, prefs):
+    day = local(2026, 10, 5, 9, 0)
+    today = {"text": "сегодня в 12", "day": "+0", "time": "12:00"}
+    [open_, done, gone, done_occ, series, idea] = await make(
+        {"kind": "task", "title": "Покушать"},
+        {"kind": "task", "title": "Покушать", "when": today},
+        {"kind": "task", "title": "Покушать удалённое"},
+        {"kind": "task", "title": "Покушать по старому", "when": today},
+        {"kind": "task", "title": "Покушать по расписанию", "when": today, "rrule": "FREQ=DAILY"},
+        {"kind": "idea", "title": "Покушать в новом месте"},
+        now=day,
+    )
+    await items.mark_done(session, done.occurrence.id, day, prefs)
+    await items.delete_item(session, gone.item.id, day)
+    # an actionable item whose current occurrence is done counts as done, even if its status says otherwise
+    await items.mark_done(session, done_occ.occurrence.id, day, prefs)
+    await session.execute(update(Item).where(Item.id == done_occ.item.id).values(status="open", done_at=None))
+    # a series stays a candidate whatever its instances
+    await items.mark_done(session, series.occurrence.id, day, prefs)
+    await session.execute(update(Occurrence).where(Occurrence.item_id == series.item.id).values(status="done"))
+    await session.commit()
+    assert (await session.get(Item, done.item.id)).status == "done"
+
+    rows = await query.related_candidates(session, "Покушать", now)
+    assert {r.item_id for r in rows} == {open_.item.id, series.item.id, idea.item.id}
 
 
 async def test_candidates_skip_the_message_itself_old_deleted_and_steps(session, make, now, local, new_raw):

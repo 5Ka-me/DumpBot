@@ -92,10 +92,6 @@ def reminder_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def done_only_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
-    return markup([button("✅ Готово", OccCb(a="done", id=occurrence_id), style="success")])
-
-
 def undone_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
     return markup([button("↩️ Не сделано", OccCb(a="undone", id=occurrence_id))])
 

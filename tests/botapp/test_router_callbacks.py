@@ -119,6 +119,7 @@ async def test_snooze_minutes(feed, updates, seed, tg, frozen, ctx, action, delt
     assert planned.fire_at == created.reminders[0].fire_at  # a later reminder is not replaced by the snooze
     assert tg.toasts[0].startswith("⏰ Напомню сегодня")
     assert "💤 отложено" in tg.edits[0].text
+    assert tg.edits[0].reply_markup is None  # no [✅ Готово]: the snoozed reminder comes with its own buttons
     assert ctx.scheduler_wakeup.is_set()
 
 
@@ -132,9 +133,7 @@ async def test_snooze_to_tomorrow(feed, updates, seed, tg, frozen) -> None:
     assert tg.toasts[0].startswith("⏰ Напомню завтра")
 
 
-async def test_snooze_to_tomorrow_of_a_daily_instance_points_done_at_tomorrows(
-    feed, updates, seed, tg, frozen, get_buttons
-) -> None:
+async def test_snooze_to_tomorrow_of_a_daily_instance_merges_into_tomorrows(feed, updates, seed, tg, frozen) -> None:
     created = await seed.item("Таблетки", when=When(text="каждый день в 11", time="11:00"), rrule="FREQ=DAILY")
     frozen.advance(hours=1, minutes=1)  # Tue 11:01: the reminder was sent, Wednesday's instance exists
     async with seed.sessionmaker() as s:
@@ -148,7 +147,10 @@ async def test_snooze_to_tomorrow_of_a_daily_instance_points_done_at_tomorrows(
     assert (tuesday.status, wednesday.status) == ("cancelled", "open")
     [reminder] = await _pending(seed, wednesday.id)
     assert reminder.fire_at == wednesday.due_at
-    assert get_buttons(tg.edits[0].reply_markup) == [("✅ Готово", OccCb(a="done", id=wednesday.id).pack())]
+    # the snoozed message has no buttons: Wednesday's reminder comes with its own [✅ Готово] for Wednesday
+    [edit] = tg.edits
+    assert edit.text == "🔔 <b>Таблетки</b>\n💤 отложено · напомню завтра в 11:00"
+    assert edit.reply_markup is None
 
 
 async def test_snooze_of_a_done_occurrence_does_not_add_reminders(feed, updates, seed, tg, frozen) -> None:

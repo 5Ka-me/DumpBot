@@ -10,6 +10,8 @@ v3 (§C): ``RELATED CANDIDATES`` in the input and ``items[].related``; ``items[]
 ``edit.action = "split"``; a separate prompt for the "split" call (🪄 Разбить на шаги).
 v4: a deadline by a season / month ("к лету", "до октября") is the first day of that span (``day`` MM-DD), not a
 period: the code reads period + deadline as "до конца …", the end of the span.
+v5: hours 13-23 and 0 are never asked about (the code also drops such an AM/PM question); ``related`` only for the
+same specific subject, never for shared verbs, time words or the same kind.
 """
 
 from __future__ import annotations
@@ -20,7 +22,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -262,10 +264,11 @@ kind: task = something to do | event = meeting, appointment, something happening
 to buy | idea | note = thought, fact, diary | link = saved link/article | meme = humor, meme image | quote | other.
 title: short (max 120 chars), imperative for tasks, in the message language. details: extra info only \
 (max 600 chars). tags: 0-4 lowercase, no "#". conf: high|med|low.
-related: ids from RELATED CANDIDATES really about the same thing (same purchase, project, follow-up), max 3; a shared \
-word is not enough; usually omit. steps: only if the owner asks to plan it step by step (распиши по шагам, разбей на \
-шаги, чек-лист) or lists the stages of ONE task: 2-8 short steps in order {{title, when only if the message gives \
-that step a time}}; the item is the whole task.
+related: ids from RELATED CANDIDATES about the same specific subject (same thing to buy, project, person, trip), \
+max 3; shared verbs (купить, прогуглить), time words or the same kind are not enough; in doubt omit. \
+steps: only if the owner asks to plan it step by step (распиши по шагам, разбей на шаги, чек-лист) or lists the \
+stages of ONE task: 2-8 short steps in order {{title, when only if the message gives that step a time}}; the item is \
+the whole task.
 
 TIME: describe it, NEVER compute dates. when = {{text: verbatim phrase, day, time, in_min, at, period, role}}
 - day: +N days (+0 сегодня, +1 завтра, +2 послезавтра) | +Nw | +Nmo | +Ny | MO TU WE TH FR SA SU = nearest such day | \
@@ -278,7 +281,7 @@ this_month | next_month | YYYY-MM (в октябре; any year) | spring | summe
 после обеда, in the afternoon), evening (вечером, tonight), after_work (после работы, after work), \
 night (ночью, перед сном, at night).
 - Hours 1-7 without утра/ночи/am are PM ("в 3" → 15:00). A bare "в 8"/"в 9" is ambiguous: the likelier one, \
-conf low, ask with both options.
+conf low, ask with both options. Hours 13-23 and 0 ("в 17", "00:15") are 24h, never ambiguous: never ask.
 - in_min only for "через N минут/часов" (2 часа → 120); "через 3 дня" → day +3.
 - at: local YYYY-MM-DD[THH:MM] ONLY if day/time can't express it; use CAL.
 - role: remind = the time to ping ("напомни в 15"); deadline = до/к/by ("до пятницы" → day FR; a season/month \

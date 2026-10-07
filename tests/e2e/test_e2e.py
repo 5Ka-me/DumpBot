@@ -397,7 +397,7 @@ async def test_snooze_from_the_reminder(e2e: Any) -> None:
     e2e.tg.push_callback(reminder_msg, reminder_msg.button("o:s15:"))
     [edit] = await e2e.wait(lambda: e2e.tg.edits_of(reminder_msg.message_id), "the reminder edited")
     assert "💤 отложено · напомню сегодня в 13:12" in edit.text
-    assert [text for text, _ in edit.buttons] == ["✅ Готово"]
+    assert edit.buttons == []  # the snoozed reminder comes with its own buttons
     assert e2e.tg.toasts() == ["⏰ Напомню сегодня 13:12"]
 
     sent_before = len(e2e.tg.sent)
@@ -406,6 +406,7 @@ async def test_snooze_from_the_reminder(e2e: Any) -> None:
     await e2e.tick(local(2026, 10, 6, 13, 12))
     [again] = e2e.tg.sent[sent_before:]
     assert again.text.startswith("🔔 <b>Купить наушники</b>")
+    assert [text for text, _ in again.buttons] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
     item = await e2e.item("Купить наушники")
     assert [(r.status, wall(r.fire_at)) for r in await e2e.reminders(item.id)] == [
         ("sent", "2026-10-06 12:55"),

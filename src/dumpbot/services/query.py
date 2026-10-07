@@ -10,7 +10,8 @@ the day is listed in ``Agenda.period_items`` instead of open / overdue; "ког�
 
 Checklists and related items (§C): a step shows in the top-level lists (/tasks, /recent, digests, queries) only
 when it has a time of its own, named after its parent ("(из «Переезд»)"); a parent row counts its steps ("2/5").
-``related_candidates`` finds earlier items with any word of a new message for the "RELATED CANDIDATES" prompt line;
+``related_candidates`` finds earlier open items sharing a subject word (``services.related``) with a new message for
+the "RELATED CANDIDATES" prompt line;
 ``card_extras`` loads what an item card shows besides the item (checklist, related items, parent).
 
 The Mini App (§D): ``feed`` pages through all items newest first with filters (keyset cursor), ``rows_by_ids`` loads
@@ -38,6 +39,7 @@ from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, CardExtras, RelatedRef, Row, Step, UsageSummary
 from dumpbot.services.items import current_occurrence_order
+from dumpbot.services.related import lexeme_query, subject_lexemes
 
 __all__ = [
     "Agenda",
@@ -92,8 +94,6 @@ _ACTIONABLE_KINDS: Final = tuple(sorted(ACTIONABLE))
 _CALENDAR_PERIODS: Final = tuple(sorted(CALENDAR_PERIODS))
 RELATED_DAYS: Final = 365  # related candidates are items saved within this many days
 RELATED_LIMIT: Final = 5
-_CANDIDATE_WORDS: Final = 30  # words of a message that go into the OR query
-_LEXEME_RE = re.compile(r"[^\W_]+", re.UNICODE)  # letters and digits only: safe in to_tsquery syntax
 FEED_STATUSES: Final = ("any", "open", "done", "deleted")  # any = not deleted; deleted = the trash
 IMAGE_TYPES: Final = ("photo", "image_document")
 # Pictures the Mini App previews (raster formats a browser shows; never SVG from our own origin).
@@ -237,16 +237,20 @@ async def items_of_raw(session: AsyncSession, raw_ids: Sequence[int]) -> list[Ro
 async def related_candidates(
     session: AsyncSession, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (), limit: int = RELATED_LIMIT
 ) -> list[Row]:
-    """Earlier items that share a word with ``text`` (§C1, for the "RELATED CANDIDATES" line): full text with an OR
-    of its lexemes (``to_tsquery('russian', 'a | b | …')``), best ``ts_rank`` first, then newest. Not deleted,
-    top-level, saved in the last ``RELATED_DAYS`` days, not from ``exclude_raw_ids`` (the message itself)."""
-    words = _candidate_words(text)
-    if not words:
+    """Earlier items that share a subject word with ``text`` (§C1, for the "RELATED CANDIDATES" line): full text with
+    an OR of the message's subject lexemes (``services.related``: no reminder / time words, common verbs or
+    numbers), best ``ts_rank`` first, then newest. Only open items (not done, not deleted; an actionable item whose
+    current occurrence is done counts as done, an active series stays), top-level, saved in the last
+    ``RELATED_DAYS`` days, not from ``exclude_raw_ids`` (the message itself). Nothing left of the message -> []."""
+    lexemes = await subject_lexemes(session, text)
+    if not lexemes:
         return []
-    tsq = func.to_tsquery(_RU, " | ".join(words))
+    tsq = lexeme_query(lexemes)
     cutoff = _utc(now) - timedelta(days=RELATED_DAYS)
-    stmt = _item_select(_occ_subquery(open_only=False)).where(
-        Item.status != "deleted",
+    occ = _occ_subquery(open_only=False)
+    stmt = _item_select(occ).where(
+        Item.status == "open",
+        or_(Item.kind.not_in(_ACTIONABLE_KINDS), Item.rec_active.is_(True), occ.c.occ_status.is_distinct_from("done")),
         Item.parent_id.is_(None),
         Item.created_at >= cutoff,
         Item.search_tsv.op("@@", is_comparison=True)(tsq),
@@ -255,13 +259,6 @@ async def related_candidates(
         stmt = stmt.where(or_(Item.raw_message_id.is_(None), Item.raw_message_id.not_in(list(exclude_raw_ids))))
     stmt = stmt.order_by(func.ts_rank(Item.search_tsv, tsq).desc(), Item.created_at.desc(), Item.id.desc())
     return await _item_rows(session, stmt.limit(limit))
-
-
-def _candidate_words(text: str) -> list[str]:
-    """Unique words of the message for the OR query: letters/digits only (no tsquery operators), no bare numbers
-    ("в 15:00" must not match every item with a 15), at most ``_CANDIDATE_WORDS``."""
-    words = dict.fromkeys(w.lower() for w in _LEXEME_RE.findall(text or ""))
-    return [w for w in words if len(w) > 1 and not w.isdigit()][:_CANDIDATE_WORDS]
 
 
 async def related_refs(session: AsyncSession, item_id: int) -> list[RelatedRef]:

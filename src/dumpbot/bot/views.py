@@ -18,7 +18,7 @@ Re-rendering in place (for the callbacks router):
   pending reminders (a done occurrence shows "✅ сделано" and [↩️ Не сделано]);
 - reminder message after ``OccCb done`` -> ``reminder_done`` (alias ``done_text``); after ``undone`` ->
   ``reminder_message(item, occ, None, ...)``; after ``s15``/``s60``/``tmr`` -> ``reminder_snoozed`` with the new
-  reminder returned by ``items.snooze``;
+  reminder returned by ``items.snooze`` (no buttons: the snoozed reminder brings its own);
 - after ``ItemCb del`` -> ``deleted_card``; after ``undel`` -> ``item_card``.
 
 Settings callbacks (``SetCb(key, v)``) emitted by the settings menus:
@@ -69,7 +69,6 @@ from dumpbot.bot.keyboards import (
     chunked,
     clip_label,
     digest_move_keyboard,
-    done_only_keyboard,
     item_card_keyboard,
     markup,
     reminder_keyboard,
@@ -756,13 +755,14 @@ def reminder_done(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> M
 done_text = reminder_done  # contract name (architecture §4.18)
 
 
-def reminder_snoozed(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime) -> MenuView:
-    """Reminder edited after a snooze button: "💤 отложено · напомню сегодня в 13:15" [✅ Готово]."""
+def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> View:
+    """Reminder edited after a snooze button: "💤 отложено · напомню сегодня в 13:15", without buttons (the snoozed
+    reminder comes again with its own [✅ Готово] / [⏰ …])."""
     tz = prefs.zone
     fire = _local(reminder.fire_at, tz)
     when = f"{fmt_date(fire.date(), today=_local(now, tz).date())} в {fmt_time(fire.time())}"
     lines = [f"🔔 <b>{q(item.title)}</b>", f"💤 отложено · напомню {when}"]
-    return fit("\n".join(lines)), done_only_keyboard(occ.id)
+    return fit("\n".join(lines)), None
 
 
 # --- lists and digests -------------------------------------------------------------------------------------------

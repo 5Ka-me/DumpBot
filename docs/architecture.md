@@ -105,6 +105,7 @@ src/dumpbot/
     usage.py               запись ai_usage, траты за месяц, состояние бюджета                        [ai]
     items.py               жизненный цикл записей/повторений/напоминаний                             [items]
     query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
+    related.py             «предметные» лексемы для «🔗 похоже на» (стоп-список общих слов)           [items]
     ingest.py              Message → RawMessage, постановка в очередь                                [workers]
     processor.py           обработчики задач очереди                                                  [workers]
     digest.py              данные для дайджестов                                                      [workers]
@@ -346,7 +347,8 @@ class RoutedSTT:                           # ctx.stt
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v4" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day)
+PROMPT_VERSION: str  # "v5" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
+                     # v5: часы 13–23 и 0 не переспрашивать, related — только тот же конкретный предмет)
 
 @dataclass
 class ExtractInput:
@@ -394,8 +396,13 @@ async def split_steps(client: ChutesClient, settings: Settings, inp: SplitInput)
 ```
 
 Итерация 2, C ([iteration-2.md §C](features/iteration-2.md)): `ExtractedItem.related: list[int]` (≤ 3, id из строки
-`RELATED CANDIDATES`; чужие id отбрасывает `items.create_items`), `ExtractedItem.steps: list[StepSpec]` (≤ 8,
-`{title, when?}`), `EditPatch.action` += `split`. Ответ на карточку с шагами вместо правки превращается в `split`.
+`RELATED CANDIDATES`; чужие id и id без общей «предметной» лексемы в названиях отбрасывает `items.create_items`),
+`ExtractedItem.steps: list[StepSpec]` (≤ 8, `{title, when?}`), `EditPatch.action` += `split`. Ответ на карточку с
+шагами вместо правки превращается в `split`.
+
+После валидации `extract` убирает бессмысленный вопрос «утра или вечера?» (`_drop_pointless_ask`): все варианты —
+время, два из них отличаются на 12 часов, а фраза времени записи уже называет этот час однозначно (13–23 или 0:
+«в 17», «17:30», «в семнадцать»; или с «утра/вечера»). Запись остаётся, `conf` low → med. «в 8» по-прежнему спрашивает.
 
 Схема `Extraction` (ai/schemas.py): до `MAX_ITEMS=20` записей, `title` ≤ 120, `tags` ≤ 6, `image.text` ≤ 4000 и т.д.
 Ограничения остаются в JSON-схеме (подсказка для constrained decoding), а при валидации слишком длинные строки
@@ -613,8 +620,10 @@ async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, 
 async def items_of_raw(session, raw_ids: Sequence[int]) -> list[Row]   # не deleted записи этих raw (без шагов), по id
 async def related_candidates(session, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (),
                              limit: int = 5) -> list[Row]
-    # итерация 2, C1: to_tsquery('russian', 'a | b | …') по словам текста (без чисел), ts_rank desc; не deleted,
-    # не шаги, created_at за 365 дней, кроме записей exclude_raw_ids
+    # итерация 2, C1: tsquery 'a | b | …' по «предметным» лексемам текста (services/related.py: без слов напоминаний,
+    # времени, частых глаголов и чисел; ничего не осталось → []), ts_rank desc; только открытые (не done/deleted,
+    # задача со сделанным текущим повторением — как done, серии остаются), не шаги, created_at за 365 дней,
+    # кроме записей exclude_raw_ids
 async def related_refs(session, item_id: int) -> list[RelatedRef]   # item_links в обе стороны, не deleted, новые первыми
 async def card_extras(session, item: Item) -> CardExtras            # шаги (☐/☑, время), похожие, название родителя
 async def usage_summary(session, prefs: Prefs, now: datetime) -> UsageSummary
@@ -836,6 +845,9 @@ def lead_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 0/5/
 def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime)
     # "🔔 <b>Купить наушники</b>\nчерез 5 мин · сегодня 13:00"  [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
 def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
+def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> tuple[str, None]
+    # после [⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра]: "🔔 <b>…</b>\n💤 отложено · напомню сегодня в 13:15" без кнопок
+    # (отложенное напоминание придёт заново со своими)
 def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
     # + раздел «🗓 На этой неделе (до вс 11 окт)» / «🗓 В этом месяце» / «🗓 Этим летом» (period_sections)
 def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]

@@ -193,10 +193,10 @@ async def _snooze(
         return Outcome(None, "Напоминание уже неактуально")
     minutes = SNOOZE_MINUTES[action]
     reminder = await items.snooze(session, occ.id, minutes=minutes, tomorrow=minutes is None, prefs=prefs, now=now)
-    # A series instance snoozed to tomorrow may have been merged into tomorrow's: [✅ Готово] must point there.
-    target = await session.get(Occurrence, reminder.occurrence_id) or occ
     toast = f"⏰ Напомню {fmt_dt(reminder.fire_at, prefs.zone, now=now)}"
-    return Outcome(views.reminder_snoozed(item, target, reminder, prefs, now), toast, wake_scheduler=True)
+    # No buttons on the snoozed message: the snoozed reminder (of tomorrow's instance, if a series instance was merged
+    # into it) comes again with its own.
+    return Outcome(views.reminder_snoozed(item, reminder, prefs, now), toast, wake_scheduler=True)
 
 
 # --- item cards ----------------------------------------------------------------------------------------------------

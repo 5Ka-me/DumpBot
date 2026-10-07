@@ -22,7 +22,8 @@ Conventions kept by this module:
   moment. Deleting / restoring a parent takes its steps along, restoring a step of a deleted parent brings the
   parent back. A checklist never repeats (no rrule for a parent with steps, nor for a step). What happened to
   parents is collected per session (``take_parent_events``) for the bot's "🎉 Все шаги выполнены" message;
-- related items (§C1): ``item_links`` rows for the earlier items the AI named among the candidates it was shown;
+- related items (§C1): ``item_links`` rows for the earlier items the AI named among the candidates it was shown and
+  that share a subject word with the new item (``services.related``: not a reminder / time word or a common verb);
 - ``updated_at`` is always set explicitly (server-side ``onupdate`` would expire it, and async sessions cannot
   lazy-load).
 """
@@ -50,6 +51,7 @@ from dumpbot.domain import recurrence, timeresolve
 from dumpbot.domain.kinds import ACTIONABLE, KINDS, Precision, SourceKind
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import CreatedItem, PatchResult, ReminderPlan, Resolution
+from dumpbot.services.related import sharing_subject
 
 __all__ = [
     "MAX_CHECKLIST",
@@ -148,7 +150,8 @@ async def create_items(
 ) -> list[CreatedItem]:
     """For each ExtractedItem: resolve_item -> Item (+ Occurrence when it has a due time, + its Reminders), its
     checklist (``steps``; not for a series: every instance would need its own) and links to the earlier items it
-    names in ``related`` — only ids in ``related_allowed`` (the candidates the model was shown; others are dropped).
+    names in ``related`` — only ids in ``related_allowed`` (the candidates the model was shown; others are dropped)
+    whose title / details share a subject word with the new item's (``services.related``).
 
     A link item without URLs of its own gets all URLs of the message. Steps are not in the result (they show in
     their parent's card). Flushes, does not commit.
@@ -264,7 +267,7 @@ async def _create_all(
         created = await _insert(session, item, res)
         if extracted.steps and not item.rec_active:
             await _create_steps(session, item, extracted.steps, prefs, now, model=model, prompt_version=prompt_version)
-        await _link(session, item.id, [i for i in extracted.related if i in allowed])
+        await _link(session, item, [i for i in extracted.related if i in allowed])
         out.append(created)
     log.info("created %d item(s) from raw %s", len(out), raw_id)
     return out
@@ -284,12 +287,17 @@ async def _insert(session: AsyncSession, item: Item, res: Resolution) -> Created
     return CreatedItem(item=item, occurrence=occ, reminders=reminders, resolution=res)
 
 
-async def _link(session: AsyncSession, item_id: int, related_ids: Sequence[int]) -> None:
-    """``item_links`` rows "item is similar to the earlier related item" (at most MAX_RELATED, never itself)."""
-    ids = [i for i in dict.fromkeys(related_ids) if i != item_id][:MAX_RELATED]
+async def _link(session: AsyncSession, item: Item, related_ids: Sequence[int]) -> None:
+    """``item_links`` rows "item is similar to the earlier related item" (at most MAX_RELATED, never itself), only
+    for related items whose title / details share a subject word with the item's (``related.sharing_subject``: the
+    model's "related" alone is not trusted)."""
+    ids = [i for i in dict.fromkeys(related_ids) if i != item.id]
     if not ids:
         return
-    rows = [{"item_id": item_id, "related_id": i, "kind": "similar"} for i in ids]
+    ids = (await sharing_subject(session, f"{item.title} {item.details or ''}", ids))[:MAX_RELATED]
+    if not ids:
+        return
+    rows = [{"item_id": item.id, "related_id": i, "kind": "similar"} for i in ids]
     await session.execute(pg_insert(ItemLink).values(rows).on_conflict_do_nothing())
 
 

@@ -9,6 +9,9 @@ too -> ``AIUnavailable``. A 404 from the fallback never turns a paid primary ans
 ``AIBadResponse``. Images route to vision-capable models (``llm_model`` / ``vision_fallback_model``).
 
 ``split_steps`` (docs/features/iteration-2.md §C2) breaks one task into checklist steps by the same ladder.
+
+After validation the code drops an AM/PM question about a time the message already pins ("в 17" is never 05:00):
+``_drop_pointless_ask``.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from dumpbot.ai.schemas import (
     QuerySpec,
     SplitResult,
     StepSpec,
+    When,
     extraction_json_schema,
     split_json_schema,
 )
@@ -300,7 +304,7 @@ def _image_part(data: bytes, mime: str) -> dict:
 
 
 def _output(ext: Extraction, inp: ExtractInput, model: str, *, missing_model: str | None = None) -> ExtractOutput:
-    ext = _apply_overrides(ext, inp)
+    ext = _drop_pointless_ask(_apply_overrides(ext, inp))
     log.info("extracted with %s: intent=%s items=%d", model, ext.intent, len(ext.items))
     return ExtractOutput(extraction=ext, model=model, prompt_version=PROMPT_VERSION, missing_model=missing_model)
 
@@ -327,6 +331,110 @@ def _edit_from_items(ext: Extraction) -> EditPatch:
     if item.steps:
         return EditPatch(action="split")
     return EditPatch(when=item.when, rrule=item.rrule, lead=item.lead)
+
+
+def _drop_pointless_ask(ext: Extraction) -> Extraction:
+    """No "morning or evening?" question about a time the owner already pinned: an AM/PM question (every option is a
+    clock time, two of them 12 hours apart: "17:00" / "05:00") is dropped when the asked item's time phrase names
+    that hour unambiguously — a 24-hour hour 13..23 or 0 ("в 17", "17:30", "в 00:15", "в семнадцать"), or one with
+    утра / вечера / am / pm. A bare "в 8" stays a question; a phrase without an hour is judged by ``when.time`` only
+    when the phrase is empty. The item stays as the model read it ("low" confidence about that hour becomes "med":
+    no "проверь время" hint)."""
+    ask = ext.ask
+    if ask is None or ask.item >= len(ext.items):
+        return ext
+    hours = [_option_hour(o) for o in ask.options]
+    if any(h is None for h in hours):
+        return ext
+    asked = _am_pm_hours([h for h in hours if h is not None])
+    item = ext.items[ask.item]
+    if not asked or not _pinned(item.when, asked):
+        return ext
+    log.info("dropped an AM/PM question about an unambiguous time (item %d)", ask.item)
+    items = list(ext.items)
+    if item.conf == "low":
+        items[ask.item] = item.model_copy(update={"conf": "med"})
+    return ext.model_copy(update={"ask": None, "items": items})
+
+
+_DAYPART = r"(утра|ночи|дня|вечера|am|pm)"
+# An option of the question as a clock time: "17:00", "05:00", "5", "в 8", "8 вечера", "20 ч".
+_OPTION_RE = re.compile(rf"(?:в|at)?\s*(\d{{1,2}})(?:[:.]([0-5]\d))?\s*(?:ч|h|час|часа|часов)?\s*{_DAYPART}?", re.I)
+_PM_PARTS = frozenset({"дня", "вечера", "pm"})
+# Hours as written in a time phrase: "17:00", "в 17", "к 21", "17 часов"; not a day of month ("13 октября", "к 15-му",
+# "в 17.10") or another unit ("в 15 минутах").
+_CLOCK_RE = re.compile(r"(?<![\d:.])(\d{1,2}):[0-5]\d(?!\d)")
+_AT_HOUR_RE = re.compile(
+    r"\b(?:в|к|до|после|с|около|at|by|around)\s+(\d{1,2})(?!\d|[:.,]\d|\s*[-–])"
+    r"(?!\s*(?:го|е|й|ое|числ|январ|феврал|март|апрел|ма[яе]|июн|июл|август|сентябр|октябр|ноябр|декабр|мин|сек"
+    r"|дн|день|недел|месяц|год|лет|раз|%))",
+    re.I,
+)
+_HOURS_RE = re.compile(r"(?<![\d:.])(\d{1,2})\s*(?:ч\b|час\w*)", re.I)
+# Spoken hours 13..23 (a voice transcript): "в семнадцать", "к двадцати двум"; not "двадцатого" (a day).
+_WORD_HOUR_RE = re.compile(
+    r"\b(тринадцат|четырнадцат|пятнадцат|шестнадцат|семнадцат|восемнадцат|девятнадцат|двадцат)[ьи]\b"
+    r"(?:\s+(один|одна|одного|два|две|двух|двум|три|трёх|трех|трём|трем)\b)?",
+    re.I,
+)
+_WORD_HOURS = {
+    "тринадцат": 13,
+    "четырнадцат": 14,
+    "пятнадцат": 15,
+    "шестнадцат": 16,
+    "семнадцат": 17,
+    "восемнадцат": 18,
+    "девятнадцат": 19,
+    "двадцат": 20,
+}
+_WORD_UNITS = {"од": 1, "дв": 2, "тр": 3}  # by the first two letters: "один", "двух", "трём"
+_DAYPART_AFTER_RE = re.compile(rf"\s*(?:ч\b|час\w*)?\s*{_DAYPART}\b", re.I)
+_HHMM_RE = re.compile(r"(\d{2}):\d{2}")
+
+
+def _option_hour(option: str) -> int | None:
+    """The hour (0..23) of an option that is only a clock time, else None ("Другое", "в пятницу")."""
+    text = " ".join(re.sub(r"[()]", " ", option).split()).strip(" .?!").lower()
+    m = _OPTION_RE.fullmatch(text)
+    if m is None or int(m.group(1)) > 23:
+        return None
+    hour = int(m.group(1))
+    return hour + 12 if m.group(3) in _PM_PARTS and hour < 12 else hour
+
+
+def _am_pm_hours(hours: list[int]) -> set[int]:
+    """Hours on the 12-hour dial (0..11) offered both ways: {5} for 17:00 / 05:00; empty when no two options are
+    12 hours apart (17:00 / 18:00 is another question)."""
+    return {h % 12 for h in hours for other in hours if other != h and other % 12 == h % 12}
+
+
+def _pinned(when: When | None, asked: set[int]) -> bool:
+    """Whether the time phrase pins the asked hour (see ``_drop_pointless_ask``)."""
+    if when is None:
+        return False
+    written = [(h, p) for h, p in _written_hours(when.text) if h % 12 in asked]
+    if written:
+        return any(h == 0 or h >= 13 or pinned for h, pinned in written)
+    m = _HHMM_RE.fullmatch(when.time or "")
+    if when.text.strip() or m is None:
+        return False
+    hour = int(m.group(1))
+    return hour % 12 in asked and (hour == 0 or hour >= 13)
+
+
+def _written_hours(text: str) -> list[tuple[int, bool]]:
+    """Hours (0..23) named in a time phrase, each with whether утра / вечера / am / pm follows it."""
+    out: list[tuple[int, bool]] = []
+    for rx in (_CLOCK_RE, _AT_HOUR_RE, _HOURS_RE):
+        for m in rx.finditer(text):
+            hour = int(m.group(1))
+            if hour <= 23:
+                out.append((hour, _DAYPART_AFTER_RE.match(text, m.end()) is not None))
+    for m in _WORD_HOUR_RE.finditer(text):
+        tens = _WORD_HOURS[m.group(1).lower()]
+        hour = tens + (_WORD_UNITS[m.group(2)[:2].lower()] if tens == 20 and m.group(2) else 0)
+        out.append((hour, False))
+    return out
 
 
 async def answer_query(

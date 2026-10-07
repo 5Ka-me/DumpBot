@@ -19,8 +19,9 @@ the same request gives the same result) -> no retries: the message is saved with
 edit is reported as failed, 😢; Telegram download errors -> ``RetryLater(5 min)``. The fallback model standing in
 for a missing (404) primary -> notice once a day.
 
-Related items and checklists (docs/features/iteration-2.md §C): before ``extract()`` up to 5 earlier items with words
-of the message go into the prompt (RELATED CANDIDATES), and only their ids are kept from the model's ``related``;
+Related items and checklists (docs/features/iteration-2.md §C): before ``extract()`` up to 5 earlier open items sharing
+a subject word with the message (not a reminder / time word or a common verb) go into the prompt (RELATED CANDIDATES),
+and only their ids are kept from the model's ``related``, and only when the titles share a subject word too;
 "переезд, распиши по шагам" comes back with ``steps``; "разбей на шаги" (a reply, or by target) and the card's
 [🪄 Разбить на шаги] (job "split") run the separate "split" call and show the checklist. Edits that close a parent
 by its last step are followed by "🎉 Все шаги выполнены" (``cards.after_steps``).
@@ -643,8 +644,9 @@ async def _dispatch(
 async def _related_candidates(
     ctx: AppContext, raws: Sequence[RawMessage], content: _Content, prefs: Prefs
 ) -> list[dict[str, Any]]:
-    """Earlier items sharing words with the message (§C1) as the prompt's RELATED CANDIDATES: ``{id, kind, title,
-    date}`` (the local date it was saved). None for questions and messages without text."""
+    """Earlier open items sharing a subject word with the message (§C1, ``query.related_candidates``) as the
+    prompt's RELATED CANDIDATES: ``{id, kind, title, date}`` (the local date it was saved). None for questions and
+    messages without text."""
     if content.force_query or not content.text.strip():
         return []
     async with ctx.sessionmaker() as session:

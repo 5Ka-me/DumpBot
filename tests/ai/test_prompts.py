@@ -27,7 +27,7 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v4"
+    assert PROMPT_VERSION == "v5"
 
 
 def test_static_prompt_explains_every_kind():
@@ -66,12 +66,12 @@ def test_static_prompt_describes_the_when_grammar_and_rules():
 
 
 def test_static_prompt_size_budget():
-    # ~2200 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
-    # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60); the static prompt is
-    # a cacheable prefix.
+    # ~2300 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
+    # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60), v5 the 24h-hour and
+    # stricter related rules (~35); the static prompt is a cacheable prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
-    assert estimate < 2300
+    assert estimate < 2350
 
 
 def test_examples_are_valid_extractions_and_rendered():

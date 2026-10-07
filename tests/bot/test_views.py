@@ -363,11 +363,14 @@ def test_reminder_done_and_undone(prefs, now, at, make_item, make_occ, check_vie
 def test_reminder_snoozed(prefs, now, make_item, make_occ, make_reminder, check_view, buttons):
     occ = make_occ(now)
     snoozed = make_reminder(occ, 0, fire_at=now + timedelta(minutes=15))
-    text, kb = check_view(views.reminder_snoozed(make_item(), occ, snoozed, prefs, now))
-    assert lines(text)[1] == "💤 отложено · напомню сегодня в 14:20"
-    assert buttons(kb) == [("✅ Готово", "o:done:10")]
+    text, kb = check_view(views.reminder_snoozed(make_item(), snoozed, prefs, now))
+    assert lines(text) == ["🔔 <b>Купить наушники</b>", "💤 отложено · напомню сегодня в 14:20"]
+    assert kb is None and buttons(kb) == []  # no [✅ Готово]: the snoozed reminder comes with its own buttons
     tomorrow = make_reminder(occ, 0, fire_at=now + timedelta(days=1))
-    assert "напомню завтра в 14:05" in views.reminder_snoozed(make_item(), occ, tomorrow, prefs, now)[0]
+    assert views.reminder_snoozed(make_item(), tomorrow, prefs, now) == (
+        "🔔 <b>Купить наушники</b>\n💤 отложено · напомню завтра в 14:05",
+        None,
+    )
 
 
 # --- lists -------------------------------------------------------------------------------------------------------
@@ -788,7 +791,7 @@ def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_remind
         views.lead_menu(item),
         views.reminder_message(item, occ, rem, prefs, now),
         views.reminder_done(item, occ, prefs, now),
-        views.reminder_snoozed(item, occ, rem, prefs, now),
+        views.reminder_snoozed(item, rem, prefs, now),
         views.morning_digest(data, prefs, now),
         views.evening_digest(data, prefs, now),
         views.rows_list("x", [row], prefs, now),

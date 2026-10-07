@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 
-from dumpbot.db.models import AiUsage, Item
+from dumpbot.db.models import AiUsage, Item, ItemLink
 
 WARSAW = ZoneInfo("Europe/Warsaw")
 MOVE_TEXT = "Переезд в субботу, распиши по шагам"
@@ -242,3 +242,79 @@ async def test_related_earlier_item_line_and_button(e2e: Any) -> None:
     # the earlier item's card names the new one as well (the link works both ways)
     assert "🔗 похоже на: «Купить чехол для наушников Sony» (7 окт)" in related_card.text
     assert first.text != related_card.text
+
+
+async def test_related_only_between_open_items_about_the_same_thing(e2e: Any) -> None:
+    """The owner's report: «Прогуглить про визу в Черногорию» came with "похоже на «Покушать»" (they share only
+    "напомни" and "час") and the question "Напомнить в 17:00 или 05:00?"; the next «Покушать» was "похоже на" the done
+    «Покушать». Now: no candidates from generic words or done items, the model's id is not trusted, no AM/PM question
+    about "в 17"; an open item about the same thing is still linked."""
+    eat_text = "напомни сегодня в 11 покушать"
+    eat_spec = {"kind": "task", "title": "Покушать", "when": {"text": "сегодня в 11", "day": "+0", "time": "11:00"}}
+    e2e.ai.script(eat_text, {"intent": "save", "items": [eat_spec]})
+    await e2e.card_for(e2e.tg.push_message(eat_text))
+    e2e.ai.script("купить наушники", {"intent": "save", "items": [{"kind": "purchase", "title": "Купить наушники"}]})
+    await e2e.card_for(e2e.tg.push_message("купить наушники"))
+    await e2e.idle()
+    eat, headphones = await e2e.item("Покушать"), await e2e.item("Купить наушники")
+
+    # 10:55 the reminder, [✅ Готово] at 11:00: «Покушать» is done
+    sent_before = len(e2e.tg.sent)
+    await e2e.tick(local(2026, 10, 6, 10, 55))
+    [reminder] = [c for c in e2e.tg.sent[sent_before:] if c.text.startswith("🔔 ")]  # (and the morning digest)
+    assert reminder.text.startswith("🔔 <b>Покушать</b>")
+    e2e.clock.set(local(2026, 10, 6, 11, 0))
+    e2e.tg.push_callback(reminder, reminder.button("o:done:"))
+    await e2e.wait(lambda: e2e.tg.edits_of(reminder.message_id), "the reminder edited")
+    assert (await e2e.item("Покушать")).status == "done"
+
+    # the live message: what the model answered then (an AM/PM question about "в 17", a related id it was not shown)
+    visa_text = "Напомни часов в 17 прогуглить про визу в черногорию"
+    visa = {
+        "kind": "task",
+        "title": "Прогуглить про визу в Черногорию",
+        "when": {"text": "в 17", "time": "17:00", "role": "event"},
+        "conf": "high",
+        "related": [eat.id, headphones.id],
+    }
+    ask = {"q": "Напомнить в 17:00 или 05:00?", "options": ["17:00", "05:00"]}
+    e2e.ai.script(visa_text, {"intent": "save", "items": [visa], "ask": ask})
+    message_id = e2e.tg.push_message(visa_text)
+    card = await e2e.card_for(message_id)
+    await e2e.reaction(message_id, "👌")
+    await e2e.idle()
+    assert e2e.ai.extraction_requests()[-1].line("RELATED CANDIDATES") is None  # "напомни", "часов": generic
+    assert card.text.split("\n")[:2] == [
+        "📌 <b>Прогуглить про визу в Черногорию</b>",
+        "⏰ сегодня 17:00 · напомню в 16:55",
+    ]
+    assert "🔗" not in card.text and "⚠️" not in card.text
+    assert labels(card) == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить", "🪄 Разбить на шаги"]
+    assert e2e.tg.replies_to(message_id) == [card]  # no question
+    assert "🤔" not in e2e.tg.reactions(message_id)
+    assert (await e2e.raw(message_id)).status == "done"
+
+    # «Покушать» again: the done one is no candidate, the model's id for it is dropped
+    e2e.ai.script("покушать", {"intent": "save", "items": [{"kind": "task", "title": "Покушать", "related": [eat.id]}]})
+    card = await e2e.card_for(e2e.tg.push_message("покушать"))
+    await e2e.idle()
+    assert e2e.ai.extraction_requests()[-1].line("RELATED CANDIDATES") is None
+    assert "🔗" not in card.text
+
+    # an open item about the same thing is still a candidate and linked
+    def sony(req: Any) -> dict[str, Any]:
+        candidates = json.loads(req.line("RELATED CANDIDATES ").removeprefix("RELATED CANDIDATES "))
+        return {
+            "intent": "save",
+            "items": [{"kind": "purchase", "title": "Купить наушники Sony", "related": [c["id"] for c in candidates]}],
+        }
+
+    e2e.ai.script("купить наушники Sony", sony)
+    card = await e2e.card_for(e2e.tg.push_message("купить наушники Sony"))
+    shown = [{"id": headphones.id, "kind": "purchase", "title": "Купить наушники", "date": "2026-10-06"}]
+    line = e2e.ai.extraction_requests()[-1].line("RELATED CANDIDATES ")
+    assert line == "RELATED CANDIDATES " + json.dumps(shown, ensure_ascii=False, separators=(",", ":"))
+    assert "🔗 похоже на: «Купить наушники» (6 окт)" in card.text.split("\n")
+    async with e2e.ctx.sessionmaker() as s:
+        links = (await s.execute(select(ItemLink.item_id, ItemLink.related_id))).all()
+    assert [tuple(r) for r in links] == [((await e2e.item("Купить наушники Sony")).id, headphones.id)]
