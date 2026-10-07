@@ -232,7 +232,7 @@ async def _restore(c: ItemCall) -> Outcome:
 
 
 async def _no_reminders(c: ItemCall) -> Outcome:
-    await items.remove_reminders(c.session, c.item.id)
+    await items.remove_reminders(c.session, c.item.id, prefs=c.prefs, now=c.now)
     view = await common.card_view(c.session, c.item, c.prefs, c.now)
     return Outcome(view, "🔕 Напоминания выключены", wake_scheduler=True)
 

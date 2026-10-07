@@ -46,7 +46,8 @@ def day_moment(day: date, prefs: Prefs) -> datetime:
 async def move_not_done(session: AsyncSession, day: date, prefs: Prefs, now: datetime) -> list[Occurrence]:
     """[📅 Перенести невыполненное на завтра] of the evening digest (and of the Mini App's «Сегодня»): what is already
     due and not done on the local ``day`` (open or missed, plus the overdue) goes to ``day`` + 1 at its time of day
-    (``items.move_to_tomorrow``). Items still ahead keep their time and reminder. Returns the moved occurrences."""
+    (``items.move_to_tomorrow``). Items still ahead keep their time and reminder — and so does one whose stated time
+    is still ahead ("за день" before tomorrow's appointment notified today). Returns the moved occurrences."""
     agenda = await query.agenda(session, prefs, day_moment(day, prefs))
     ids = [
         r.occurrence_id
@@ -55,4 +56,4 @@ async def move_not_done(session: AsyncSession, day: date, prefs: Prefs, now: dat
     ]
     if not ids:
         return []
-    return await items.move_to_tomorrow(session, ids, prefs, now, day=day + timedelta(days=1))
+    return await items.move_to_tomorrow(session, ids, prefs, now, day=day + timedelta(days=1), keep_ahead=True)

@@ -1,7 +1,8 @@
 /**
  * In-memory data of the mock API (npm run dev): items with occurrences, reminders, checklists, related items and
  * pictures, built relative to "now" so Today / the week / overdue always have something to show. As in the bot, an
- * item's time is its notification time (no "напомнить за" by default; "за день и за час" = `due` + `later`).
+ * item's time is its notification time (no "напомнить за" by default; "за день и за час" = `earlier` + `due`, the
+ * last notification).
  */
 import type {
   Forward,
@@ -59,8 +60,8 @@ export interface MItem {
   linkTitles: Record<string, string>;
   /** 🔕 */
   remindersOff: boolean;
-  /** Later notifications of the same time ("за день и за час до 10:30": due = the day before, later = [10:15]). */
-  later: number[];
+  /** Notifications before the item's time ("за день и за час до 10:30": due = 09:30, earlier = [the day before]). */
+  earlier: number[];
   rrule: string | null;
   recActive: boolean;
   repeatText: string | null;
@@ -181,7 +182,7 @@ export class MockDb {
       urls: [],
       linkTitles: {},
       remindersOff: false,
-      later: [],
+      earlier: [],
       rrule: null,
       recActive: false,
       repeatText: null,
@@ -230,16 +231,21 @@ export class MockDb {
     item.occId = due === null ? null : this.nextOcc++;
     item.occStatus = due === null ? null : "open";
     item.occDoneAt = null;
-    item.later = [];
+    item.earlier = [];
     item.remindersOff = false;
   }
 
-  /** «⏰ Отложить»: the item's time moves to `fire` (the same occurrence), one notification there. */
+  /** «⏰ Отложить»: the item's time moves to `fire` (the same occurrence), one notification there — never earlier: to
+   * before its time, the item keeps it and gets one more notification then (as the bot's `items.snooze`). */
   snooze(item: MItem, fire: number): void {
+    if (item.due !== null && fire < item.due) {
+      item.earlier = [...item.earlier.filter((t) => t > fire), fire].sort((a, b) => a - b);
+      return;
+    }
     item.due = fire;
     if (!["exact", "slot", "relative", "date", "fallback"].includes(item.precision)) item.precision = "exact";
     item.period = null;
-    item.later = [];
+    item.earlier = [];
   }
 
   // --- views -----------------------------------------------------------------------------------------------------
@@ -253,11 +259,12 @@ export class MockDb {
     return item.role === "deadline" ? `до ${when}` : when;
   }
 
-  /** The pending notifications: the item's time itself, its later ones, a deadline's evening before. */
+  /** The pending notifications: the earlier ones, the item's time itself, a deadline's evening before. */
   reminders(item: MItem, now: number): Reminder[] {
     if (item.due === null || item.occStatus !== "open" || item.someday || item.remindersOff) return [];
     const auto = !["exact", "slot", "relative"].includes(item.precision);
-    const times = [item.due, ...item.later].map((fire) => ({ fire, lead: 0, auto }));
+    const due = item.due;
+    const times = [...item.earlier, due].map((fire) => ({ fire, lead: Math.max(0, Math.round((due - fire) / MIN)), auto }));
     if (item.role === "deadline") {
       const eve = addDays(zoned(item.due, this.prefs.tz).date, -1);
       const fire = zonedToUtc(`${eve}T${this.prefs.task_default_time}`, this.prefs.tz).getTime();
@@ -269,23 +276,34 @@ export class MockDb {
       .map((t, i) => ({ id: item.id * 100 + i, fire_at: iso(t.fire)!, lead_minutes: t.lead, auto: t.auto, status: "pending" }));
   }
 
-  /** The card's time line, as the bot's: "🔔 завтра 13:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00". */
+  /** The card's time line, as the bot's: "🔔 завтра 13:00", "🔔 завтра 09:30 и 10:15", "⏳ до пт 9 окт · 🔔 чт 19:00,
+   * пт 10:00" — the notifications grouped by day. */
   cardWhen(item: MItem, now: number): string | null {
     if (item.someday) return "🌙 когда-нибудь";
     const tz = this.prefs.tz;
     const today = this.today(now);
     const reminders = this.reminders(item, now);
-    const byDay = reminders.map((r) => {
-      const z = zoned(r.fire_at, tz);
-      const delta = daysBetween(today, z.date);
-      const day = delta === 0 ? "сегодня" : delta === 1 ? "завтра" : delta < 7 ? fmtDate(z.date).split(" ")[0] : fmtDate(z.date, today, false);
-      return `${day} ${z.time}`;
-    });
-    if (item.period) return `🗓 ${item.period.label} (до ${fmtDate(item.period.end, today, false)})${byDay.length ? ` · 🔔 ${byDay.join(", ")}` : ""}`;
+    const shortDay = (date: string) => {
+      const delta = daysBetween(today, date);
+      return delta === 0 ? "сегодня" : delta === 1 ? "завтра" : delta < 7 ? (fmtDate(date).split(" ")[0] ?? "") : fmtDate(date, today, false);
+    };
+    const byDay = (label: (date: string) => string) => {
+      const days = new Map<string, string[]>();
+      for (const r of reminders) {
+        const z = zoned(r.fire_at, tz);
+        const times = days.get(z.date) ?? [];
+        if (!times.includes(z.time)) times.push(z.time);
+        days.set(z.date, times);
+      }
+      const joined = (times: string[]) => (times.length === 1 ? times[0] : `${times.slice(0, -1).join(", ")} и ${times[times.length - 1]}`);
+      return [...days].map(([date, times]) => `${label(date)} ${joined(times)}`).join(", ");
+    };
+    const notify = reminders.length ? ` · 🔔 ${byDay(shortDay)}` : "";
+    if (item.period) return `🗓 ${item.period.label} (до ${fmtDate(item.period.end, today, false)})${notify}`;
     if (item.due === null) return null;
-    if (item.role === "deadline") return `⏳ до ${this.rowWhen(item, now)?.replace(/^до /, "")}${byDay.length ? ` · 🔔 ${byDay.join(", ")}` : ""}`;
+    if (item.role === "deadline") return `⏳ до ${this.rowWhen(item, now)?.replace(/^до /, "")}${notify}`;
     if (item.occStatus === "done") return `⏰ ${this.rowWhen(item, now)}`;
-    if (reminders.length) return `🔔 ${reminders.map((r) => fmtDateTime(r.fire_at, tz, now)).join(" · ")}`;
+    if (reminders.length) return `🔔 ${byDay((date) => fmtDate(date, today))}`;
     if (item.due <= now) return `⏰ ${fmtDateTime(item.due, tz, now)} · просрочено`;
     return `🔕 ${fmtDateTime(item.due, tz, now)}`;
   }
@@ -487,15 +505,15 @@ function seed(db: MockDb, now: number): void {
   const ago = (days: number, hours = 0) => now - days * DAY - hours * 3_600_000;
 
   db.add({ id: 1, kind: "task", title: "Позвонить в банк", tags: ["финансы"], due: at(today, "15:00"), precision: "exact", created: ago(1, 3) }, now);
-  // "напомни за час и за 15 минут": notified at 09:30 and 10:15, the 10:30 itself is in the title
+  // "напомни за час и за 15 минут": notified at 09:30 and 10:15 (the item's time), the 10:30 itself is in the title
   db.add(
     {
       id: 2,
       kind: "event",
       title: "Стоматолог (10:30)",
       details: "Кабинет 12, взять полис",
-      due: at(day(1), "09:30"),
-      later: [at(day(1), "10:15")],
+      due: at(day(1), "10:15"),
+      earlier: [at(day(1), "09:30")],
       precision: "exact",
       created: ago(3),
     },

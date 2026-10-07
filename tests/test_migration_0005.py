@@ -83,19 +83,26 @@ async def _seed(url: str) -> dict[str, int]:
         async with engine.begin() as conn:
 
             async def item(
-                key: str, *, leads: list[int] | None = None, role: str = "event", series: bool = False
+                key: str,
+                *,
+                leads: list[int] | None = None,
+                role: str = "event",
+                series: bool = False,
+                title: str | None = None,
+                status: str = "open",
             ) -> int:
                 row = await conn.execute(
                     text(
-                        "INSERT INTO items (kind, title, when_spec, lead_minutes, rrule, rec_active) "
-                        "VALUES ('event', :title, CAST(:spec AS jsonb), :leads, :rrule, :series) RETURNING id"
+                        "INSERT INTO items (kind, title, when_spec, lead_minutes, rrule, rec_active, status) "
+                        "VALUES ('event', :title, CAST(:spec AS jsonb), :leads, :rrule, :series, :status) RETURNING id"
                     ),
                     {
-                        "title": key,
+                        "title": title or key,
                         "spec": json.dumps({"text": key, "role": role}),
                         "leads": leads,
                         "rrule": "FREQ=DAILY" if series else None,
                         "series": series,
+                        "status": status,
                     },
                 )
                 ids[key] = row.scalar_one()
@@ -152,6 +159,28 @@ async def _seed(url: str) -> dict[str, int]:
             await occ("occ_g1", g, T(8, 8))
             g2 = await occ("occ_g2", g, T(9, 8))
             await rem(g2, T(8, 8), 1440)
+            # M1: "за час до встречи в 18", 17:00 already sent, still open: the meeting stays at 18:00, no lead left
+            m1 = await occ("occ_m1", await item("sent lead", leads=[60]), T(7, 16))
+            await rem(m1, T(7, 15), 60, status="sent")
+            # M3: "за день и за час" on Fri 15:00, the day-before sent, a snooze waiting on Thu 16:00: due Fri 14:00
+            m3 = await occ("occ_m3", await item("with snooze", leads=[1440, 60]), T(9, 13))
+            await rem(m3, T(8, 13), 1440, status="sent")
+            await rem(m3, T(8, 14), 0)
+            await rem(m3, T(9, 12), 60)
+            # M5: a series "за день и за час" whose day-before has been sent: due at its stated time minus the hour
+            m5 = await occ("occ_m5", await item("series two leads", leads=[1440, 60], series=True), T(9, 13))
+            await rem(m5, T(8, 13), 1440, status="sent")
+            await rem(m5, T(9, 12), 60)
+            # M5b: the same with both still pending: due at the hour before as well, not the day before
+            m5b = await occ("occ_m5b", await item("series both pending", leads=[1440, 60], series=True), T(9, 13))
+            await rem(m5b, T(8, 13), 1440)
+            await rem(m5b, T(9, 12), 60)
+            # U: "стоматолог в пт в 15, напомни за день" titled "(15:00)": due Thursday, the title gets the day
+            u = await occ("occ_u", await item("day lead", leads=[1440], title="Стоматолог (15:00)"), T(9, 13))
+            await rem(u, T(8, 13), 1440)
+            # closed: a done one-off keeps no leads (an undo plans from the stated time)
+            closed = await occ("occ_closed", await item("closed", leads=[60], status="done"), T(5, 13), status="done")
+            await rem(closed, T(5, 12), 60, status="sent")
             # H: a span's first-morning reminder (automatic, before the time) and a done occurrence: untouched
             h = await occ("occ_h", await item("span"), T(16, 17), precision="period")
             await rem(h, T(12, 8), 5820, auto=True)
@@ -175,7 +204,7 @@ async def _state(url: str) -> dict[str, Any]:
         url,
         "SELECT occurrence_id, fire_at, lead_minutes, auto, status FROM reminders ORDER BY occurrence_id, fire_at, id",
     )
-    items = await _run(url, "SELECT title, lead_minutes FROM items")
+    items = await _run(url, "SELECT id, title, lead_minutes FROM items")
     [prefs] = await _run(url, "SELECT prefs FROM user_settings")
     by_occ: dict[int, list[tuple[datetime, int, bool, str]]] = {}
     for occ_id, fire, lead, auto, status in rems:
@@ -183,9 +212,24 @@ async def _state(url: str) -> dict[str, Any]:
     return {
         "due": dict(occs),
         "reminders": by_occ,
-        "leads": {title: leads for title, leads in items},
+        "leads": {item_id: leads for item_id, _, leads in items},
+        "titles": {item_id: title for item_id, title, _ in items},
         "prefs": prefs[0],
     }
+
+
+ITEM_KEYS = (
+    "two leads",
+    "one left",
+    "series",
+    "clash",
+    "sent lead",
+    "with snooze",
+    "series two leads",
+    "series both pending",
+    "day lead",
+    "closed",
+)
 
 
 def test_upgrade_moves_default_leads_and_makes_explicit_leads_the_items_time(scratch_url: str) -> None:
@@ -195,7 +239,9 @@ def test_upgrade_moves_default_leads_and_makes_explicit_leads_the_items_time(scr
 
     command.upgrade(cfg, "head")
     state = asyncio.run(_state(scratch_url))
-    due, rems, leads = state["due"], state["reminders"], state["leads"]
+    due, rems = state["due"], state["reminders"]
+    leads = {key: state["leads"][ids[key]] for key in ITEM_KEYS}
+    titles = {key: state["titles"][ids[key]] for key in ITEM_KEYS}
 
     # A: 12:55 -> 13:00 (11:00 UTC), lead 0
     assert due[ids["occ_a"]] == T(7, 11)
@@ -206,21 +252,42 @@ def test_upgrade_moves_default_leads_and_makes_explicit_leads_the_items_time(scr
     # C: the evening before stays automatic and early; the deadline's own reminder at its time
     assert due[ids["occ_c"]] == T(9, 13)
     assert rems[ids["occ_c"]] == [(T(8, 17), 1200, True, "pending"), (T(9, 13), 0, False, "pending")]
-    # D: due at the first notification, both notifications kept, the leads stay on the item
-    assert due[ids["occ_d"]] == T(8, 13)
+    # D: due at the last notification (Fri 14:00), both notifications kept, the leads stay on the item; the title
+    # names the meeting's own time
+    assert due[ids["occ_d"]] == T(9, 12)
     assert rems[ids["occ_d"]] == [(T(8, 13), 0, False, "pending"), (T(9, 12), 0, False, "pending")]
-    assert leads["two leads"] == [1440, 60]
+    assert (leads["two leads"], titles["two leads"]) == ([1440, 60], "two leads (15:00)")
     # E: only "за час" is left: it is the item's time and its only lead
     assert due[ids["occ_e"]] == T(9, 12)
     assert [r[3] for r in rems[ids["occ_e"]]] == ["sent", "pending"]
-    assert leads["one left"] == [60]
+    assert (leads["one left"], titles["one left"]) == ([60], "one left (15:00)")
     # F: the next instance of the series is due at its notification; the series keeps its lead
     assert (due[ids["occ_f1"]], due[ids["occ_f2"]]) == (T(7, 8), T(8, 7, 45))
     assert rems[ids["occ_f2"]] == [(T(8, 7, 45), 0, False, "pending")]
-    assert leads["series"] == [15]
+    assert (leads["series"], titles["series"]) == ([15], "series (10:00)")
+    # M1: every lead moment sent: the stated 18:00 stays the item's time, without the lead (no "19:00 meeting")
+    assert (due[ids["occ_m1"]], leads["sent lead"], titles["sent lead"]) == (T(7, 16), None, "sent lead")
+    # M3: the snooze is no lead moment: due at "за час", the item keeps that lead only
+    assert (due[ids["occ_m3"]], leads["with snooze"]) == (T(9, 12), [60])
+    assert rems[ids["occ_m3"]] == [
+        (T(8, 13), 1440, False, "sent"),
+        (T(8, 14), 0, False, "pending"),
+        (T(9, 12), 0, False, "pending"),
+    ]
+    # M5: a series is due its stated time minus its smallest lead, whatever has been sent
+    assert (due[ids["occ_m5"]], leads["series two leads"]) == (T(9, 12), [1440, 60])
+    assert (due[ids["occ_m5b"]], leads["series both pending"]) == (T(9, 12), [1440, 60])
+    assert rems[ids["occ_m5b"]] == [(T(8, 13), 0, False, "pending"), (T(9, 12), 0, False, "pending")]
+    assert titles["series two leads"] == "series two leads (15:00)"
+    # U: due the day before, so the title says which day the 15:00 is
+    assert due[ids["occ_u"]] == T(8, 13)
+    assert (leads["day lead"], titles["day lead"]) == ([1440], "Стоматолог (пт 9 окт 15:00)")
+    # a closed one-off loses its leads
+    assert leads["closed"] is None
     # G: another instance is due right there: this one keeps its due, its reminder stays as it was planned
     assert (due[ids["occ_g1"]], due[ids["occ_g2"]]) == (T(8, 8), T(9, 8))
     assert rems[ids["occ_g2"]] == [(T(8, 8), 0, False, "pending")]
+    assert titles["clash"] == "clash"
     # H: a span and a done occurrence are untouched
     assert due[ids["occ_h"]] == T(16, 17)
     assert rems[ids["occ_h"]] == [(T(12, 8), 5820, True, "pending"), (T(16, 17), 0, True, "pending")]

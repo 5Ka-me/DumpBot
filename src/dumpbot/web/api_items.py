@@ -333,7 +333,7 @@ async def _occurrence_of(session: AsyncSession, item: Item, occ_id: int) -> Occu
 
 async def no_reminders(request: web.Request) -> web.Response:
     async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
-        await items.remove_reminders(session, item.id)
+        await items.remove_reminders(session, item.id, prefs=prefs, now=now)
         return Change(message="🔕 Напоминания выключены")
 
     return await _change(request, op)
@@ -365,7 +365,8 @@ async def stop_recurrence(request: web.Request) -> web.Response:
 
 async def snooze(request: web.Request) -> web.Response:
     """``{minutes}`` (1…10080) or ``{tomorrow: true}``: the current open occurrence moves to that time (one reminder
-    then), like the reminder's buttons (``items.snooze``)."""
+    then), like the reminder's buttons (``items.snooze``) — never earlier: an item not due yet keeps its time and gets
+    one more reminder then."""
     body = await read_json(request)
     minutes, tomorrow = body.get("minutes"), body.get("tomorrow") is True
     valid_minutes = isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= SNOOZE_MAX

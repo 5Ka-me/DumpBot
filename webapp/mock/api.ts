@@ -303,7 +303,7 @@ export class MockApi {
         return this.answer(item, "↩️ Не сделано", now);
       case "norem":
         item.remindersOff = true;
-        item.later = [];
+        item.earlier = [];
         return this.answer(item, "🔕 Напоминания выключены", now);
       case "stoprec":
         item.recActive = false;
@@ -311,7 +311,7 @@ export class MockApi {
       case "snooze": {
         if (item.occStatus !== "open" || item.due === null || item.someday) throw conflict("nothing_to_snooze", "Нечего откладывать: у записи нет открытого срока.");
         if (body.tomorrow !== true && !(Number(body.minutes) >= 1 && Number(body.minutes) <= 10080)) throw bad("Нужно либо minutes (1…10080), либо tomorrow: true", "minutes");
-        // The item's time moves there (tomorrow: at its time of day), as the bot's ⏰ buttons.
+        // The item's time moves there (tomorrow: at its time of day), as the bot's ⏰ buttons; never earlier.
         const tz = this.db.prefs.tz;
         const fire =
           body.tomorrow === true

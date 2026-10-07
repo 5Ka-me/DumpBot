@@ -8,8 +8,9 @@ Rules:
   so ``fit`` can drop whole lines to stay within Telegram's 4096-character limit (counted in UTF-16 units);
 - dates are rendered in Russian by ``domain.fmt`` relative to the ``now`` argument (never the wall clock);
 - an item's time is its notification time (docs/requirements.md, 2026-10-07): the card's time line is the moment(s)
-  it notifies — "🔔 сегодня 13:00", "🔔 вс 11 окт 10:00 · пн 12 окт 09:00" ("за день и за час"); "🔕 сегодня 13:00"
-  with reminders off, "⏰ сегодня 13:00 · просрочено" once past, "⏰ сегодня 13:00" when done;
+  it notifies, grouped by day — "🔔 сегодня 13:00", "🔔 завтра 09:30 и 10:15", "🔔 вс 11 окт 10:00, пн 12 окт
+  09:00" ("за день и за час"); "🔕 сегодня 13:00" with reminders off, "⏰ сегодня 13:00 · просрочено" once past,
+  "⏰ сегодня 13:00" when done;
 - fuzzy time (docs/features/iteration-2.md §A) has its own time lines: "🗓 на этой неделе (до вс 11 окт) · 🔔 пт
   19:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00", "🌙 когда-нибудь";
 - checklists and related items (§C): a parent's card lists its steps "☐ 1. Упаковать вещи" with a [☐ 1] / [☑ 1]
@@ -75,7 +76,7 @@ from dumpbot.bot.keyboards import (
     reminder_keyboard,
     undone_keyboard,
 )
-from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_time
+from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS, KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import SLOT_LABELS, SLOT_NAMES, Prefs
 from dumpbot.domain.recurrence import describe_rrule_ru
@@ -134,6 +135,7 @@ _SEASON_WORDS: Final[dict[int, tuple[str, str]]] = {
     12: ("зимой", "этой зимой"),
 }
 NEEDS_CONFIRM_HINT: Final = "проверь, правильно ли я понял"
+LATE_AFTER: Final = timedelta(minutes=2)  # a reminder sent later than this after its time says so
 
 # --- text helpers ------------------------------------------------------------------------------------------------
 
@@ -241,18 +243,33 @@ def _occ_done(item: Item, occ: Occurrence | None) -> bool:
 
 
 def _notify_times(pending: Sequence[Reminder], tz: ZoneInfo, now: datetime) -> str:
-    """ "🔔 сегодня 13:00", several "🔔 вс 11 окт 10:00 · пн 12 окт 09:00": when the item notifies."""
-    return "🔔 " + " · ".join(dict.fromkeys(fmt_dt(r.fire_at, tz, now=now) for r in pending))
+    """When the item notifies: "🔔 сегодня 13:00", "🔔 завтра 09:30 и 10:15", "🔔 вс 11 окт 10:00, пн 12 окт 09:00"."""
+    today = _local(now, tz).date()
+    return _notify_line(pending, tz, lambda d: fmt_date(d, today=today))
 
 
 def _notify_days(pending: Sequence[Reminder], tz: ZoneInfo, now: datetime) -> str:
-    """Notifications of a span or a deadline by day: "🔔 пт 19:00", "🔔 чт 19:00, пт 10:00"."""
+    """Notifications of a span or a deadline, days as short as they stay clear: "🔔 пт 19:00", "🔔 чт 19:00, пт
+    10:00"."""
     today = _local(now, tz).date()
-    parts = (
-        f"{fmt_day(_local(r.fire_at, tz).date(), today=today)} {fmt_time(_local(r.fire_at, tz).time())}"
-        for r in pending
-    )
-    return "🔔 " + ", ".join(dict.fromkeys(parts))
+    return _notify_line(pending, tz, lambda d: fmt_day(d, today=today))
+
+
+def _notify_line(pending: Sequence[Reminder], tz: ZoneInfo, day_label: Callable[[date], str]) -> str:
+    """ "🔔 " + the notification moments grouped by day: each day once, its times joined with "и" ("завтра 09:30 и
+    10:15"), the days with commas."""
+    by_day: dict[date, list[str]] = {}
+    for reminder in pending:
+        local = _local(reminder.fire_at, tz)
+        times = by_day.setdefault(local.date(), [])
+        if (clock_time := fmt_time(local.time())) not in times:
+            times.append(clock_time)
+    return "🔔 " + ", ".join(f"{day_label(d)} {_join_ru(times)}" for d, times in by_day.items())
+
+
+def _join_ru(parts: Sequence[str]) -> str:
+    """ "a", "a и b", "a, b и c"."""
+    return parts[0] if len(parts) == 1 else f"{', '.join(parts[:-1])} и {parts[-1]}"
 
 
 def period_label(kind: str | None, start: date, end: date, today: date) -> str:
@@ -357,9 +374,9 @@ def _time_line(
 def time_text(
     item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime
 ) -> str | None:
-    """The card's time line as plain text, for the Mini App: "🔔 сегодня 13:00", "🔔 вс 11 окт 10:00 · пн 12 окт
-    09:00", "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00",
-    "🌙 когда-нибудь"."""
+    """The card's time line as plain text, for the Mini App: "🔔 сегодня 13:00", "🔔 вс 11 окт 10:00, пн 12 окт
+    09:00", "🔔 завтра 09:30 и 10:15", "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00", "⏳ до пт 9 окт · 🔔 чт
+    19:00, пт 10:00", "🌙 когда-нибудь"."""
     if item.someday:
         occ = None
     line = _time_line(item, occ, reminders, prefs, now)
@@ -655,17 +672,18 @@ def reminder_message(
     parent_title: str | None = None,
 ) -> MenuView:
     """Reminder: "🔔 <b>Купить наушники</b>" (the item's time is this notification, so no time line), then for a span
-    "🗓 на этой неделе (до вс 11 окт)", for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00"; then
-    [✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]. A step of a checklist names its parent (``parent_title``):
-    "↳ шаг из «Переезд»".
+    "🗓 на этой неделе (до вс 11 окт)", for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00"; a reminder
+    that comes noticeably late (``_late_line``) says when it was for; then [✅ Готово] / [⏰ 15 мин] [⏰ 1 час]
+    [📅 Завтра]. A step of a checklist names its parent (``parent_title``): "↳ шаг из «Переезд»".
 
-    ``reminder`` is accepted for the contract; the text depends only on the occurrence and ``now``.
+    ``reminder`` is the one being sent (None when the message is re-rendered, e.g. after "↩️ Не сделано").
     """
     lines = [f"🔔 <b>{q(item.title)}</b>"]
     lines += filter(
         None,
         [
             _reminder_context(item, occ, prefs, now),
+            _late_line(reminder, prefs, now),
             _parent_line(parent_title),
             _recurrence_line(item),
             _details_line(item),
@@ -689,6 +707,23 @@ def _reminder_context(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) 
             return f"⏳ срок: {day}"
         return f"⏳ срок: {day} в {fmt_time(local.time())}"
     return None
+
+
+def _late_line(reminder: Reminder | None, prefs: Prefs, now: datetime) -> str | None:
+    """ "⏰ сегодня 13:00 · опоздал на 5 ч" for a reminder sent more than ``LATE_AFTER`` after its time (the PC slept,
+    the bot was down: the scheduler still sends it within ``missed_grace_minutes``) — without it the owner would read
+    the bare title as "now". None for one on time."""
+    if reminder is None or now - reminder.fire_at <= LATE_AFTER:
+        return None
+    minutes = round((now - reminder.fire_at).total_seconds() / 60)
+    return f"⏰ {fmt_dt(reminder.fire_at, prefs.zone, now=now)} · опоздал на {_rough_duration(minutes)}"
+
+
+def _rough_duration(minutes: int) -> str:
+    """ "5 мин", "2 ч 30 мин"; a day or more is rounded to hours ("1 дн 2 ч")."""
+    if minutes >= 1440:
+        minutes = round(minutes / 60) * 60
+    return fmt_duration(minutes)
 
 
 def reminder_done(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> MenuView:
@@ -917,14 +952,15 @@ def help_text() -> str:
             "• время записи — это время напоминания: «встреча в 15» — напомню в 15:00, «в обед» — в 13:00;"
             " задачи без времени — вечером (19:00)",
             "• «напомни за 30 минут до встречи в 15» — напомню в 14:30, а 15:00 останется в названии;"
-            " «за день и за час» — оба раза",
+            " «за день и за час» — оба раза, а в плане запись стоит в день встречи",
             "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00 (и утром первого дня,"
             " если срок ещё не начался); такие дела каждое утро в плане, пока срок идёт",
             "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
             " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
             "• в напоминании: ✅ Готово, ⏰ отложить на 15 мин / 1 час, 📅 на завтра — запись переезжает"
-            " на новое время (и в плане на день, и в приложении)",
+            " на новое время (и в плане на день, и в приложении); напоминание заранее (накануне срока, «за день»)"
+            " просто придёт ещё раз — время записи остаётся",
             "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",
             "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
             "• в тихие часы приходят только напоминания с явно заданным временем",

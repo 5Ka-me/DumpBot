@@ -73,6 +73,7 @@ async def test_reschedule_with_lead(session, make, local, now, prefs):
     assert c.item.lead_minutes == [30]
     assert result.occurrence.due_at == local(2026, 10, 6, 17, 30)
     assert fires(result) == [(local(2026, 10, 6, 17, 30), 0, False)]
+    assert c.item.title == "Встреча с Олегом (18:00)"  # the time it is at, now that the card shows 17:30
 
 
 async def test_lead_without_when_moves_the_notification(session, make, local, now, prefs):
@@ -82,17 +83,21 @@ async def test_lead_without_when_moves_the_notification(session, make, local, no
     assert (result.occurrence.id, result.occurrence.due_at) == (c.occurrence.id, local(2026, 10, 6, 14, 45))
     assert c.item.lead_minutes == [15]
     assert fires(result) == [(local(2026, 10, 6, 14, 45), 0, False)]
+    # The card and /today show 14:45 now: the title keeps the meeting's own time.
+    assert c.item.title == "Встреча с Олегом (15:00)"
     # Another lead counts from the stated 15:00 again, not from 14:45.
     result = await items.apply_patch(session, c.item.id, patch(lead=[60]), prefs, now)
     assert result.occurrence.due_at == local(2026, 10, 6, 14, 0)
     assert c.item.lead_minutes == [60]
+    assert c.item.title == "Встреча с Олегом (15:00)"
 
 
 async def test_several_leads_from_a_reply(session, make, reminders_of, local, now, prefs):
     [c] = await make({**MEETING, "when": {"day": "FR", "time": "15:00"}}, now=now)
     result = await items.apply_patch(session, c.item.id, patch(lead=[60, 1440]), prefs, now)
-    assert result.occurrence.due_at == local(2026, 10, 8, 15, 0)
+    assert result.occurrence.due_at == local(2026, 10, 9, 14, 0)  # the last notification, on the meeting's day
     assert [r.fire_at for r in result.reminders] == [local(2026, 10, 8, 15, 0), local(2026, 10, 9, 14, 0)]
+    assert c.item.title == "Встреча с Олегом (15:00)"
 
 
 async def test_a_new_time_without_a_lead_is_the_notification_time(session, make, local, now, prefs):
@@ -103,6 +108,7 @@ async def test_a_new_time_without_a_lead_is_the_notification_time(session, make,
     assert result.occurrence.due_at == local(2026, 10, 6, 17, 0)
     assert c.item.lead_minutes is None
     assert fires(result) == [(local(2026, 10, 6, 17, 0), 0, False)]
+    assert c.item.title == "Встреча"  # "(15:00)" named the old time
 
 
 async def test_lead_on_a_series_moves_every_instance_ahead(session, make, occurrences_of, local, now, prefs):

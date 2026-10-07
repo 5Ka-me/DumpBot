@@ -123,20 +123,26 @@ describe("with the mock API", () => {
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "Название" })).toBeNull());
   });
 
-  it("shows the item's notification time, no «напомнить за», and a snooze moves the time", async () => {
+  it("shows the item's notification time, no «напомнить за», and a snooze of a due item moves the time", async () => {
     const { api } = useMockApi();
     render(<App outside={false} />);
     await screen.findByText("Позвонить в банк");
     fireEvent.click(screen.getByRole("button", { name: "Задачи" }));
-    // "стоматолог завтра в 10:30, напомни за час и за 15 минут": notified at 09:30 and 10:15
+    // "стоматолог завтра в 10:30, напомни за час и за 15 минут": notified at 09:30 and 10:15, one day named once
     fireEvent.click(await screen.findByText("Стоматолог (10:30)"));
-    expect(await screen.findByText("🔔 завтра 09:30 · завтра 10:15")).toBeInTheDocument();
+    expect(await screen.findByText("🔔 завтра 09:30 и 10:15")).toBeInTheDocument();
     expect(screen.queryByText("Напомнить")).toBeNull();
     expect(screen.queryByText(/как в настройках/)).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "завтра" })); // tomorrow at its time of day: one notification
-    expect(await screen.findByText("⏰ Напомню завтра 09:30")).toBeInTheDocument();
-    expect(await screen.findByText("🔔 завтра 09:30")).toBeInTheDocument();
-    expect(api.db.get(2)!.later).toEqual([]);
+    // not due yet: no snooze (it would never move the item earlier, only add a reminder)
+    expect(screen.queryByText(/Отложить/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Назад" }));
+    // overdue since yesterday 19:00: snoozed to tomorrow, at its time of day, with one notification
+    fireEvent.click(await screen.findByText("Оплатить интернет"));
+    expect(await screen.findByText(/Отложить — запись переедет/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "завтра" }));
+    expect(await screen.findByText("⏰ Напомню завтра 19:00")).toBeInTheDocument();
+    expect(await screen.findByText("🔔 завтра 19:00")).toBeInTheDocument();
+    expect(api.db.get(13)!.earlier).toEqual([]);
   });
 
   it("renames an item with the main button", async () => {

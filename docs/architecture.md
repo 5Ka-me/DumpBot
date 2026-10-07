@@ -183,20 +183,23 @@ def resolve_item(item: ExtractedItem, now: datetime, prefs: Prefs, *, source: So
 def resolve_when(when: When, now: datetime, prefs: Prefs) -> tuple[datetime | None, Precision, list[str], bool]
     """(due_at UTC | None, precision, warnings, needs_confirm) — без напоминаний; используется и для правок."""
 def plan_reminders(due_at: datetime, precision: Precision, role: str, lead: list[int] | None,
-                   prefs: Prefs, now: datetime, *, period: tuple[date, date] | None = None) -> tuple[ReminderPlan, ...]
+                   prefs: Prefs, now: datetime, *, period: tuple[date, date] | None = None,
+                   catch_up: bool = False) -> tuple[ReminderPlan, ...]
 def notify_due(stated: datetime, precision: str, role: str, lead: Sequence[int] | None, prefs: Prefs,
                now: datetime) -> tuple[datetime, tuple[int, ...] | None]
     """(due, leads) записи, названной на stated: без «за N» — stated; «за 30 минут» — на 30 минут раньше; «за день и
-    за час» — самый ранний ещё не прошедший момент, остальные leads — более поздние уведомления. Прошедшие моменты
-    отбрасываются; если не осталось ни одного — stated. Дедлайн сохраняет своё время (leads двигают только его
-    напоминания)."""
+    за час» — последний момент (за час: запись стоит в день встречи), остальные leads — более ранние уведомления.
+    Прошедшие моменты отбрасываются; если не осталось ни одного — stated. Дедлайн сохраняет своё время (leads двигают
+    только его напоминания)."""
 def effective_leads(precision: str, lead) -> list[int]   # exact/slot/relative — любые; date/fallback — кратные 1440;
                                                           # default/period/soon — никаких; 0 — не lead
-def lead_shift(precision: str, role: str, lead) -> int     # насколько уведомление раньше названного (0 у дедлайна)
+def lead_shift(precision: str, role: str, lead) -> int     # насколько время записи раньше названного: наименьший
+                                                          # lead (0 у дедлайна); названное = due + lead_shift
 def shift_back(t, minutes, tz) / shift_forward(t, minutes, tz)   # кратное 1440 — дни по местным часам, иначе UTC
 def next_series_due(rule, dtstart_local, tz, after, *, inclusive=False, shift=0, now=None) -> datetime | None
     """Следующее повторение серии (названные времена правила) минус shift; с shift пропускает повторения, чьё
-    уведомление уже не после now."""
+    названное время уже не после now (у повторения с прошедшим «за N», но не прошедшим временем due в прошлом —
+    `plan_reminders(catch_up=True)` напомнит в само время)."""
 def period_bounds(period: str, now: datetime, prefs: Prefs) -> tuple[date, date]
     """When.period → локальные [start, end]: неделя пн–вс, месяц (YYYY-MM: прошедший → следующий год), ближайший
     незакончившийся сезон (зима дек–фев), soon = сегодня…+soon_days. someday → ValueError."""
@@ -245,22 +248,26 @@ def tomorrow(now: datetime, prefs: Prefs) -> date
 Напоминания (`plan_reminders`; `due_at` — время записи, `lead` — её `Item.lead_minutes`):
 - одно уведомление ровно в `due`: auto=False для времени пользователя (exact/slot/relative), **auto=True** для
   выбранного ботом (date/fallback/default/period/soon). **Никаких «за 5 минут» по умолчанию.**
-- несколько явных leads («за день и за час» = [1440, 60]): due = названное − наибольший; остальные — позже:
-  (due + наибольший) − lead. Какие leads действуют — `effective_leads` (date/fallback — только целые дни).
+- несколько явных leads («за день и за час» = [1440, 60]): due = названное − наименьший (последнее уведомление,
+  запись стоит в день встречи); остальные — раньше, как «накануне» у срока: (due + наименьший) − lead. Какие leads
+  действуют — `effective_leads` (date/fallback — только целые дни).
 - role `deadline` с exact/slot/date/fallback: время записи — сам срок; уведомление в него, а с явными leads — за
   них до срока (у даты-срока утро самого дня остаётся); плюс накануне в `task_default_time`.
 - precision `period` → (2) в due и (1) утром первого дня срока (`bare_date_time`), если срок начинается после
   сегодняшнего дня; `soon` → ровно в due.
 - lead кратный 1440 считается в днях по локальным часам (wall clock), остальные — в UTC.
-- Если `due ≤ now` → напоминаний нет; прошедшие моменты («за …», (1), «накануне») пропускаются.
+- Прошедшие моменты («за …», (1), «накануне», сам due) пропускаются: при `due ≤ now` не остаётся ничего.
+  `catch_up=True` (новое повторение серии: создание, `_create_next`, новый lead, `_set_rrule`, возврат): все
+  моменты «за …» прошли, а названное время нет → одно уведомление в названное время, как `notify_due` у разовой.
 - auto=True → `quiet.shift_out_of_quiet(fire_at, prefs)`. Дубликаты `fire_at` схлопнуть; сортировка по времени.
 
 Повторы (`item.rrule` есть): `normalize_rrule`; время суток = `time` из When (слот/HH:MM) или `task_default_time`;
 `rec_dtstart_local` = дата из `day` («с понедельника», «начиная со следующей пятницы» — от неё отсчитываются INTERVAL и
 голый FREQ=WEEKLY/YEARLY), а если `day` нет, он в прошлом или непонятен — сегодня (локально), в это время (naive);
 `due_at` = `recurrence.next_occurrence(…, after=now, inclusive=True)` минус явный lead (`next_series_due`: правило
-хранит названное время, «каждый пн в 10, напомни за 15 минут» → повторения на 09:45, повторение с уже прошедшим
-уведомлением пропускается); precision `slot`/`exact`/`default`; напоминания для этого повторения — как обычно. Невалидный RRULE → запись без повтора +
+хранит названное время, «каждый пн в 10, напомни за 15 минут» → повторения на 09:45; сегодняшнее повторение, у
+которого прошёл только момент «за N», остаётся и напоминает в само время — и считается в COUNT, как без «за N»);
+precision `slot`/`exact`/`default`; напоминания для этого повторения — как обычно. Невалидный RRULE → запись без повтора +
 warning «не понял правило повтора», needs_confirm.
 
 ### 4.2 domain/recurrence.py  [domain]
@@ -515,12 +522,16 @@ async def snooze(session, occurrence_id: int, *, minutes: int | None = None, tom
     время; `_move`: в ежедневной серии сливается с уже созданным завтрашним), все его pending → cancelled, остаётся
     ровно одно напоминание (auto=False) в это время; у разовой записи явные leads сбрасываются, срок
     (period/soon) и время, выбранное ботом (default), становятся этим точным временем (precision exact).
-    Исключение — дедлайн или срок (они напоминают и раньше своего времени), отложенные на момент до него: время не
-    меняется, напоминания до этого момента → cancelled, добавляется одно, поздние остаются.
+    Раньше своего времени запись не переезжает никогда: отложенная на момент до него (напоминание накануне срока,
+    утро первого дня срока, «за день» из «за день и за час», «Отложить» в Mini App у записи, чьё время не
+    наступило) сохраняет время, напоминания до этого момента → cancelled, добавляется одно, поздние остаются.
     Возвращённое напоминание указывает на occurrence, к которому оно теперь относится."""
 async def delete_item(session, item_id: int, now: datetime) -> None     # soft: status=deleted, deleted_at, rec_active=False, cancel
-async def restore_item(session, item_id: int, now: datetime, prefs: Prefs) -> Item   # undo; будущие напоминания вернуть в pending
-async def remove_reminders(session, item_id: int) -> int                # cancel все pending; вернуть число
+async def restore_item(session, item_id: int, now: datetime, prefs: Prefs) -> Item   # undo; напоминания open
+                                                                        # occurrences, чьё названное время впереди
+async def remove_reminders(session, item_id: int, *, prefs: Prefs | None = None, now: datetime | None = None) -> int
+    """🔕: cancel все pending, lead_minutes=[]; occurrence, сдвинутые «за N», возвращаются на названное время (у
+    серии — все повторения, чьё названное время впереди: следующее не задублирует их). Вернуть число отменённых."""
 async def set_kind(session, item_id: int, kind: str) -> Item
 async def set_title(session, item_id: int, title: str) -> Item
 async def set_tags(session, item_id: int, tags: list[str]) -> Item
@@ -530,7 +541,10 @@ async def apply_patch(session, item_id: int, patch: EditPatch, prefs: Prefs, now
     на это время уведомления (только patch.lead этой же правки сдвигает его раньше; прежние leads разовой записи
     сбрасываются, серия хранит свои для следующих повторений); rrule → включить/заменить повтор (правило хранит
     названное время: due предыдущего + его lead); lead без when → уведомление на lead раньше названного времени
-    (`_shift_by_lead`, «напомни за час»). kind стал ACTIONABLE без времени → напоминание по умолчанию (19:00);
+    (`_shift_by_lead`, «напомни за час»); новый lead серии переставляет и её остальные повторения, чьё названное
+    время впереди (`_relead`). Название: when без lead убирает метку прежнего названного времени («Встреча (15:00)»
+    → 17:00 — «Встреча»), when с lead и lead без when дописывают названное время («(15:00)», на другой день —
+    «(пт 9 окт 15:00)»), как при создании. kind стал ACTIONABLE без времени → напоминание по умолчанию (19:00);
     kind перестал быть ACTIONABLE (задача → идея) без when/rrule и вне активного повтора → open occurrences с
     precision `default` → cancelled вместе с pending-напоминаниями (время, заданное владельцем, остаётся)."""
 async def stop_recurrence(session, item_id: int, now: datetime | None = None) -> Item
@@ -538,13 +552,16 @@ async def stop_recurrence(session, item_id: int, now: datetime | None = None) ->
     вместе с напоминаниями (следующее появляется сразу, как только текущее наступило)."""
 async def ensure_recurring(session, prefs: Prefs, now: datetime) -> int
     """Для каждой записи rec_active и status!=deleted: если нет open-повторения с due_at > now → создать следующее
-    (next_occurrence после max(due_at) существующих) с напоминаниями; open-повторения этой записи, у которых
+    (next_occurrence после названного времени последнего, max(due_at) + lead_shift, и после now) с напоминаниями
+    (`catch_up`); open-повторения этой записи, у которых
     due_at < due_at нового и которые старше 12 ч, → status=missed, кроме тех, у кого есть pending-напоминание
     с fire_at > now (отложенное кнопкой): они ждут его отправки. Возвращает число созданных."""
 async def move_to_tomorrow(session, occurrence_ids: list[int], prefs: Prefs, now: datetime, *,
-                           day: date | None = None) -> list[Occurrence]
+                           day: date | None = None, keep_ahead: bool = False) -> list[Occurrence]
     """+1 день к локальной дате при том же времени суток; due в прошлом → на `day` (по умолчанию
-    `timeresolve.tomorrow`, не раньше сегодня) в то же время, а если и этот момент прошёл — днём позже. Перепланировать."""
+    `timeresolve.tomorrow`, не раньше сегодня) в то же время, а если и этот момент прошёл — днём позже. Перепланировать.
+    Новое время — единственное уведомление разовой записи (явные leads сбрасываются, кроме дедлайна). keep_ahead
+    (вечерний дайджест): не трогать occurrence, чьё названное время ещё впереди («за день» до завтрашней встречи)."""
 ```
 
 Итерация 2, C ([iteration-2.md §C](features/iteration-2.md)): `Item.parent_id/position` — шаг чек-листа (один
@@ -861,7 +878,8 @@ ForceReply).
 Все функции чистые (без I/O), возвращают `(text_html, markup | None)`.
 
 ```python
-# 2026-10-07: строка времени — моменты уведомлений: «🔔 сегодня 13:00», «🔔 вс 11 окт 10:00 · пн 12 окт 09:00»,
+# 2026-10-07: строка времени — моменты уведомлений по дням: «🔔 сегодня 13:00», «🔔 завтра 09:30 и 10:15»,
+# «🔔 вс 11 окт 10:00, пн 12 окт 09:00»,
 # «⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00», «🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00»; без напоминаний —
 # «🔕 завтра 13:00» (у времени по умолчанию «🔕 без напоминания»), прошедшее — «⏰ вчера 18:00 · просрочено»,
 # сделанное — «⏰ сегодня 13:00».
@@ -880,7 +898,8 @@ def edit_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # [�
                                                                           # убрано 2026-10-07)
 def kind_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 9 категорий
 def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime)
-    # "🔔 <b>Купить наушники</b>" (+ «🗓 на этой неделе (до вс 11 окт)» / «⏳ срок: завтра»; без «через 5 мин»)
+    # "🔔 <b>Купить наушники</b>" (+ «🗓 на этой неделе (до вс 11 окт)» / «⏳ срок: завтра»; без «через 5 мин»;
+    # пришедшее позже своего времени больше чем на 2 мин — «⏰ сегодня 13:00 · опоздал на 5 ч»)
     # [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
 def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
 def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> tuple[str, None]
@@ -926,8 +945,8 @@ def help_text() -> str
 `callbacks` (CallbackData в `cbdata.py`): done/undone/snooze (OccCb), edit/del/undel/norem/stoprec/kind/back (ItemCb),
 выбор категории (KindCb), ответ на Ask (AskCb → job "clarify"), выбор записи для правки (PickCb → job "edit"),
 перенос невыполненного (DigestCb: день дайджеста D из данных кнопки, у старых кнопок `d:tmr` — дата сообщения;
-переносятся open-повторения дня D с due ≤ now и просроченные, на D+1 — `move_to_tomorrow(day=D+1)`; то, что ещё
-впереди вечером, не трогается), настройки (SetCb). Изменения → `edit` текущего сообщения (карточки) + `answer()` с тостом.
+переносятся open-повторения дня D с due ≤ now и просроченные, на D+1 — `move_to_tomorrow(day=D+1, keep_ahead=True)`;
+то, что ещё впереди вечером, и то, чьё названное время впереди, не трогается), настройки (SetCb). Изменения → `edit` текущего сообщения (карточки) + `answer()` с тостом.
 Кнопки убранного «⏱ Напомнить за…» в старых сообщениях (ItemCb `lead`, `LeadCb` `l:…`, SetCb `lead`, `ask`
 `lead_minutes`) отвечают «Кнопка устарела» и ничего не меняют.
 

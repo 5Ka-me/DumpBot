@@ -96,11 +96,38 @@ def test_item_card_lunch_notifies_at_13(prefs, now, at, make_item, make_occ, mak
 
 
 def test_item_card_several_notification_times(prefs, now, at, make_item, make_occ, make_reminder, check_view):
-    # "за день и за час до встречи в пн 10:00": due Sun 10:00, then Mon 09:00.
-    occ = make_occ(at(2026, 10, 11, 10, 0), precision="exact")
-    rems = [make_reminder(occ, 0), make_reminder(occ, 0, id=2, fire_at=at(2026, 10, 12, 9, 0))]
+    # "за день и за час до встречи в пн 10:00": the day before (Sun 10:00), then the item's time Mon 09:00.
+    occ = make_occ(at(2026, 10, 12, 9, 0), precision="exact")
+    rems = [make_reminder(occ, 23 * 60), make_reminder(occ, 0, id=2)]
     text, _ = check_view(views.item_card(make_item(kind="event"), occ, rems, prefs, now))
-    assert lines(text)[:2] == ["📅 <b>Купить наушники</b>", "🔔 вс 11 окт 10:00 · пн 12 окт 09:00"]
+    assert lines(text)[:2] == ["📅 <b>Купить наушники</b>", "🔔 вс 11 окт 10:00, пн 12 окт 09:00"]
+
+
+@pytest.mark.parametrize(
+    ("fires", "expected"),
+    [
+        # "за час и за 15 минут до 10:30 завтра": the day once, its times joined
+        ([(7, 9, 30), (7, 10, 15)], "🔔 завтра 09:30 и 10:15"),
+        ([(6, 13, 0), (6, 14, 0), (6, 14, 45)], "🔔 сегодня 13:00, 14:00 и 14:45"),
+        ([(8, 10, 30), (9, 9, 30), (9, 10, 15)], "🔔 чт 8 окт 10:30, пт 9 окт 09:30 и 10:15"),
+    ],
+)
+def test_item_card_groups_notification_times_by_day(
+    prefs, now, at, make_item, make_occ, make_reminder, fires, expected
+):
+    occ = make_occ(at(2026, 10, *fires[-1]), precision="exact")
+    rems = [make_reminder(occ, 0, id=i, fire_at=at(2026, 10, *f)) for i, f in enumerate(fires, start=1)]
+    text, _ = views.item_card(make_item(kind="event"), occ, rems, prefs, now)
+    assert lines(text)[1] == expected
+    assert views.time_text(make_item(kind="event"), occ, rems, prefs, now) == expected
+
+
+def test_deadline_notifications_on_one_day_are_grouped_too(prefs, now, at, make_item, make_occ, make_reminder):
+    # "до завтра 19:00, напомни за час": 18:00 and the evening before at 19:00 on different days, two on one day here
+    item = make_item(when_spec={"role": "deadline"})
+    occ = make_occ(at(2026, 10, 7, 19, 0), precision="exact")
+    rems = [make_reminder(occ, 60, id=1), make_reminder(occ, 0, id=2, fire_at=at(2026, 10, 7, 19, 0))]
+    assert views.time_text(item, occ, rems, prefs, now) == "⏳ до ср 7 окт 19:00 · 🔔 завтра 18:00 и 19:00"
 
 
 def test_item_card_shows_the_reminder_times_themselves(prefs, now, at, make_item, make_occ, make_reminder):
@@ -315,7 +342,7 @@ def test_no_lead_menu_any_more(make_item, buttons):
 # --- reminders ---------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("delta", [timedelta(0), timedelta(minutes=5), timedelta(hours=-2), timedelta(days=1)])
+@pytest.mark.parametrize("delta", [timedelta(0), timedelta(minutes=5), timedelta(minutes=-2), timedelta(days=1)])
 def test_reminder_message(prefs, at, make_item, make_occ, make_reminder, check_view, buttons, delta):
     # The reminder comes at the item's time: just the title, no "через 5 мин".
     due = at(2026, 10, 6, 13, 0)
@@ -328,6 +355,27 @@ def test_reminder_message(prefs, at, make_item, make_occ, make_reminder, check_v
         ("⏰ 1 час", f"o:s60:{BIG}"),
         ("📅 Завтра", f"o:tmr:{BIG}"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("late", "expected"),
+    [
+        (timedelta(minutes=3), "⏰ сегодня 13:00 · опоздал на 3 мин"),
+        (timedelta(hours=2), "⏰ сегодня 13:00 · опоздал на 2 ч"),
+        (timedelta(hours=5, minutes=10), "⏰ сегодня 13:00 · опоздал на 5 ч 10 мин"),
+        (timedelta(hours=21), "⏰ вчера 13:00 · опоздал на 21 ч"),
+    ],
+)
+def test_a_late_reminder_says_when_it_was_for(
+    prefs, at, make_item, make_occ, make_reminder, check_view, late, expected
+):
+    # The PC slept from 12:30: the 13:00 reminder of "Созвон" arrives later — it must not read as "now".
+    occ = make_occ(at(2026, 10, 6, 13, 0))
+    text, _ = check_view(views.reminder_message(make_item(), occ, make_reminder(occ), prefs, occ.due_at + late))
+    assert lines(text) == ["🔔 <b>Купить наушники</b>", expected]
+    # re-rendered without the reminder (after "↩️ Не сделано"): no such line
+    text, _ = views.reminder_message(make_item(), occ, None, prefs, occ.due_at + late)
+    assert lines(text) == ["🔔 <b>Купить наушники</b>"]
 
 
 def test_reminder_message_absolute_time_and_extras(prefs, now, at, make_item, make_occ, check_view):

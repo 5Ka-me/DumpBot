@@ -83,7 +83,9 @@ async def test_a_title_without_the_stated_time_gets_it(make, local, now):
     assert c.occurrence.due_at == local(2026, 10, 6, 14, 30)
     when = {"day": "FR", "time": "15:00"}
     [c] = await make({"kind": "event", "title": "Встреча в 15", "when": when, "lead": [1440]}, now=now)
-    assert c.item.title == "Встреча в 15"  # names the hour already
+    assert c.item.title == "Встреча в 15 (пт 9 окт)"  # names the hour, not the day it is on
+    [c] = await make({"kind": "event", "title": "Встреча в пятницу в 15", "when": when, "lead": [1440]}, now=now)
+    assert c.item.title == "Встреча в пятницу в 15"  # names both
     [c] = await make({"kind": "event", "title": "Созвон", "when": when, "lead": [1440]}, now=now)
     assert c.item.title == "Созвон (пт 9 окт 15:00)"  # notified the day before
     [c] = await make({"kind": "event", "title": "ДР мамы", "when": {"day": "10-12"}, "lead": [1440]}, now=now)
@@ -92,14 +94,29 @@ async def test_a_title_without_the_stated_time_gets_it(make, local, now):
     assert c.item.title == "Обед"  # no lead: the time is the item's own
 
 
+async def test_a_day_lead_keeps_the_day_in_the_title(make, local, now):
+    # "стоматолог в пятницу в 10:30, напомни за день": the model kept "(10:30)" as the prompt's example does, but the
+    # item is due (and listed) on Thursday — the title must say Friday.
+    when = {"day": "FR", "time": "10:30"}
+    [c] = await make({"kind": "event", "title": "Стоматолог (10:30)", "when": when, "lead": [1440]}, now=now)
+    assert (c.item.title, c.occurrence.due_at) == ("Стоматолог (пт 9 окт 10:30)", local(2026, 10, 8, 10, 30))
+    [c] = await make({"kind": "event", "title": "Стоматолог (пт 10:30)", "when": when, "lead": [1440]}, now=now)
+    assert c.item.title == "Стоматолог (пт 10:30)"
+    # a series names the time of day only: its days are in the rule
+    weekly = {"kind": "event", "title": "Планёрка", "when": {"text": "по пятницам в 15", "time": "15:00"}}
+    [c] = await make({**weekly, "rrule": "FREQ=WEEKLY;BYDAY=FR", "lead": [1440]}, now=now)
+    assert (c.item.title, c.occurrence.due_at) == ("Планёрка (15:00)", local(2026, 10, 8, 15, 0))
+
+
 async def test_several_explicit_leads_give_several_notifications(make, reminders_of, local, now):
-    # "стоматолог в пятницу в 10:30, напомни за день и за час"
+    # "стоматолог в пятницу в 10:30, напомни за день и за час": the item's time is the last notification, on the
+    # day of the appointment; the day before notifies earlier.
     when = {"day": "FR", "time": "10:30"}
     [c] = await make({"kind": "event", "title": "Стоматолог (10:30)", "when": when, "lead": [60, 1440]}, now=now)
-    assert c.item.lead_minutes == [1440, 60]
-    assert c.occurrence.due_at == local(2026, 10, 8, 10, 30)  # the first notification is the item's time
+    assert (c.item.lead_minutes, c.item.title) == ([1440, 60], "Стоматолог (10:30)")
+    assert c.occurrence.due_at == local(2026, 10, 9, 9, 30)
     assert await reminders_of(c.occurrence.id) == [
-        (local(2026, 10, 8, 10, 30), "pending", 0, False),
+        (local(2026, 10, 8, 10, 30), "pending", 23 * 60, False),
         (local(2026, 10, 9, 9, 30), "pending", 0, False),
     ]
 

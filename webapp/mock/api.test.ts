@@ -22,28 +22,35 @@ describe("PATCH /api/items/{id} period", () => {
 
 describe("the item's time is its notification time (2026-10-07)", () => {
   const NOW = Date.parse("2026-10-06T08:00:00Z"); // Tue 10:00 in Warsaw
-  const call = (api: MockApi, method: string, path: string, body?: unknown) =>
-    api.handle({ method, path, body, query: new URLSearchParams(), authorization: AUTH }, NOW);
+  const call = (api: MockApi, method: string, path: string, body?: unknown, now = NOW) =>
+    api.handle({ method, path, body, query: new URLSearchParams(), authorization: AUTH }, now);
   type Detail = { item: { when_text: string; occurrence: { due_local: string }; reminders: { fire_at: string }[] }; message: string };
 
-  it("snooze moves the time and leaves one notification there", () => {
+  it("snooze moves the time and leaves one notification there, never earlier", () => {
     const api = new MockApi(NOW);
-    const answer = call(api, "POST", "/api/items/1/snooze", { minutes: 60 }).json as Detail;
-    expect(answer.message).toBe("⏰ Напомню сегодня 11:00");
-    expect(answer.item.occurrence.due_local).toBe("2026-10-06T11:00");
-    expect(answer.item.reminders.map((r) => r.fire_at)).toEqual(["2026-10-06T09:00:00Z"]);
-    expect(answer.item.when_text).toBe("🔔 сегодня 11:00");
-    const today = call(api, "GET", "/api/today").json as { open: { id: number; due_at: string }[] };
-    expect(today.open.find((r) => r.id === 1)?.due_at).toBe("2026-10-06T09:00:00Z");
+    // "Позвонить в банк" at 15:00, snoozed an hour at 10:00: one more reminder at 11:00, still 15:00
+    const early = call(api, "POST", "/api/items/1/snooze", { minutes: 60 }).json as Detail;
+    expect(early.message).toBe("⏰ Напомню сегодня 11:00");
+    expect(early.item.occurrence.due_local).toBe("2026-10-06T15:00");
+    expect(early.item.when_text).toBe("🔔 сегодня 11:00 и 15:00");
 
-    const tomorrow = call(api, "POST", "/api/items/1/snooze", { tomorrow: true }).json as Detail;
-    expect(tomorrow.item.occurrence.due_local).toBe("2026-10-07T11:00");
+    const due = NOW + 5 * 3_600_000 + 5 * 60_000; // 15:05: the time has come
+    const answer = call(api, "POST", "/api/items/1/snooze", { minutes: 60 }, due).json as Detail;
+    expect(answer.message).toBe("⏰ Напомню сегодня 16:05");
+    expect(answer.item.occurrence.due_local).toBe("2026-10-06T16:05");
+    expect(answer.item.reminders.map((r) => r.fire_at)).toEqual(["2026-10-06T14:05:00Z"]);
+    expect(answer.item.when_text).toBe("🔔 сегодня 16:05");
+    const today = call(api, "GET", "/api/today", undefined, due).json as { open: { id: number; due_at: string }[] };
+    expect(today.open.find((r) => r.id === 1)?.due_at).toBe("2026-10-06T14:05:00Z");
+
+    const tomorrow = call(api, "POST", "/api/items/1/snooze", { tomorrow: true }, due).json as Detail;
+    expect(tomorrow.item.occurrence.due_local).toBe("2026-10-07T16:05");
   });
 
   it("lists several notification times and has no «напомнить за»", () => {
     const api = new MockApi(NOW);
     const detail = call(api, "GET", "/api/items/2").json as Record<string, unknown> & Detail["item"];
-    expect(detail.when_text).toBe("🔔 завтра 09:30 · завтра 10:15");
+    expect(detail.when_text).toBe("🔔 завтра 09:30 и 10:15");
     expect("lead_minutes" in detail).toBe(false);
     const refused = call(api, "PATCH", "/api/items/2", { lead: [30] });
     expect(refused.status).toBe(400);

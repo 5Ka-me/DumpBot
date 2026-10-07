@@ -19,6 +19,7 @@ from dumpbot.ai.schemas import MAX_ITEMS, Extraction, When, extraction_json_sche
 from dumpbot.domain.kinds import KINDS
 from dumpbot.domain.prefs import SLOT_NAMES, Prefs
 from dumpbot.domain.timeresolve import resolve_item
+from dumpbot.services import items as items_service
 
 WARSAW = Prefs(tz="Europe/Warsaw")
 
@@ -44,10 +45,30 @@ def test_lead_example_keeps_the_stated_time_in_the_title_and_notifies_before_it(
     assert [r.fire_at for r in res.reminders] == [res.due_at]
 
 
+def test_day_lead_rule_keeps_the_day_in_the_title():
+    """A lead of a day puts the item on the day before: the title the rule asks for names the day it happens
+    ("Стоматолог (пт 10:30)"), and the code keeps such a title as it is."""
+    assert '"Стоматолог (пт 10:30)"' in _line("- lead,")
+    out = {
+        "kind": "event",
+        "title": "Стоматолог (пт 10:30)",
+        "when": {"text": "в пятницу в 10:30", "day": "FR", "time": "10:30"},
+        "lead": [1440],
+    }
+    [item] = Extraction.model_validate({"items": [out]}).items
+    now = datetime(2026, 10, 6, 12, 5, tzinfo=UTC)
+    res = resolve_item(item, now, WARSAW, source="text")
+    assert (res.due_at, res.stated_at) == (
+        datetime(2026, 10, 8, 8, 30, tzinfo=UTC),  # Thu 10:30 Warsaw
+        datetime(2026, 10, 9, 8, 30, tzinfo=UTC),
+    )
+    assert items_service._titled(item.title, res, WARSAW) == "Стоматолог (пт 10:30)"
+
+
 def test_prompt_explains_the_notification_time():
     assert "The time is when the owner is notified" in SYSTEM_PROMPT
     lead = _line("- lead,")
-    assert "[30]" in lead and "[1440, 60]" in lead and "(15:00)" in lead
+    assert "[30]" in lead and "[1440, 60]" in lead and "(15:00)" in lead and "(пт 10:30)" in lead
     assert "remind = the time to ping" not in SYSTEM_PROMPT  # role remind no longer differs from event
 
 

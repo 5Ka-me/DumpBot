@@ -14,8 +14,9 @@ v5: hours 13-23 and 0 are never asked about (the code also drops such an AM/PM q
 same specific subject, never for shared verbs, time words or the same kind.
 v6 (2026-10-07, docs/requirements.md): an item's time is its notification time. ``lead`` = notify N minutes before
 the stated time ("напомни за 30 минут до встречи в 15" → time 15:00, lead [30]: notified at 14:30) and the stated
-time stays in the title ("Встреча (15:00)"); several leads only when asked ("за день и за час"). Role remind no
-longer differs from event (both notify at the time), so the prompt no longer asks for it.
+time stays in the title ("Встреча (15:00)"; with a lead of a day or more its day too: "Стоматолог (пт 10:30)");
+several leads only when asked ("за день и за час"). Role remind no longer differs from event (both notify at the
+time), so the prompt no longer asks for it.
 """
 
 from __future__ import annotations
@@ -292,7 +293,8 @@ conf low, ask with both options. Hours 13-23 and 0 ("в 17", "00:15") are 24h, n
 - role: deadline = до/к/by ("до пятницы" → day FR; a season/month "к лету", "до октября" → day = its first day \
 MM-DD: 06-01, 10-01; only "до конца недели/месяца" → period this_week/this_month); else omit (event).
 - lead, only if asked to notify before the stated time: за 30 минут → [30], за час → [60], за день и за час → \
-[1440, 60]; when = the stated time, also kept in the title: "Встреча с Олегом (15:00)".
+[1440, 60]; when = the stated time, also kept in the title: "Встреча с Олегом (15:00)"; with a lead of a day or \
+more the title keeps the day too: "Стоматолог (пт 10:30)".
 - rrule only for explicit repetition (каждый, по понедельникам, every): RFC 5545 without DTSTART; time of day \
 still in when.time.
 - Past facts (звонил, был) get no when; no time mentioned → no when.

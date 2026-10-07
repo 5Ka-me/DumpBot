@@ -150,7 +150,7 @@ export interface Occurrence {
 export interface Reminder {
   id: number;
   fire_at: IsoDateTime;
-  /** How long before the occurrence's time (0: at it, or a later notification of "за день и за час"). */
+  /** How long before the occurrence's time (0: at it; the day-before notification of "за день и за час": 1380). */
   lead_minutes: number;
   /** Time chosen automatically (moved out of quiet hours). */
   auto: boolean;
@@ -232,8 +232,9 @@ export interface ItemDetail {
   occurrence: Occurrence | null;
   reminders: Reminder[];
   /**
-   * When it notifies: "🔔 завтра 13:00", "🔔 вс 11 окт 10:00 · пн 12 окт 09:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00",
-   * "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00", "🔕 завтра 13:00", "🌙 когда-нибудь".
+   * When it notifies, by day: "🔔 завтра 13:00", "🔔 завтра 09:30 и 10:15", "🔔 вс 11 окт 10:00, пн 12 окт 09:00",
+   * "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00", "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00", "🔕 завтра 13:00",
+   * "🌙 когда-нибудь".
    */
   when_text: string | null;
   steps: Step[];

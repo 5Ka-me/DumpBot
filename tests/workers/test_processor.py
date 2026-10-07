@@ -616,7 +616,8 @@ async def test_edit_time_applies_only_the_time(ctx, fake_ai, bot, make_items, t0
     await processor.handle_edit_time(ctx, {"item_id": created.item.id, "text": "в пятницу 18", "message_id": 558})
 
     item = await get(Item, created.item.id)
-    assert (item.title, item.kind, item.status, item.lead_minutes) == ("Отчёт", "task", "open", [30])
+    # the model's title is dropped; the service names the stated 18:00, since the item's time is 17:30 now
+    assert (item.title, item.kind, item.status, item.lead_minutes) == ("Отчёт (18:00)", "task", "open", [30])
     [occ] = [o for o in await occurrences_of(created.item.id) if o.status == "open"]
     assert occ.due_at == local(2026, 10, 9, 17, 30)  # "за 30 минут" before Friday 18:00
     assert bot.reactions == [(558, "👌")]

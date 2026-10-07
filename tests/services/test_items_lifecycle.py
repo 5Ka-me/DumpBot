@@ -39,9 +39,9 @@ async def test_mark_done_keeps_sent_reminders(session, make, reminders_of, local
     early = min(first, key=lambda r: r.fire_at)
     early.status = "sent"
     await items.mark_done(session, c.occurrence.id, local(2026, 10, 6, 14, 10), prefs)
-    assert c.occurrence.due_at == local(2026, 10, 6, 14, 0)  # "за час и за 10 минут до 15:00": due at the first
+    assert c.occurrence.due_at == local(2026, 10, 6, 14, 50)  # "за час и за 10 минут до 15:00": due at the last
     assert await reminders_of(c.occurrence.id) == [
-        (local(2026, 10, 6, 14, 0), "sent", 0, False),
+        (local(2026, 10, 6, 14, 0), "sent", 50, False),
         (local(2026, 10, 6, 14, 50), "cancelled", 0, False),
     ]
 
@@ -412,16 +412,23 @@ async def test_move_to_tomorrow_merges_into_existing_series_instance(
 
 
 async def test_snooze_leaves_exactly_one_notification(session, make, reminders_of, local, now, prefs):
-    # "встреча завтра в 15:00, напомни за день и за 30 минут": "+15 мин" on the day-before reminder moves the item's
-    # time; it then notifies once, at that time (the owner's decision: snooze moves the time).
+    # "встреча завтра в 15:00, напомни за день и за 30 минут": the item's time is tomorrow 14:30. "+15 мин" on the
+    # day-before reminder does not pull tomorrow's meeting to today: it reminds again at 15:15, 14:30 stays.
     spec = {"kind": "event", "title": "Встреча", "when": {"day": "+1", "time": "15:00"}, "lead": [1440, 30]}
     [c] = await make(spec, now=now)
-    assert c.occurrence.due_at == local(2026, 10, 6, 15, 0)
+    assert c.occurrence.due_at == local(2026, 10, 7, 14, 30)
     day_before = local(2026, 10, 6, 15, 0)
     await items.snooze(session, c.occurrence.id, minutes=15, prefs=prefs, now=day_before)
-    assert c.occurrence.due_at == local(2026, 10, 6, 15, 15)
+    assert (c.occurrence.due_at, c.item.lead_minutes) == (local(2026, 10, 7, 14, 30), [1440, 30])
+    assert [f for f, *_ in await reminders_of(c.occurrence.id, "pending")] == [
+        local(2026, 10, 6, 15, 15),
+        local(2026, 10, 7, 14, 30),
+    ]
+    # Snoozed at its time, the item moves there and notifies once (the owner's decision: snooze moves the time).
+    await items.snooze(session, c.occurrence.id, minutes=15, prefs=prefs, now=local(2026, 10, 7, 14, 30))
+    assert c.occurrence.due_at == local(2026, 10, 7, 14, 45)
     assert c.item.lead_minutes is None
-    assert await reminders_of(c.occurrence.id, "pending") == [(local(2026, 10, 6, 15, 15), "pending", 0, False)]
+    assert await reminders_of(c.occurrence.id, "pending") == [(local(2026, 10, 7, 14, 45), "pending", 0, False)]
 
 
 async def test_snooze_of_a_deadlines_evening_reminder_keeps_the_deadline(

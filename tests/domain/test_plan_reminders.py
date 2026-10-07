@@ -79,26 +79,47 @@ def test_one_explicit_lead_is_already_in_the_due(now: datetime, prefs: Prefs):
 
 
 def test_several_leads_notify_at_each_moment(now: datetime, prefs: Prefs):
-    # "за день и за час до встречи в пт 15:00": due Thu 15:00 (the first), then Fri 14:00.
-    due = L(2026, 10, 8, 15, 0)
+    # "за день и за час до встречи в пт 15:00": due Fri 14:00 (the last), the day before (Thu 15:00) comes earlier.
+    due = L(2026, 10, 9, 14, 0)
     assert fires(plan_reminders(due, "exact", "event", [1440, 60], prefs, now)) == [
+        (L(2026, 10, 8, 15, 0), 23 * 60, False),
         (due, 0, False),
-        (L(2026, 10, 9, 14, 0), 0, False),
     ]
 
 
 def test_three_leads(now: datetime, prefs: Prefs):
-    due = L(2026, 10, 8, 15, 0)  # stated Fri 15:00 minus a day
+    due = L(2026, 10, 9, 14, 30)  # stated Fri 15:00 minus the smallest lead
     plans = plan_reminders(due, "exact", "event", [30, 1440, 60], prefs, now)
-    assert [p.fire_at for p in plans] == [due, L(2026, 10, 9, 14, 0), L(2026, 10, 9, 14, 30)]
+    assert [p.fire_at for p in plans] == [L(2026, 10, 8, 15, 0), L(2026, 10, 9, 14, 0), due]
+
+
+def test_earlier_lead_moments_already_past_are_dropped(prefs: Prefs):
+    # Thu 15:05: "за день" has notified, "за час" (the due) is still ahead; at 14:05 nothing is left.
+    due = L(2026, 10, 9, 14, 0)
+    assert fires(plan_reminders(due, "exact", "event", [1440, 60], prefs, L(2026, 10, 8, 15, 5))) == [(due, 0, False)]
+    assert plan_reminders(due, "exact", "event", [1440, 60], prefs, L(2026, 10, 9, 14, 5)) == ()
+
+
+def test_catch_up_notifies_a_series_instance_at_its_stated_time(prefs: Prefs):
+    # "каждый день в 14:30, напомни за час" sent at 14:05: today's instance is due 13:30, its lead moment is past.
+    due, now = L(2026, 10, 6, 13, 30), L(2026, 10, 6, 14, 5)
+    assert plan_reminders(due, "exact", "event", [60], prefs, now) == ()
+    assert fires(plan_reminders(due, "exact", "event", [60], prefs, now, catch_up=True)) == [
+        (L(2026, 10, 6, 14, 30), 0, False)
+    ]
+    # a lead moment still ahead is planned as usual; past the stated time there is nothing to catch up
+    assert fires(plan_reminders(due, "exact", "event", [60], prefs, L(2026, 10, 6, 13, 0), catch_up=True)) == [
+        (due, 0, False)
+    ]
+    assert plan_reminders(due, "exact", "event", [60], prefs, L(2026, 10, 6, 14, 31), catch_up=True) == ()
 
 
 @pytest.mark.parametrize("precision", ["date", "fallback"])
 def test_automatic_dates_take_whole_day_leads_only(precision: str, now: datetime, prefs: Prefs):
     assert effective_leads(precision, [1440, 60, 30]) == [1440]
-    due = L(2026, 10, 8, 10, 0)  # "за 2 дня и за день до 10 окт": stated Sat 10:00
+    due = L(2026, 10, 9, 10, 0)  # "за 2 дня и за день до 10 окт": stated Sat 10:00, due the day before
     plans = plan_reminders(due, precision, "event", [2880, 1440, 60], prefs, now)
-    assert fires(plans) == [(due, 0, True), (L(2026, 10, 9, 10, 0), 0, True)]
+    assert fires(plans) == [(L(2026, 10, 8, 10, 0), 1440, True), (due, 0, True)]
 
 
 @pytest.mark.parametrize("precision", ["default", "period", "soon", "none", "someday"])
@@ -112,8 +133,9 @@ def test_effective_leads_are_unique_positive_and_largest_first():
     assert effective_leads("exact", None) == []
 
 
-def test_lead_shift_is_the_largest_lead_but_not_for_a_deadline():
-    assert lead_shift("exact", "event", [60, 1440]) == 1440
+def test_lead_shift_is_the_smallest_lead_but_not_for_a_deadline():
+    assert lead_shift("exact", "event", [60, 1440]) == 60
+    assert lead_shift("exact", "event", [1440]) == 1440
     assert lead_shift("slot", "remind", [30]) == 30
     assert lead_shift("exact", "deadline", [60]) == 0
     assert lead_shift("default", "event", [60]) == 0
@@ -131,8 +153,9 @@ def test_notify_due_moves_the_time_by_the_lead(now: datetime, prefs: Prefs):
     assert notify_due(DUE, "exact", "event", [30], prefs, now) == (L(2026, 10, 9, 14, 30), (30,))
 
 
-def test_notify_due_with_several_leads_is_the_first(now: datetime, prefs: Prefs):
-    assert notify_due(DUE, "exact", "event", [60, 1440], prefs, now) == (L(2026, 10, 8, 15, 0), (1440, 60))
+def test_notify_due_with_several_leads_is_the_last(now: datetime, prefs: Prefs):
+    # "за день и за час": the item sits on the day it happens, an hour before; the day before notifies earlier.
+    assert notify_due(DUE, "exact", "event", [60, 1440], prefs, now) == (L(2026, 10, 9, 14, 0), (1440, 60))
 
 
 def test_notify_due_drops_lead_moments_already_past(prefs: Prefs):
@@ -188,7 +211,7 @@ def test_date_deadline_keeps_its_morning_with_a_whole_day_lead(now: datetime, pr
 def test_day_lead_across_autumn_switch(now: datetime, prefs: Prefs):
     stated = L(2026, 10, 25, 19, 0)  # CET, 18:00 UTC
     due, leads = notify_due(stated, "exact", "event", [2880, 1440, 60], prefs, now)
-    assert (due, leads) == (L(2026, 10, 23, 19, 0), (2880, 1440, 60))
+    assert (due, leads) == (L(2026, 10, 25, 18, 0), (2880, 1440, 60))
     plans = plan_reminders(due, "exact", "event", list(leads), prefs, now)
     assert [p.fire_at for p in plans] == [L(2026, 10, 23, 19, 0), L(2026, 10, 24, 19, 0), L(2026, 10, 25, 18, 0)]
     assert stated - plans[1].fire_at == timedelta(hours=25)  # 19:00 CEST = 17:00 UTC

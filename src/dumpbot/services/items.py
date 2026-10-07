@@ -7,16 +7,20 @@ Conventions kept by this module:
 - an item's time is its notification time (docs/requirements.md, 2026-10-07): ``Occurrence.due_at`` is when it
   notifies — "встреча в 15" at 15:00, no default lead. ``Item.lead_minutes`` keeps the explicit leads still in effect
   ("напомни за 30 минут до встречи в 15": [30], the occurrence is due at 14:30 and the title keeps "(15:00)"); with
-  several ("за день и за час") the occurrence is due at the first moment and notifies again at the others
-  (``timeresolve.plan_reminders``). A series keeps its stated times in its rule, each instance is due its lead
-  earlier. A deadline keeps its own time ("до пятницы": the evening before and the day itself). A new time from an
-  edit or the Mini App's picker is the notification time itself (the item's leads go); "напомни за N" alone moves
-  the notification N minutes before the time the owner stated (``_shift_by_lead``); a snooze moves the time;
+  several ("за день и за час") the occurrence is due at the last moment (the hour before: it sits on the day it
+  happens) and notifies at the earlier ones too (``timeresolve.plan_reminders``). The stated time is always the due
+  plus the smallest lead (``_stated_at``): whatever changes the leads re-places the occurrences (``_relead``). A
+  series keeps its stated times in its rule, each instance is due its lead earlier. A deadline keeps its own time
+  ("до пятницы": the evening before and the day itself). A new time from an edit or the Mini App's picker is the
+  notification time itself (the item's leads go, and so does a "(15:00)" of the old time in the title); "напомни за
+  N" alone moves the notification N minutes before the time the owner stated (``_shift_by_lead``), which the title
+  then names; a snooze moves the time — never earlier: snoozed to before it, the item keeps its time;
 - the *current* occurrence of an item is its earliest open one, else the latest by ``due_at`` (cancelled last);
 - re-planning cancels the occurrence's **pending** reminders (sent ones are history) and inserts a fresh plan
   from ``timeresolve.plan_reminders``;
 - ``Item.lead_minutes == []`` means "reminders switched off" (🔕): set by ``remove_reminders``, so the next
-  occurrences of a series stay silent too; an explicit new time or lead switches reminders back on;
+  occurrences of a series stay silent too (they sit at the stated times then); an explicit new time or lead switches
+  reminders back on;
 - precision and role of a recurring series come from ``Item.when_spec`` (moving one instance does not change it);
 - fuzzy time (docs/features/iteration-2.md §A): ``Item.period_kind/period_start/period_end`` keep the span of
   "на этой неделе" & co. and its occurrence has precision ``period`` (reminders (1)/(2) are planned from the span);
@@ -56,7 +60,7 @@ from dumpbot import clock
 from dumpbot.ai.schemas import MAX_RELATED, MAX_STEPS, EditPatch, ExtractedItem, Extraction, StepSpec, When
 from dumpbot.db.models import Item, ItemLink, Occurrence, RawMessage, Reminder, UserSettings
 from dumpbot.domain import recurrence, timeresolve
-from dumpbot.domain.fmt import fmt_date, fmt_time
+from dumpbot.domain.fmt import MONTHS_SHORT, WEEKDAYS_SHORT, fmt_date, fmt_time
 from dumpbot.domain.kinds import ACTIONABLE, KINDS, Precision, SourceKind
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import CreatedItem, PatchResult, ReminderPlan, Resolution
@@ -116,6 +120,13 @@ WARN_STEP_RRULE: Final = "шаг чек-листа не повторяется"
 _FUZZY: Final = ("period", "soon")  # precisions of a span's occurrence: due at its reminder (2), not a named day
 # Precisions a snoozed occurrence keeps; any other (a time the bot chose, a span) becomes the exact new time.
 _SNOOZE_KEEPS: Final = frozenset({"exact", "slot", "relative", "date", "fallback"})
+# A stated time at the end of a title: "(15:00)", "(пт 9 окт 15:00)", "(пт 9 окт)", "(9 окт 2027 15:00)".
+_LABEL_RE: Final = re.compile(
+    rf"\s*\(((?:(?:{'|'.join(WEEKDAYS_SHORT)})\s+)?(?:\d{{1,2}}\s+(?:{'|'.join(MONTHS_SHORT)})(?:\s+\d{{4}})?)?"
+    r"\s*(?:\d{1,2}:\d{2})?)\)\s*$"
+)
+_WEEKDAY_STEMS: Final = ("понедельник", "вторник", r"сред[аеуы]\b", "четверг", "пятниц", "суббот", "воскресен")
+_WEEKDAYS_EN: Final = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 class NotFoundError(LookupError):
@@ -247,7 +258,7 @@ async def _create_all(
         item = Item(
             raw_message_id=raw_id,
             kind=extracted.kind,
-            title=_with_stated_time(extracted.title.strip() or "Без названия", res, prefs),
+            title=_titled(extracted.title.strip() or "Без названия", res, prefs),
             details=extracted.details,
             tags=list(extracted.tags),
             source_text=source_text,
@@ -311,25 +322,78 @@ async def _link(session: AsyncSession, item: Item, related_ids: Sequence[int]) -
     await session.execute(pg_insert(ItemLink).values(rows).on_conflict_do_nothing())
 
 
-def _with_stated_time(title: str, res: Resolution, prefs: Prefs) -> str:
-    """ "Встреча" -> "Встреча (15:00)" when a lead moved the notification before the time the message stated (the
-    item's time is its notification time, so the stated one lives in the title). The prompt asks the model to keep it
-    there; this covers a model that did not: nothing is added when the title already has the hour (or the day of a
-    date) as a number. A stated time on another day than the notification reads "(пт 9 окт 15:00)"."""
+def _titled(title: str, res: Resolution, prefs: Prefs) -> str:
+    """The new item's title, naming the stated time when a lead moved its time before it (``_stated_label``)."""
     if res.stated_at is None or res.due_at is None:
         return title
+    return _stated_label(title, res.stated_at, res.due_at, res.precision, prefs, series=res.rrule is not None)
+
+
+def _stated_label(
+    title: str, stated: datetime, due: datetime, precision: str, prefs: Prefs, *, series: bool = False
+) -> str:
+    """ "Встреча" -> "Встреча (15:00)" when a lead moved the item's time (its notification) before the time the owner
+    stated: the stated one lives in the title. On another day than the notification it reads "(пт 9 окт 15:00)", for
+    a date "(пт 9 окт)"; a series names the time of day only (its days are in the rule). The prompt asks the model to
+    keep it there; nothing is added when the title has it already — the hour as a number, and on another day the day
+    too (its number or weekday). A title with the hour but not the day gets the day: a trailing "(10:30)" becomes
+    "(пт 9 окт 10:30)", otherwise "(пт 9 окт)" is added."""
     tz = prefs.zone
-    stated = res.stated_at.astimezone(tz)
-    timed = res.precision not in ("date", "fallback")
-    if re.search(rf"(?<!\d)0?{stated.hour if timed else stated.day}(?!\d)", title):
+    local = stated.astimezone(tz)
+    timed = precision not in ("date", "fallback")
+    need_day = not timed or (not series and local.date() != due.astimezone(tz).date())
+    has_time = not timed or re.search(rf"(?<![\d:])0?{local.hour}(?!\d)", title) is not None
+    has_day = not need_day or _names_day(title, local.date())
+    if has_time and has_day:
         return title
-    if not timed:
-        label = fmt_date(stated.date())
-    elif stated.date() == res.due_at.astimezone(tz).date():
-        label = fmt_time(stated.time())
-    else:
-        label = f"{fmt_date(stated.date())} {fmt_time(stated.time())}"
+    day, clock_time = fmt_date(local.date()), fmt_time(local.time())
+    label = f"{day} {clock_time}" if timed and need_day else (clock_time if timed else day)
+    if (trailing := _LABEL_RE.search(title)) is not None and trailing.group(1).strip():
+        return f"{title[: trailing.start()]} ({label})"
+    if has_time:  # "Стоматолог в 10:30" stated on another day: only the day is missing
+        label = day
     return f"{title} ({label})"
+
+
+def _names_day(title: str, day: date) -> bool:
+    """Whether the title names this day: its number (not an hour's "9:30") or its weekday ("пт", "пятницу", "Fri")."""
+    low = title.lower()
+    if re.search(rf"(?<![\d:]){day.day}(?![\d:])", low):
+        return True
+    weekday = day.weekday()
+    return (
+        re.search(rf"(?<![а-яё]){WEEKDAYS_SHORT[weekday]}(?![а-яё])", low) is not None
+        or re.search(_WEEKDAY_STEMS[weekday], low) is not None
+        or re.search(rf"\b{_WEEKDAYS_EN[weekday]}", low) is not None
+    )
+
+
+def _drop_stated_label(title: str, stated: datetime, prefs: Prefs) -> str:
+    """The title without a trailing "(15:00)" / "(пт 9 окт 15:00)" / "(пт 9 окт)" that names ``stated`` — a time the
+    item no longer has. Other brackets stay."""
+    trailing = _LABEL_RE.search(title)
+    if trailing is None or not trailing.group(1).strip():
+        return title
+    local = stated.astimezone(prefs.zone)
+    content = trailing.group(1)
+    names = fmt_time(local.time()) in content if ":" in content else str(local.day) in content.split()
+    stripped = title[: trailing.start()].rstrip()
+    return stripped if names and stripped else title
+
+
+def _retitle(
+    item: Item, old_stated: datetime | None, stated: datetime, due: datetime, precision: str, prefs: Prefs
+) -> None:
+    """A new time for the item: a title label naming the old stated time goes when the time of day changed ("Встреча
+    (15:00)" moved to 17:00), and the new stated time is named when a lead puts the item's time before it."""
+    tz = prefs.zone
+    title = item.title
+    if old_stated is not None and old_stated.astimezone(tz).time() != stated.astimezone(tz).time():
+        title = _drop_stated_label(title, old_stated, prefs)
+    if due != stated:
+        title = _stated_label(title, stated, due, precision, prefs, series=bool(item.rec_active and item.rrule))
+    if title != item.title:
+        item.title = title
 
 
 def _item_urls(extracted: ExtractedItem, urls: Sequence[str], *, single: bool) -> list[str]:
@@ -709,9 +773,10 @@ async def snooze(
     неделе") or a time the bot chose becomes this exact time. An instance of a series moves alone (merging into an
     instance already there, e.g. tomorrow's of a daily series).
 
-    A deadline or a span (they remind before their time too: the evening before, the first morning) snoozed to a
-    moment still before its time keeps that time: the snooze replaces the reminders up to then, the deadline's own
-    (later) ones stay. The returned reminder's ``occurrence_id`` is the occurrence it now belongs to.
+    A snooze never moves the time earlier: snoozed to a moment still before it — a deadline's evening reminder, the
+    first morning of a span, the "за день" of "за день и за час", or a Mini App snooze of an item that is not due
+    yet — the item keeps its time; the snooze replaces the reminders up to then, the later ones stay. The returned
+    reminder's ``occurrence_id`` is the occurrence it now belongs to.
     """
     if (minutes is None) == (not tomorrow):
         raise ValueError("snooze needs exactly one of minutes / tomorrow")
@@ -728,7 +793,7 @@ async def snooze(
         fire = timeresolve.localize(day, clock_time, tz).astimezone(UTC)
         if fire <= now:  # "завтра" right after midnight is today, but that time of day has passed
             fire = timeresolve.localize(day + timedelta(days=1), clock_time, tz).astimezone(UTC)
-    if fire < occ.due_at and _reminds_before(item, occ):  # a deadline / a span, snoozed to before its time
+    if fire < occ.due_at:  # snoozed to before its time: the time stays
         await _cancel_pending(session, [occ.id], until=fire)
         lead = int((occ.due_at - fire).total_seconds() // 60)
         [reminder] = await _add_reminders(session, occ.id, [ReminderPlan(fire_at=fire, lead_minutes=lead, auto=False)])
@@ -745,14 +810,6 @@ async def snooze(
     [reminder] = await _add_reminders(session, target.id, [ReminderPlan(fire_at=fire, lead_minutes=0, auto=False)])
     _touch(item)
     return reminder
-
-
-def _reminds_before(item: Item, occ: Occurrence) -> bool:
-    """Whether the occurrence also reminds before its time: a span ((1) on its first morning) or a deadline (the
-    evening before) — its time is more than a notification moment."""
-    return occ.precision == "period" or (
-        _role(item) == "deadline" and occ.precision in ("exact", "slot", "date", "fallback")
-    )
 
 
 # --- delete / restore / reminders off --------------------------------------------------------------------------
@@ -805,19 +862,28 @@ async def _restore(session: AsyncSession, item: Item, prefs: Prefs, now: datetim
     # delete_item cleared rec_active; a stopped-then-deleted series cannot be told apart and resumes too. A series
     # moved to "когда-нибудь" (``_make_someday`` keeps the rule, stopped) can: it stays stopped.
     item.rec_active = item.rrule is not None and item.status == "open" and not item.someday
-    for occ in await _open_occurrences(session, item.id, after=now):
-        await _replan(session, item, occ, prefs, now)
+    series = bool(item.rec_active and item.rrule)
+    for occ in await _open_all(session, item.id):  # still ahead: the time stated for it, not only its due
+        if _stated_at(item, occ, prefs) > now:
+            await _replan(session, item, occ, prefs, now, catch_up=series)
     if item.rec_active:
         await _ensure_next(session, item, prefs, now)
     _touch(item)
 
 
-async def remove_reminders(session: AsyncSession, item_id: int) -> int:
+async def remove_reminders(
+    session: AsyncSession, item_id: int, *, prefs: Prefs | None = None, now: datetime | None = None
+) -> int:
     """Cancel all pending reminders of the item and switch reminders off for it (also for the next occurrences
-    of a series). Returns the number of cancelled reminders."""
+    of a series). Without reminders a lead means nothing: an occurrence it had put before the time the owner stated
+    goes back to that time ("Встреча (15:00)" due 14:30 -> 15:00), every instance of a series still ahead too, so
+    its next ones follow on from the stated times. Returns the number of cancelled reminders.
+
+    ``prefs``/``now`` are optional extensions of the contract (default: the owner's prefs, the current time)."""
     item = await _get_item(session, item_id)
     count = await _cancel_pending(session, await _occurrence_ids(session, item.id))
-    item.lead_minutes = []
+    prefs = prefs if prefs is not None else await _owner_prefs(session)
+    await _relead(session, item, [], prefs, _utc(now) if now is not None else clock.utcnow())
     _touch(item)
     return count
 
@@ -956,7 +1022,7 @@ async def apply_patch(
         await _drop_default(session, item)
 
     if patch.action == "no_reminder":
-        await remove_reminders(session, item.id)
+        await remove_reminders(session, item.id, prefs=prefs, now=now)
     elif patch.action == "stop_recurrence":
         await stop_recurrence(session, item.id, now)
 
@@ -1024,9 +1090,12 @@ async def _reschedule(
     "Когда-нибудь" drops the dates instead (``_make_someday``); a fuzzy span ("на следующей неделе") is kept on
     the item, any other time clears it. An instance of a series moved to a span becomes a plain date. The new time is
     when the item notifies: the item's leads go (a series keeps them for its next instances), only ``lead`` of the
-    same edit moves the notification before it.
+    same edit moves the notification before it — and the title then names the new stated time, while a label of the
+    old one goes ("Встреча (15:00)" moved to 17:00 is "Встреча"). A series given a new lead re-places its other
+    instances still ahead too (``_relead``).
     """
     first = await _first_open(session, item.id)
+    old_stated = _stated_at(item, first, prefs) if first is not None else None
     when = _keep_future_date(when, first, prefs, now)
     stated, precision, when_warnings, confirm = timeresolve.resolve_when(when, now, prefs)
     warnings.extend(when_warnings)
@@ -1041,18 +1110,24 @@ async def _reschedule(
         _set_period(item, *timeresolve.when_period(when, now, prefs))
     elif precision in ("period", "soon"):
         precision = "date"
-    due, kept = timeresolve.notify_due(stated, precision, when.role, _clean_lead(lead), prefs, now)
-    if series:
-        if lead:
-            item.lead_minutes = _clean_lead(lead)
-        elif item.lead_minutes == []:  # a new explicit time switches reminders back on
+    leads = _clean_lead(lead)
+    if series and leads:
+        # The series' new lead: its other instances still ahead move too (no duplicate when the next one is made).
+        await _relead(session, item, leads, prefs, now, exclude=first.id if first is not None else None)
+        shift = timeresolve.lead_shift(precision, when.role, leads)
+        due = timeresolve.shift_back(stated, shift, _rec_zone(item, prefs))
+    elif series:
+        due = stated
+        if item.lead_minutes == []:  # a new explicit time switches reminders back on
             item.lead_minutes = None
     else:
+        due, kept = timeresolve.notify_due(stated, precision, when.role, leads, prefs, now)
         item.lead_minutes = list(kept) if kept else None  # also switches reminders back on
+        _retitle(item, old_stated, stated, due, precision, prefs)
     item.needs_confirm = confirm
     occ = await _move(session, item, first, due, precision)
     await _reopen_for_time(session, item, prefs, now)
-    await _replan(session, item, occ, prefs, now, role=when.role)
+    await _replan(session, item, occ, prefs, now, role=when.role, catch_up=bool(series and leads))
     return True
 
 
@@ -1073,7 +1148,7 @@ def _keep_future_date(when: When, occ: Occurrence | None, prefs: Prefs, now: dat
 
 def _stated_at(item: Item, occ: Occurrence, prefs: Prefs) -> datetime:
     """The time the owner stated for an occurrence: its due (the notification time) plus the item's lead shift
-    ("Встреча (15:00)" due at 14:30 with ``lead_minutes`` [30] -> 15:00)."""
+    ("Встреча (15:00)" due at 14:30 with ``lead_minutes`` [30] -> 15:00; "за день и за час" due at 14:00 -> 15:00)."""
     shift = timeresolve.lead_shift(occ.precision, _role(item), item.lead_minutes or None)
     return timeresolve.shift_forward(occ.due_at, shift, _rec_zone(item, prefs))
 
@@ -1081,26 +1156,56 @@ def _stated_at(item: Item, occ: Occurrence, prefs: Prefs) -> datetime:
 async def _shift_by_lead(session: AsyncSession, item: Item, lead: Sequence[int], prefs: Prefs, now: datetime) -> None:
     """ "Напомни за час" without a new time: the notification moves that long before the time the owner stated
     (``_stated_at``) — of the current open occurrence, or of every instance still ahead for a series (which keeps the
-    lead for its next ones). A lead moment already past leaves the stated time itself."""
-    leads = _clean_lead(lead)
+    lead for its next ones). A lead moment already past leaves the stated time itself. The title names the stated
+    time ("Встреча с Олегом (15:00)"): the item's own time no longer shows it."""
+    moved = await _relead(session, item, _clean_lead(lead), prefs, now)
+    if moved:
+        occ, stated = moved[0]
+        _retitle(item, None, stated, occ.due_at, occ.precision, prefs)
+
+
+async def _relead(
+    session: AsyncSession,
+    item: Item,
+    leads: list[int] | None,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    exclude: int | None = None,
+) -> list[tuple[Occurrence, datetime]]:
+    """The item's explicit leads become ``leads`` (``[]``: reminders off, 🔕). The occurrences they shift move with
+    them, so that the time the owner stated stays due + lead (``_stated_at``) — taken with the old leads first: every
+    open instance of a series whose stated time is still ahead (but ``exclude``), else the current open occurrence.
+    A one-off keeps the leads whose moments are still ahead (``notify_due``: none left -> the stated time itself); a
+    series keeps them all for its next instances (an instance whose lead moment has passed notifies at its stated
+    time). Re-planned; returns the moved occurrences (earliest first) with their stated times."""
     role = _role(item)
-    if item.rec_active and item.rrule:
-        occs = await _open_occurrences(session, item.id, after=now)
+    series = bool(item.rec_active and item.rrule)
+    if series:
+        occs = [occ for occ in await _open_all(session, item.id) if occ.id != exclude]
     else:
         first = await _first_open(session, item.id)
-        occs = [first] if first is not None else []
-    stated = [(occ, _stated_at(item, occ, prefs)) for occ in occs]  # with the old leads
+        occs = [first] if first is not None and first.id != exclude else []
+    stated = [(occ, at) for occ in occs if (at := _stated_at(item, occ, prefs)) > now or not series]  # old leads
     kept: tuple[int, ...] | None = None
-    moved: list[Occurrence] = []
-    for occ, at in stated:  # earliest first: an instance moving earlier frees its place for the next one
-        due, kept = timeresolve.notify_due(at, occ.precision, role, leads, prefs, now)
-        moved.append(await _move(session, item, occ, due, occ.precision))
-    if item.rec_active and item.rrule:
+    targets: list[tuple[Occurrence, datetime, datetime]] = []
+    for occ, at in stated:
+        if series:
+            due = timeresolve.shift_back(at, timeresolve.lead_shift(occ.precision, role, leads), _rec_zone(item, prefs))
+        else:
+            due, kept = timeresolve.notify_due(at, occ.precision, role, leads, prefs, now)
+        targets.append((occ, at, due))
+    if leads == [] or series:
         item.lead_minutes = leads
     elif stated:
         item.lead_minutes = list(kept) if kept else None
-    for occ in moved:
-        await _replan(session, item, occ, prefs, now)
+    # Moving later, the latest goes first (and earlier, the earliest): each frees its place for the next one.
+    later = any(due > occ.due_at for occ, _, due in targets)
+    targets.sort(key=lambda t: t[0].due_at, reverse=later)
+    moved = [(await _move(session, item, occ, due, occ.precision), at) for occ, at, due in targets]
+    for occ, _ in moved:
+        await _replan(session, item, occ, prefs, now, catch_up=series)
+    return sorted(moved, key=lambda m: m[0].due_at)
 
 
 async def _set_rrule(
@@ -1164,7 +1269,7 @@ async def _set_rrule(
             other.status = "cancelled"
             await _cancel_pending(session, [other.id])
     await _reopen_for_time(session, item, prefs, now)
-    await _replan(session, item, occ, prefs, now)
+    await _replan(session, item, occ, prefs, now, catch_up=True)
     return True
 
 
@@ -1298,19 +1403,21 @@ async def _ensure_next(session: AsyncSession, item: Item, prefs: Prefs, now: dat
 
 
 async def _create_next(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Occurrence | None:
-    """Next occurrence after max(latest existing due, now); an exhausted or broken rule deactivates the series."""
+    """Next occurrence whose stated time is after both the latest existing one's (its due plus the lead shift) and
+    ``now``; an exhausted or broken rule deactivates the series. One whose lead moment has passed notifies at its
+    stated time."""
     max_due = await session.scalar(select(func.max(Occurrence.due_at)).where(Occurrence.item_id == item.id))
-    after = max(max_due, now) if max_due is not None else now
     tz = _rec_zone(item, prefs)
     dtstart = item.rec_dtstart_local or datetime.combine(
         now.astimezone(tz).date(), item.rec_time_local or prefs.task_default_time
     )
-    # The rule gives the stated times; each instance is due its lead earlier ("за 15 минут" before 10:00).
+    # The rule gives the stated times; each instance is due its lead earlier ("за 15 минут" before 10:00). Every
+    # change of the leads re-places the open instances (``_relead``), so the latest due plus the shift is the
+    # latest stated time.
     shift = timeresolve.lead_shift(_rec_precision(item), _role(item), item.lead_minutes or None)
+    after = max(timeresolve.shift_forward(max_due, shift, tz), now) if max_due is not None else now
     try:
-        due = timeresolve.next_series_due(
-            item.rrule or "", dtstart, tz, timeresolve.shift_forward(after, shift, tz), shift=shift, now=now
-        )
+        due = timeresolve.next_series_due(item.rrule or "", dtstart, tz, after, shift=shift, now=now)
     except ValueError:
         log.warning("item %s: invalid stored rrule, recurrence stopped", item.id)
         due = None
@@ -1321,7 +1428,7 @@ async def _create_next(session: AsyncSession, item: Item, prefs: Prefs, now: dat
     occ = await _insert_occurrence(session, item.id, due, _rec_precision(item))
     if occ is None:  # created concurrently (e.g. scheduler tick vs. "Готово")
         return None
-    await _plan(session, item, occ, prefs, now)
+    await _plan(session, item, occ, prefs, now, catch_up=True)
     return occ
 
 
@@ -1376,15 +1483,24 @@ def _rec_precision(item: Item) -> Precision:
 
 
 async def move_to_tomorrow(
-    session: AsyncSession, occurrence_ids: list[int], prefs: Prefs, now: datetime, *, day: date | None = None
+    session: AsyncSession,
+    occurrence_ids: list[int],
+    prefs: Prefs,
+    now: datetime,
+    *,
+    day: date | None = None,
+    keep_ahead: bool = False,
 ) -> list[Occurrence]:
     """+1 day to the local date at the same time of day, re-plan. A due in the past goes to ``day`` (default:
     tomorrow, which before ``night_cutoff`` is the day that has just started; never a day in the past) at that
-    time of day, or to the day after when that moment has passed as well.
+    time of day, or to the day after when that moment has passed as well. The new time is the one notification of a
+    one-off item, as after a snooze: its explicit leads go (a deadline keeps them, they only move its reminders).
 
     Done/cancelled occurrences, deleted items and "когда-нибудь" ones (no date on purpose) are skipped. Moving onto
-    an existing occurrence of the same item (a daily series) merges into it. ``day`` is an optional extension of the
-    contract (the evening digest passes its own day + 1).
+    an existing occurrence of the same item (a daily series) merges into it. ``day`` and ``keep_ahead`` are optional
+    extensions of the contract: the evening digest passes its own day + 1, and ``keep_ahead`` (it does too) skips an
+    occurrence whose stated time is still ahead — "за день" before tomorrow's appointment has notified today, but
+    the appointment itself is still to come.
     """
     now = _utc(now)
     tz = prefs.zone
@@ -1397,6 +1513,10 @@ async def move_to_tomorrow(
         item = await _get_item(session, occ.item_id)
         if item.status == "deleted" or item.someday:
             continue
+        if keep_ahead and _stated_at(item, occ, prefs) > now:
+            continue
+        if not (item.rec_active and item.rrule) and item.lead_minutes and _role(item) != "deadline":
+            item.lead_minutes = None
         local = occ.due_at.astimezone(tz)
         new_day = local.date() + timedelta(days=1) if occ.due_at > now else past_due_day
         due = timeresolve.localize(new_day, local.time(), tz).astimezone(UTC)
@@ -1479,6 +1599,16 @@ async def _latest_kept(session: AsyncSession, item_id: int) -> Occurrence | None
     return await session.scalar(stmt)
 
 
+async def _open_all(session: AsyncSession, item_id: int) -> list[Occurrence]:
+    """Every open occurrence of the item, earliest first."""
+    stmt = (
+        select(Occurrence)
+        .where(Occurrence.item_id == item_id, Occurrence.status == "open")
+        .order_by(Occurrence.due_at, Occurrence.id)
+    )
+    return list((await session.scalars(stmt)).all())
+
+
 async def _open_occurrences(session: AsyncSession, item_id: int, *, after: datetime) -> list[Occurrence]:
     stmt = (
         select(Occurrence)
@@ -1501,16 +1631,31 @@ async def _occurrence_ids(session: AsyncSession, item_id: int) -> list[int]:
 
 
 async def _replan(
-    session: AsyncSession, item: Item, occ: Occurrence, prefs: Prefs, now: datetime, *, role: str | None = None
+    session: AsyncSession,
+    item: Item,
+    occ: Occurrence,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    role: str | None = None,
+    catch_up: bool = False,
 ) -> list[Reminder]:
     await _cancel_pending(session, [occ.id])
-    return await _plan(session, item, occ, prefs, now, role=role)
+    return await _plan(session, item, occ, prefs, now, role=role, catch_up=catch_up)
 
 
 async def _plan(
-    session: AsyncSession, item: Item, occ: Occurrence, prefs: Prefs, now: datetime, *, role: str | None = None
+    session: AsyncSession,
+    item: Item,
+    occ: Occurrence,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    role: str | None = None,
+    catch_up: bool = False,
 ) -> list[Reminder]:
-    """Insert the reminder plan for an open occurrence (nothing for deleted / silenced items)."""
+    """Insert the reminder plan for an open occurrence (nothing for deleted / silenced items). ``catch_up``: an
+    instance of a series placed now notifies at its stated time when its lead moments have passed."""
     if item.status == "deleted" or occ.status != "open" or item.lead_minutes == []:
         return []
     plans = timeresolve.plan_reminders(
@@ -1521,6 +1666,7 @@ async def _plan(
         prefs,
         now,
         period=_period_span(item, occ),
+        catch_up=catch_up,
     )
     return await _add_reminders(session, occ.id, plans)
 

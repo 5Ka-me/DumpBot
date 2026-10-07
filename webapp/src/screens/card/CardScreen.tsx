@@ -2,7 +2,9 @@
  * «Карточка»: everything about one item and every edit of the bot — title, details, category, tags, the time (by
  * words through the AI or from the picker, a span, «когда-нибудь»), no reminders, snooze, done / not done, delete /
  * restore, stop repeating, the checklist with «🪄 Разбить на шаги», related items, the source. The item's time is its
- * notification time: the picker sets it, a snooze moves it, «за час до…» goes by words.
+ * notification time: the picker sets it, a snooze moves it, «за час до…» goes by words. The snooze chips show once
+ * the item is due (its time has come): a snooze never moves an item earlier, so before that they would only add a
+ * reminder while saying it moves.
  * An unsaved title / details is a draft (lib/drafts): it comes back after an expired session.
  */
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
@@ -152,6 +154,7 @@ export function CardScreen({ id }: { id: number }) {
   const done = itemDone(item);
   const locked = deleted || busy !== null;
   const occOpen = item.occurrence?.status === "open" && !item.someday;
+  const occDue = occOpen && item.occurrence !== null && Date.parse(item.occurrence.due_at) <= Date.now();
   const pendingReminders = item.reminders.filter((r) => r.status === "pending");
   const sourceText = item.source.text && item.source.text.trim() !== item.title.trim() ? item.source.text : null;
   const allWarnings = [...(item.needs_confirm ? ["🤔 Проверь время — я не уверен, что понял правильно."] : []), ...warnings];
@@ -293,7 +296,7 @@ export function CardScreen({ id }: { id: number }) {
               </button>
             )}
           </div>
-          {occOpen && (
+          {occDue && (
             <div className="field-group field-group--inset">
               <span className="field-label">⏰ Отложить — запись переедет на это время</span>
               <div className="chips">

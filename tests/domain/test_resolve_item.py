@@ -129,10 +129,12 @@ def test_explicit_lead_moves_the_due(now: datetime, prefs: Prefs):
 
 
 def test_several_leads_give_several_notifications(now: datetime, prefs: Prefs):
+    # "за день и за час до встречи в пт 15": the item's time is the last notification (Fri 14:00), on the day of
+    # the meeting; the day before notifies earlier, like a deadline's evening before.
     res = resolve_item(item("event", when={"day": "FR", "time": "15:00"}, lead=[1440, 60]), now, prefs, source="text")
-    assert (res.due_at, res.leads, res.stated_at) == (L(2026, 10, 8, 15, 0), (1440, 60), L(2026, 10, 9, 15, 0))
+    assert (res.due_at, res.leads, res.stated_at) == (L(2026, 10, 9, 14, 0), (1440, 60), L(2026, 10, 9, 15, 0))
     assert [(r.fire_at, r.lead_minutes) for r in res.reminders] == [
-        (L(2026, 10, 8, 15, 0), 0),
+        (L(2026, 10, 8, 15, 0), 23 * 60),
         (L(2026, 10, 9, 14, 0), 0),
     ]
 
@@ -305,11 +307,39 @@ def test_weekly_with_a_lead_is_due_its_lead_earlier(now: datetime, prefs: Prefs)
     assert [r.fire_at for r in res.reminders] == [L(2026, 10, 12, 9, 45)]
 
 
-def test_daily_series_skips_today_when_its_lead_moment_has_passed(now: datetime, prefs: Prefs):
-    # 14:05: "каждый день в 14:30, напомни за час" — today's 13:30 is gone, tomorrow 13:30 is the first.
+def test_daily_series_keeps_today_when_only_its_lead_moment_has_passed(now: datetime, prefs: Prefs):
+    # 14:05: "каждый день в 14:30, напомни за час" — the 13:30 lead moment is gone, but today's 14:30 is not: it
+    # notifies at 14:30, as "в 14:30, напомни за час" without "каждый день" does. Its due stays 13:30 (stated minus
+    # the lead), so the next instances follow on from it.
     it = item(when={"text": "каждый день в 14:30", "time": "14:30"}, rrule="FREQ=DAILY", lead=[60])
     res = resolve_item(it, now, prefs, source="text")
-    assert res.due_at == L(2026, 10, 7, 13, 30)
+    assert (res.due_at, res.stated_at) == (L(2026, 10, 6, 13, 30), L(2026, 10, 6, 14, 30))
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 14, 30), lead_minutes=0, auto=False),)
+    one_off = resolve_item(item(when={"time": "14:30"}, lead=[60]), now, prefs, source="text")
+    assert [r.fire_at for r in one_off.reminders] == [L(2026, 10, 6, 14, 30)]
+
+
+def test_weekly_with_a_lead_sent_on_the_day_keeps_that_days_instance(prefs: Prefs):
+    # Fri 10:00: "каждую пятницу в 15, напомни за день" — today's 15:00 is still ahead: notified then, not skipped
+    # to Thursday next week.
+    now = L(2026, 10, 9, 10, 0)
+    it = item(when={"text": "каждую пятницу в 15", "time": "15:00"}, rrule="FREQ=WEEKLY;BYDAY=FR", lead=[1440])
+    res = resolve_item(it, now, prefs, source="text")
+    assert (res.due_at, res.stated_at) == (L(2026, 10, 8, 15, 0), L(2026, 10, 9, 15, 0))
+    assert [r.fire_at for r in res.reminders] == [L(2026, 10, 9, 15, 0)]
+
+
+def test_count_is_not_used_up_by_an_instance_skipped_for_its_lead(now: datetime, prefs: Prefs):
+    # 14:05: "каждый день в 14:30, 3 раза, напомни за час" — today, tomorrow and the day after, as without the lead.
+    it = item(when={"text": "каждый день в 14:30, 3 раза", "time": "14:30"}, rrule="FREQ=DAILY;COUNT=3", lead=[60])
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.rec_dtstart_local == datetime(2026, 10, 6, 14, 30)
+    tz = prefs.zone
+    stated, instances = res.stated_at, []
+    while stated is not None:
+        instances.append(stated)
+        stated = recurrence.next_occurrence(res.rrule, res.rec_dtstart_local, tz, stated)
+    assert instances == [L(2026, 10, 6, 14, 30), L(2026, 10, 7, 14, 30), L(2026, 10, 8, 14, 30)]
 
 
 def test_count_is_not_used_up_by_a_time_already_past_today(now: datetime, prefs: Prefs):

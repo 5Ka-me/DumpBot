@@ -413,11 +413,12 @@ async def test_no_reminders_delete_restore_stoprec(api, make_items) -> None:
 
 
 async def test_snooze(api, make_items, db) -> None:
-    [created] = await make_items({"kind": "task", "title": "Позвонить", "when": TOMORROW_13})
+    # Yesterday's 13:00, not done: the snooze moves the item's time (2026-10-07), exactly one pending reminder there.
+    yesterday = datetime(2026, 10, 5, 8, 0, tzinfo=UTC)
+    [created] = await make_items({"kind": "task", "title": "Позвонить", "when": {"time": "13:00"}}, now=yesterday)
     path = f"/api/items/{created.item.id}/snooze"
     reply = await api.post(path, {"minutes": 15})
     assert reply.data["message"] == "⏰ Напомню сегодня 10:15"
-    # The snooze moves the item's time (2026-10-07): exactly one pending reminder, there.
     assert reply.data["item"]["occurrence"]["due_local"] == "2026-10-06T10:15"
     fires = sorted(r.fire_at for r in await db(select(Reminder).where(Reminder.status == "pending")))
     assert [f.isoformat() for f in fires] == ["2026-10-06T08:15:00+00:00"]
@@ -426,6 +427,21 @@ async def test_snooze(api, make_items, db) -> None:
     assert reply.data["item"]["when_text"] == "🔔 завтра 10:15"
     for body in [{}, {"minutes": 0}, {"minutes": 10081}, {"minutes": 5, "tomorrow": True}, {"minutes": "5"}]:
         assert (await api.post(path, body)).status == 400, body
+
+
+async def test_snooze_never_moves_an_item_earlier(api, make_items, db) -> None:
+    # Tomorrow's 13:00 snoozed 15 minutes today (an app opened before the change still shows the chips): one more
+    # reminder at 10:15, and the item stays tomorrow at 13:00 with its own.
+    [created] = await make_items({"kind": "task", "title": "Позвонить", "when": TOMORROW_13})
+    path = f"/api/items/{created.item.id}/snooze"
+    reply = await api.post(path, {"minutes": 15})
+    assert reply.data["message"] == "⏰ Напомню сегодня 10:15"
+    assert reply.data["item"]["occurrence"]["due_local"] == "2026-10-07T13:00"
+    fires = sorted(r.fire_at for r in await db(select(Reminder).where(Reminder.status == "pending")))
+    assert [f.isoformat() for f in fires] == ["2026-10-06T08:15:00+00:00", "2026-10-07T11:00:00+00:00"]
+    reply = await api.post(path, {"tomorrow": True})
+    assert reply.data["message"] == "⏰ Напомню завтра 13:00"
+    assert reply.data["item"]["when_text"] == "🔔 завтра 13:00"
 
     [note] = await make_items({"kind": "note", "title": "Заметка"})
     reply = await api.post(f"/api/items/{note.item.id}/snooze", {"minutes": 15})
