@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from sqlalchemy import select
 
-from dumpbot.ai.client import AIBadResponse, AIConfigError, AIModelNotFound, AIUnavailable
+from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
 from dumpbot.ai.stt import ORDER_BY_MODE, ChutesWhisperSTT, LocalWhisperSTT, RoutedSTT, SpeechToText
 from dumpbot.db.models import AiUsage
 from dumpbot.domain.prefs import STT_MODES
@@ -61,6 +61,15 @@ async def test_local_url_with_a_trailing_slash(fake, make_settings):
     assert await _transcribe(stt) == "ok"
 
 
+@pytest.mark.parametrize("suffix", ["/transcribe", "/transcribe/"])
+async def test_local_url_given_with_the_api_path(fake, make_settings, suffix):
+    """LOCAL_STT_URL=http://whisper:9000/transcribe (the API is POST /transcribe): no …/transcribe/transcribe."""
+    fake.local_ok("ok")
+    stt = LocalWhisperSTT(make_settings(local_stt_url=f"{fake.local_url}{suffix}"))
+    assert await _transcribe(stt) == "ok"
+    assert len(fake.local_requests) == 1
+
+
 @pytest.mark.parametrize(
     ("status", "body", "exc"),
     [
@@ -68,7 +77,10 @@ async def test_local_url_with_a_trailing_slash(fake, make_settings):
         (500, "Internal Server Error", AIUnavailable),
         (413, {"error": "audio is 130 s long, the limit is 120 s"}, AIBadResponse),
         (400, {"error": "cannot decode the audio"}, AIBadResponse),
-        (404, "404: Not Found", AIModelNotFound),  # LOCAL_STT_URL points at something else
+        # LOCAL_STT_URL points at something else: not usable, but never "check the chutes key" (AIConfigError)
+        (404, "404: Not Found", AIBadResponse),
+        (401, "Unauthorized", AIBadResponse),
+        (403, "Forbidden", AIBadResponse),
     ],
 )
 async def test_local_errors(fake, local_settings, sessionmaker, status, body, exc):
@@ -246,6 +258,20 @@ async def test_when_all_fail_the_error_worth_retrying_wins(chutes_error, local_e
     with pytest.raises(raised) as exc:
         await routed.transcribe(AUDIO, mode="auto")
     assert exc.value in (chutes_error, local_error)
+
+
+async def test_a_wrong_local_url_is_no_chutes_config_problem(fake, make_settings, sessionmaker):
+    """Local 404 (wrong LOCAL_STT_URL) and chutes 400 (cannot read this audio): the audio is not usable, not "check the
+    chutes key, balance and model IDs" with an hourly retry that never ends."""
+    settings = make_settings(local_stt_url=f"{fake.local_url}/wrong")
+    fake.stt_error(400, "bad audio")
+    routed = RoutedSTT(ChutesWhisperSTT(settings, sessionmaker), LocalWhisperSTT(settings, sessionmaker))
+    try:
+        with pytest.raises(AIBadResponse) as exc:
+            await routed.transcribe(AUDIO, mode="local")
+    finally:
+        await routed.close()
+    assert not isinstance(exc.value, AIConfigError)
 
 
 async def test_close_closes_both_backends():

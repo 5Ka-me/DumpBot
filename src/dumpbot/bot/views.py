@@ -530,12 +530,17 @@ def _parent_line(parent_title: str | None) -> str | None:
 
 
 def _step_when(step: Step, prefs: Prefs, now: datetime) -> str | None:
-    """Time of a checklist step: "чт 8 окт 15:00", or the date alone when it has no time of day."""
+    """Time of a checklist step: "чт 8 окт 15:00", the date alone when it has no time of day, a fuzzy span as words
+    ("на следующей неделе", like list rows) rather than the date of its reminder (2)."""
     if step.due_at is None:
         return None
     tz = prefs.zone
+    today = _local(now, tz).date()
+    kind, start, end = step.period_kind, step.period_start, step.period_end
+    if step.precision == "period" and kind in CALENDAR_PERIODS and start is not None and end is not None:
+        return period_label(kind, start, end, today)
     if step.precision in ("date", "fallback", "period", "soon"):
-        return fmt_date(_local(step.due_at, tz).date(), today=_local(now, tz).date())
+        return fmt_date(_local(step.due_at, tz).date(), today=today)
     return fmt_dt(step.due_at, tz, now=now)
 
 
@@ -959,7 +964,8 @@ def help_text() -> str:
             "• о событиях со временем — заранее (по умолчанию за 5 мин), задачи без времени — вечером (19:00)",
             "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00 (и утром первого дня,"
             " если срок ещё не начался); такие дела каждое утро в плане, пока срок идёт",
-            "• «до пятницы» — накануне в 19:00 и в сам день в 10:00, «на днях» — через 2 дня в 19:00",
+            "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
+            " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
             "• в напоминании: ✅ Готово, ⏰ отложить на 15 мин / 1 час, 📅 на завтра",
             "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",

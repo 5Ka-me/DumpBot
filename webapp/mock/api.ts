@@ -198,11 +198,14 @@ export class MockApi {
     if (patch.period === "someday" || patch.someday === true) {
       item.someday = true;
       item.period = null;
+      item.role = "event";
       this.db.setDue(item, null, "none");
     } else if (patch.period) {
+      // A chip is that span, also on a deadline item ("до пятницы"), as the bot's reply «перенеси на следующую неделю».
       const p = periodOf(patch.period, this.db.today(now), this.db.prefs.soon_days);
       item.someday = false;
       item.period = p.period;
+      item.role = "event";
       this.db.setDue(item, p.due, p.precision);
     } else if (patch.someday === false) {
       item.someday = false;

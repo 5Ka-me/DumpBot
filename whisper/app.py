@@ -7,9 +7,12 @@
 ``GET /health`` -> ``{"status": "ok", "model": "small", "loaded": false}``.
 
 Any format FFmpeg reads (OGG/Opus voice notes, MP3, M4A, WAV…) is decoded by PyAV, which faster-whisper bundles.
-The model is loaded on the first request: downloaded from Hugging Face into ``WHISPER_MODELS_DIR`` once, read from
-there without any network afterwards, then kept in memory. Requests are transcribed one at a time.
-Audio and transcripts are never logged.
+Decoding stops as soon as the audio is over the limit: memory stays bounded whatever the file is (an hour of
+silence is a few hundred KB of FLAC). The model is loaded on the first request: downloaded from Hugging Face into
+``WHISPER_MODELS_DIR`` once, read from there without any network afterwards, then kept in memory (a load goes on even
+when the request that started it is gone). Requests are transcribed one at a time; a client that disconnects (the
+bot's timeout) stops its transcription after the current segment, so the next request does not wait for work nobody
+reads. Audio and transcripts are never logged.
 
 Environment: ``WHISPER_MODEL`` (small; tiny | base | small | medium), ``WHISPER_THREADS`` (0 = all cores),
 ``WHISPER_BEAM_SIZE`` (1), ``WHISPER_COMPUTE_TYPE`` (int8), ``WHISPER_VAD`` (1: skip silence),
@@ -24,13 +27,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import gc
 import io
 import logging
 import os
 import re
 import sys
+import threading
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,7 +47,8 @@ SAMPLE_RATE = 16000
 LANGUAGE_RE = re.compile(r"^[a-z]{2,3}$")
 
 Loader = Callable[["Config"], Any]  # blocking: Config -> a WhisperModel-like object
-Decoder = Callable[[bytes], Sequence[float]]  # blocking: file bytes -> 16 kHz mono samples
+# blocking: (file bytes, max_samples) -> 16 kHz mono samples; stops once it has more than max_samples
+Decoder = Callable[[bytes, int], Sequence[float]]
 
 
 @dataclass(frozen=True)
@@ -119,11 +125,44 @@ def load_model(cfg: Config) -> Any:
     return WhisperModel(cfg.model, **kwargs)
 
 
-def decode_audio(data: bytes) -> Sequence[float]:
-    """16 kHz mono float32 samples of any audio file FFmpeg can read."""
-    from faster_whisper import decode_audio as fw_decode
+def decode_audio(data: bytes, max_samples: int) -> Sequence[float]:
+    """16 kHz mono float32 samples of any audio file FFmpeg can read, like ``faster_whisper.decode_audio``, but frame
+    by frame: once there are more than ``max_samples`` it stops (the caller rejects that audio), so neither a long
+    file nor a lying duration in its header can fill the memory."""
+    import av
+    import numpy as np
 
-    return fw_decode(io.BytesIO(data), sampling_rate=SAMPLE_RATE)
+    chunks: list[Any] = []
+    total = 0
+    resampler = av.audio.resampler.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    with av.open(io.BytesIO(data), mode="r", metadata_errors="ignore") as container:
+        for frame in _audio_frames(container):  # None at the end flushes the resampler
+            for out in resampler.resample(frame):
+                chunk = out.to_ndarray().reshape(-1)
+                chunks.append(chunk)
+                total += chunk.size
+            if total > max_samples:
+                break
+    del resampler  # the resampler's buffers are freed only by a collection (faster-whisper does the same)
+    gc.collect()
+    pcm = np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.int16)
+    del chunks
+    return pcm.astype(np.float32) / 32768.0
+
+
+def _audio_frames(container: Any) -> Iterator[Any]:
+    """Frames of the first audio stream, skipping undecodable ones, then None."""
+    import av
+
+    frames = container.decode(audio=0)
+    while True:
+        try:
+            yield next(frames)
+        except StopIteration:
+            break
+        except av.error.InvalidDataError:
+            continue
+    yield None
 
 
 def download(cfg: Config) -> str:
@@ -147,7 +186,7 @@ class Service:
         self._loader = loader
         self._decoder = decoder
         self._model: Any = None
-        self._load_lock = asyncio.Lock()
+        self._loading: asyncio.Task[None] | None = None
         self._busy = asyncio.Semaphore(1)  # one transcription at a time: bounded memory, no CPU oversubscription
 
     @property
@@ -155,14 +194,21 @@ class Service:
         return self._model is not None
 
     async def model(self) -> Any:
-        """The model, loaded on first use (in a thread: the event loop keeps answering /health)."""
-        async with self._load_lock:
-            if self._model is None:
-                started, cfg = time.monotonic(), self.cfg
-                log.info("loading model %s (%d threads, %s)", cfg.model, cfg.cpu_threads, cfg.compute_type)
-                self._model = await asyncio.to_thread(self._loader, self.cfg)
-                log.info("model %s loaded in %.1f s", self.cfg.model, time.monotonic() - started)
+        """The model, loaded on first use (in a thread: the event loop keeps answering /health). The load is not
+        tied to the request that started it: a client that gives up (the first download may outlast its timeout)
+        leaves it running for the next request. A failed load is tried again by the next request."""
+        if self._model is None:
+            if self._loading is None or self._loading.done():
+                self._loading = asyncio.create_task(self._load())
+                self._loading.add_done_callback(_retrieve)
+            await asyncio.shield(self._loading)
         return self._model
+
+    async def _load(self) -> None:
+        started, cfg = time.monotonic(), self.cfg
+        log.info("loading model %s (%d threads, %s)", cfg.model, cfg.cpu_threads, cfg.compute_type)
+        self._model = await asyncio.to_thread(self._loader, cfg)
+        log.info("model %s loaded in %.1f s", cfg.model, time.monotonic() - started)
 
     async def health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "model": self.cfg.model, "loaded": self.loaded})
@@ -197,15 +243,17 @@ class Service:
 
     async def _transcribe(self, audio: bytes, language: str | None) -> web.Response:
         started = time.monotonic()
+        stop = threading.Event()  # set when the client has gone: the thread ends after its current step
+        limit = int(self.cfg.max_audio_s * SAMPLE_RATE)
         try:
-            samples = await asyncio.to_thread(self._decoder, audio)
+            samples = await _in_thread(stop, self._decoder, audio, limit)
         except Exception as e:
             log.info("cannot decode %d bytes of audio: %s", len(audio), type(e).__name__)
             return _error(400, "cannot decode the audio")
+        if len(samples) > limit:  # decoding stopped right after the limit: the real length is not known
+            log.info("audio is over the %.0f s limit", self.cfg.max_audio_s)
+            return _error(413, f"audio is longer than the limit of {self.cfg.max_audio_s:.0f} s")
         duration = len(samples) / SAMPLE_RATE
-        if duration > self.cfg.max_audio_s:
-            log.info("%.1f s of audio is over the %.0f s limit", duration, self.cfg.max_audio_s)
-            return _error(413, f"audio is {duration:.0f} s long, the limit is {self.cfg.max_audio_s:.0f} s")
         text, detected = "", language or ""
         if duration > 0:
             try:
@@ -215,7 +263,7 @@ class Service:
                 return _error(503, "the model is not available yet, try again later")
             if language is not None and language not in getattr(model, "supported_languages", (language,)):
                 return _error(400, f"language {language!r} is not supported by this model")
-            text, detected = await asyncio.to_thread(self._run, model, samples, language)
+            text, detected = await _in_thread(stop, self._run, model, samples, language, stop)
         ms = int((time.monotonic() - started) * 1000)
         log.info("transcribed %.1f s of audio in %d ms (language %s, %d chars)", duration, ms, detected, len(text))
         return web.json_response(
@@ -228,12 +276,40 @@ class Service:
             }
         )
 
-    def _run(self, model: Any, samples: Sequence[float], language: str | None) -> tuple[str, str]:
+    def _run(
+        self, model: Any, samples: Sequence[float], language: str | None, stop: threading.Event
+    ) -> tuple[str, str]:
         segments, info = model.transcribe(
             samples, language=language, beam_size=self.cfg.beam_size, vad_filter=self.cfg.vad
         )
-        text = " ".join(part for part in (s.text.strip() for s in segments) if part)  # runs the decoding
-        return text, str(info.language or language or "")
+        parts: list[str] = []
+        for segment in segments:  # lazy: every step decodes the next stretch of audio
+            if part := segment.text.strip():
+                parts.append(part)
+            if stop.is_set():
+                log.info("transcription stopped: the client has gone")
+                break
+        return " ".join(parts), str(info.language or language or "")
+
+
+async def _in_thread[T](stop: threading.Event, fn: Callable[..., T], *args: Any) -> T:
+    """``fn(*args)`` in a worker thread. If the request is cancelled meanwhile (its client disconnected), ``stop`` asks
+    ``fn`` to end early and the caller waits for the thread before the cancellation goes on: the transcription slot
+    is never free while a thread still uses the CPU."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        stop.set()
+        await asyncio.wait([work])
+        _retrieve(work)
+        raise
+
+
+def _retrieve(future: asyncio.Future[Any]) -> None:
+    """Mark the outcome of a future nobody awaits as seen (no "exception was never retrieved" noise)."""
+    if not future.cancelled():
+        future.exception()
 
 
 def _error(status: int, message: str) -> web.Response:
@@ -265,7 +341,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         cfg.beam_size,
         cfg.max_audio_s,
     )
-    web.run_app(make_app(cfg), host=cfg.host, port=cfg.port, access_log=None, print=None)
+    # handler_cancellation: a request whose client disconnected is cancelled (aiohttp's default lets it run on).
+    web.run_app(make_app(cfg), host=cfg.host, port=cfg.port, access_log=None, print=None, handler_cancellation=True)
 
 
 if __name__ == "__main__":

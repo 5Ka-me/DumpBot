@@ -36,7 +36,10 @@ Telegram ──long polling──► aiogram Dispatcher
 
 Контейнеры: `db` (postgres:18), `migrate` (alembic upgrade head, one-shot), `bot`; необязательный `whisper`
 (compose profile `whisper`, `whisper/app.py`: faster-whisper на CPU, `POST /transcribe`, `GET /health`, модель в томе
-`whisper-models`, наружу не публикуется — [iteration-2.md, B](features/iteration-2.md)); необязательный `tailscale`
+`whisper-models`, наружу не публикуется — [iteration-2.md, B](features/iteration-2.md); декодирует покадрово до
+`WHISPER_MAX_AUDIO_S` и отвечает 413, не дочитывая длинный файл; запрос отключившегося клиента отменяется
+(`handler_cancellation`), его распознавание останавливается после текущего фрагмента, а загрузка модели идёт дальше);
+необязательный `tailscale`
 (compose profile `miniapp`, userspace-режим, `tailscale/serve.json`: Funnel HTTPS 443 → `http://bot:8080`).
 
 Mini App ([iteration-2.md, D](features/iteration-2.md), [miniapp-api.md](features/miniapp-api.md)): при
@@ -193,7 +196,7 @@ def lead_applies(precision: str, minutes: int) -> bool
 | Вход | Результат |
 |---|---|
 | Приоритет полей When | `at` > `in_min` > `period` > (`day` и/или `time`). Лишние игнорируются. |
-| `period` (итерация 2) | неделя / месяц / сезон: precision `period`, due = напоминание (2) — последний рабочий день срока в `task_default_time`, если прошёл — последний день срока, если и он прошёл — этот момент без напоминания; `soon`: через `soon_days` в `task_default_time`, precision `soon`; `someday`: без due и без напоминания по умолчанию, precision `someday`. С role `deadline` неделя/месяц/сезон → обычная дата: последний рабочий день срока (прошёл → последний день). Подробно: [iteration-2.md §A](features/iteration-2.md). |
+| `period` (итерация 2) | неделя / месяц / сезон: precision `period`, due = напоминание (2) — последний рабочий день срока в `task_default_time`, если прошёл — последний день срока, если и он прошёл — этот момент без напоминания; `soon`: через `soon_days` в `task_default_time`, precision `soon`; `someday`: без due и без напоминания по умолчанию, precision `someday`. С role `deadline` неделя/месяц/сезон → обычная дата: последний рабочий день срока (прошёл → последний день); «к лету», «до октября» (`text` с «до/к/by» без «конца», срок ещё не начался) → первый день срока — промпт v4 сразу просит `day` MM-DD. Подробно: [iteration-2.md §A](features/iteration-2.md). |
 | `in_min` | `due = now + in_min` (в UTC), precision `relative`, напоминание ровно в `due` (lead 0, auto=False). |
 | только `time` (слот или HH:MM) | сегодня в это время; если ≤ now → **завтра** (без предупреждения). precision `slot`/`exact`. |
 | `day` без `time` | время `bare_date_time` (10:00); для `weekend` — `weekend_time`; precision `date`. Явная дата (`+N`, `dN`, `MM-DD`, `YYYY-MM-DD`), которая сегодня, **остаётся сегодня** и после 10:00 (это не время пользователя): `task_default_time` (19:00), если ещё впереди, иначе через 1 ч (не позже 23:59); без предупреждения. |
@@ -323,7 +326,9 @@ class ChutesWhisperSTT:
 ```python
 class LocalWhisperSTT:                     # тот же протокол; POST {local_stt_url}/transcribe, таймаут local_stt_timeout_s
     ...                                    # ai_usage(purpose="stt", model="local:<model>", audio_seconds=длительность, cost=0)
-                                           # сеть/таймаут/5xx → AIUnavailable; 413 (длиннее лимита сервиса)/400 → AIBadResponse
+                                           # сеть/таймаут/5xx → AIUnavailable; прочие статусы (413 длиннее лимита сервиса,
+                                           # 400, 404 неверный LOCAL_STT_URL) → AIBadResponse, никогда AIConfigError;
+                                           # LOCAL_STT_URL — базовый адрес, «…/transcribe» на конце тоже понимается
 class RoutedSTT:                           # ctx.stt
     def __init__(self, chutes: SpeechToText, local: SpeechToText | None = None) -> None
     def order(self, mode: str) -> list[str]   # ORDER_BY_MODE: auto → chutes, local; local → local, chutes; chutes → chutes
@@ -337,7 +342,7 @@ class RoutedSTT:                           # ctx.stt
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v3" (итерация 2: when.period; related / steps / edit.action split)
+PROMPT_VERSION: str  # "v4" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day)
 
 @dataclass
 class ExtractInput:
@@ -526,6 +531,12 @@ pending-напоминания → cancelled), снятие отметки у з
 хранит `period_kind/period_start/period_end/someday`; `apply_patch` с `when.period` пересчитывает срок и
 напоминания («перенеси на следующую неделю»), `someday` отменяет open occurrences с напоминаниями; явная дата,
 `move_to_tomorrow` и rrule делают запись обычной датированной (period сбрасывается).
+«Когда-нибудь» — без живого occurrence: `restore_item` не возобновляет остановленный им повтор, `mark_undone` его
+occurrence → cancelled (не open), «не сделано» правкой снимает только отметку самой записи (и occurrence, закрывший
+её), `move_to_tomorrow` такие записи пропускает, `query.agenda` не показывает их в open/overdue. rrule берёт за
+образец первое open, иначе последнее не отменённое occurrence («сделал заранее» — только у done); у occurrence
+срока (`period`/`soon`) и у `when` со сроком серия начинается с первого дня срока (не раньше сегодня) в
+`task_default_time`. Чипы срока Mini App (`PATCH period`) задают срок с ролью `event`, как ответ «перенеси на …».
 Перед отменой pending-напоминаний строки occurrences блокируются (`SELECT … FOR UPDATE` до commit):
 два одновременных перепланирования одного occurrence (двойное нажатие «+15 мин», кнопка и job правки) выполняются по
 очереди, и второе видит и отменяет напоминание первого, а не добавляет дубликат. `Item.updated_at` обновляется. Повторяющиеся записи: `Item.status` остаётся open, пока активен повтор.
@@ -580,7 +591,8 @@ async def someday_items(session, limit: int = 50) -> list[Row]    # open someday
 async def recent(session, limit: int = 15) -> list[Row]           # по created_at desc, без deleted
 async def search(session, text: str, limit: int = 20) -> list[Row]  # FTS + ILIKE-фолбэк по title/tags
 async def run_query(session, spec: QuerySpec, prefs: Prefs, now: datetime) -> list[Row]
-    # date_field=due + range: occurrences с due в диапазоне и записи, чей срок пересекается с диапазоном
+    # date_field=due + range: occurrences с due в диапазоне и записи, чей срок пересекается с диапазоном (тогда —
+    # только occurrence самого срока: precision period, due внутри срока; старое done другого времени — нет)
 async def recurring(session) -> list[Row]                          # rec_active, с ближайшим open occurrence
 async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, limit: int = 5, *,
                                exact: bool = False) -> list[Row]
@@ -623,7 +635,8 @@ class JobWorker:
     async def run(self) -> None          # бесконечный цикл; ждёт ctx.jobs_wakeup или poll_interval
     async def run_once(self) -> int      # одна итерация (для тестов): claim + выполнить; вернуть число задач
 ```
-`run` регистрирует `"jobs"` в `ctx.watchdog` (лимит `STALL_AFTER` = 30 мин) и отмечается на каждой итерации и перед
+`run` регистрирует `"jobs"` в `ctx.watchdog` (лимит `STALL_AFTER` = 30 мин; processor отмечается и сам — перед
+распознаванием каждой части альбома аудиофайлов) и отмечается на каждой итерации и перед
 каждой задачей. Итерация 2, D: обработчик может вернуть dict — он сохраняется в `Job.result` (итог для Mini App,
 `GET /api/jobs/{id}`); `pending_job(session, kind, item_id)` — id идущей задачи о записи.
 

@@ -14,6 +14,8 @@ short transaction:
 
 ``JobWorker.run`` registers with ``ctx.watchdog`` and beats on every iteration and before every job: silence for
 ``STALL_AFTER`` (far beyond the slowest job: the AI fallback ladder, speech-to-text, Telegram) exits the process.
+A job with many slow steps beats ``WATCH_NAME`` itself: the processor does before each part of an album it
+transcribes.
 
 Logs and ``last_error`` never contain exception messages of unknown origin: they may carry message text (SQL
 parameters, validation input) or Telegram file URLs with the bot token. Only the exception type and the code
@@ -45,6 +47,7 @@ __all__ = [
     "BUDGET_REASON",
     "MAX_BACKOFF",
     "STALL_AFTER",
+    "WATCH_NAME",
     "DeadHook",
     "Handler",
     "JobWorker",

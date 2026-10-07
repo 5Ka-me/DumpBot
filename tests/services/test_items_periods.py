@@ -6,11 +6,12 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
 from sqlalchemy import select
 
 from dumpbot.ai.schemas import EditPatch, When
 from dumpbot.db.models import Item, Occurrence
-from dumpbot.services import items
+from dumpbot.services import items, query
 
 WEEK = {"text": "на этой неделе", "period": "this_week"}
 NEXT_WEEK = {"text": "на следующей неделе", "period": "next_week"}
@@ -244,3 +245,137 @@ async def test_snapshot_tells_the_model_about_the_span(session, prefs, make, now
     assert snap["due_local"] == "2026-10-09 19:00"
     snap = await items.item_snapshot(session, someday.item.id, prefs, now)
     assert snap["someday"] is True and snap["due_local"] is None and "period" not in snap
+
+
+# --- review fixes: "когда-нибудь" has no live occurrence -----------------------------------------------------------
+
+TODAY_11 = {"text": "сегодня в 11", "day": "+0", "time": "11:00"}
+
+
+async def test_restore_keeps_a_someday_series_stopped(session, prefs, make, now, local, occurrences_of, reminders_of):
+    """A series moved to "когда-нибудь", then 🗑 and ↩️ Вернуть: it stays stopped (no new instance, no reminder)."""
+    spec = {"kind": "task", "title": "Полить цветы", "when": {"text": "каждый понедельник в 9", "time": "09:00"}}
+    [c] = await make({**spec, "rrule": "FREQ=WEEKLY;BYDAY=MO"}, now=now)
+    await items.apply_patch(session, c.item.id, EditPatch(when=When(**SOMEDAY)), prefs, now)
+    await items.delete_item(session, c.item.id, now)
+    await items.restore_item(session, c.item.id, now, prefs)
+    await session.commit()
+
+    item = await session.get(Item, c.item.id)
+    assert (item.status, item.someday, item.rec_active) == ("open", True, False)
+    assert [o.status for o in await occurrences_of(c.item.id)] == ["cancelled"]
+    assert await reminders_of(c.occurrence.id, "pending") == []
+    assert await items.ensure_recurring(session, prefs, local(2026, 10, 13, 10, 0)) == 0
+    assert await query.recurring(session) == []
+
+
+async def test_old_reminders_undone_does_not_plan_a_someday_item_again(session, prefs, make, now, local, reminders_of):
+    """Done at 11:00, then «давай когда-нибудь», then ↩️ Не сделано on the old reminder: the item is open and still
+    "когда-нибудь"; its occurrence is not done any more but not planned either (no plan, overdue, digest, ping)."""
+    [c] = await make({"kind": "task", "title": "Купить молоко", "when": TODAY_11}, now=now)
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 6, 11, 0), prefs)
+    await items.apply_patch(session, c.item.id, EditPatch(when=When(**SOMEDAY)), prefs, local(2026, 10, 6, 12, 0))
+    occ = await items.mark_undone(session, c.occurrence.id, prefs=prefs, now=local(2026, 10, 6, 15, 0))
+    await session.commit()
+
+    item = await session.get(Item, c.item.id)
+    assert (item.status, item.someday, item.done_at) == ("open", True, None)
+    assert (occ.status, occ.done_at) == ("cancelled", None)
+    assert await reminders_of(c.occurrence.id, "pending") == []
+    agenda = await query.agenda(session, prefs, local(2026, 10, 6, 21, 0))
+    assert c.item.id not in {r.item_id for r in (*agenda.open, *agenda.overdue, *agenda.done)}
+    assert [r.item_id for r in await query.someday_items(session)] == [c.item.id]
+
+
+async def test_undone_of_a_someday_item_keeps_the_history_of_its_series(
+    session, prefs, make, now, local, occurrences_of
+):
+    """A series instance done before "когда-нибудь" stays done when the item's own ✅ is taken back."""
+    spec = {"kind": "task", "title": "Полить цветы", "when": {"text": "каждый день в 9", "time": "09:00"}}
+    [c] = await make({**spec, "rrule": "FREQ=DAILY"}, now=local(2026, 10, 5, 8, 0))
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 5, 9, 30), prefs)  # Tue 09:00 is created
+    await items.apply_patch(session, c.item.id, EditPatch(when=When(**SOMEDAY)), prefs, now)
+    await items.apply_patch(session, c.item.id, EditPatch(action="done"), prefs, now)
+    await items.apply_patch(session, c.item.id, EditPatch(action="undone"), prefs, local(2026, 10, 6, 10, 5))
+    await session.commit()
+
+    item = await session.get(Item, c.item.id)
+    assert (item.status, item.someday, item.rec_active) == ("open", True, False)
+    assert [(o.due_at, o.status) for o in await occurrences_of(c.item.id)] == [
+        (local(2026, 10, 5, 9, 0), "done"),
+        (local(2026, 10, 6, 9, 0), "cancelled"),
+    ]
+    agenda = await query.agenda(session, prefs, local(2026, 10, 6, 21, 0))
+    assert (agenda.open, agenda.overdue) == ([], [])
+
+
+async def test_reply_undone_takes_back_a_stale_reminders_done_of_a_someday_item(
+    session, prefs, make, now, local, occurrences_of
+):
+    """✅ on an old reminder closed the "когда-нибудь" item through its cancelled occurrence; «не сделано» reopens
+    the item and takes that ✅ back without planning the occurrence."""
+    [c] = await make({"kind": "task", "title": "Купить молоко", "when": TODAY_11}, now=now)
+    await items.apply_patch(session, c.item.id, EditPatch(when=When(**SOMEDAY)), prefs, now)
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 6, 11, 0), prefs)
+    assert (await session.get(Item, c.item.id)).status == "done"
+
+    later = local(2026, 10, 6, 11, 30)
+    result = await items.apply_patch(session, c.item.id, EditPatch(action="undone"), prefs, later)
+    await session.commit()
+    assert (result.item.status, result.item.someday, result.reminders) == ("open", True, [])
+    assert [o.status for o in await occurrences_of(c.item.id)] == ["cancelled"]
+
+
+async def test_a_someday_item_is_never_due_even_with_an_open_occurrence(session, prefs, make, now, local):
+    """Rows saved before the fix: a "когда-нибудь" item that kept an open occurrence is not in the day's plan, in
+    «Просрочено» or in the digest's 📅 move."""
+    [c] = await make({"kind": "task", "title": "Купить молоко", "when": TODAY_11}, now=now)
+    item = await session.get(Item, c.item.id)
+    item.someday, item.period_kind = True, "someday"
+    await session.commit()
+
+    for at in (local(2026, 10, 6, 21, 0), local(2026, 10, 7, 9, 0)):
+        agenda = await query.agenda(session, prefs, at)
+        assert c.item.id not in {r.item_id for r in (*agenda.open, *agenda.overdue)}, at
+    assert await items.move_to_tomorrow(session, [c.occurrence.id], prefs, local(2026, 10, 6, 21, 0)) == []
+
+
+# --- review fixes: a series made from a someday / period item ------------------------------------------------------
+
+
+@pytest.mark.parametrize("when", [None, {"text": "каждую пятницу", "day": "FR"}])
+async def test_series_from_a_someday_item_starts_with_this_weeks_instance(session, prefs, make, now, local, when):
+    """«в пятницу купить хлеб» → «когда-нибудь» → «каждую пятницу» on Tue 6 Oct: the cancelled Friday 10:00 is no
+    reference ("done ahead of time" would skip this Friday); the series starts this Friday at the default time."""
+    [c] = await make({"kind": "task", "title": "Купить хлеб", "when": {"text": "в пятницу", "day": "FR"}}, now=now)
+    await items.apply_patch(session, c.item.id, EditPatch(when=When(**SOMEDAY)), prefs, now)
+    patch = EditPatch(rrule="FREQ=WEEKLY;BYDAY=FR", when=When(**when) if when else None)
+    result = await items.apply_patch(session, c.item.id, patch, prefs, now)
+    await session.commit()
+
+    assert result.item.rec_active and not result.item.someday
+    assert (result.occurrence.due_at, result.occurrence.status) == (local(2026, 10, 9, 19, 0), "open")
+    assert [r.fire_at for r in result.reminders] == [local(2026, 10, 9, 19, 0)]
+
+
+@pytest.mark.parametrize(("when", "first_day"), [(WEEK, (2026, 10, 6)), (NEXT_WEEK, (2026, 10, 12))])
+async def test_series_from_a_period_item_starts_in_its_span(session, prefs, make, now, local, when, first_day):
+    """«на этой неделе начать зарядку» → «пусть каждый день»: from today (the span has begun), not from the span's
+    Friday 19:00 (reminder (2)); «на следующей неделе» → from its Monday."""
+    [c] = await make({"kind": "task", "title": "Зарядка", "when": when}, now=now)
+    result = await items.apply_patch(session, c.item.id, EditPatch(rrule="FREQ=DAILY"), prefs, now)
+    await session.commit()
+
+    assert result.occurrence.id == c.occurrence.id
+    assert result.occurrence.due_at == local(*first_day, 19, 0)
+    assert await _period_columns(session, c.item.id) == (None, None, None, False)
+
+
+async def test_series_starting_next_week_keeps_the_time_of_day(session, prefs, make, now, local):
+    """«каждый день со следующей недели» (when = the span) on an item due tomorrow at 15:00: Monday 12 Oct, 15:00."""
+    tomorrow_15 = {"text": "завтра в 15", "day": "+1", "time": "15:00"}
+    [c] = await make({"kind": "task", "title": "Зарядка", "when": tomorrow_15}, now=now)
+    patch = EditPatch(rrule="FREQ=DAILY", when=When(**NEXT_WEEK))
+    result = await items.apply_patch(session, c.item.id, patch, prefs, now)
+    await session.commit()
+    assert result.occurrence.due_at == local(2026, 10, 12, 15, 0)

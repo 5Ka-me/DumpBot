@@ -28,7 +28,9 @@ curl http://127.0.0.1:9000/health
 
 `POST /transcribe` — JSON `{"audio_b64": "<base64 файла>", "language": "ru" | "en" | null}`
 (`null` — язык определится сам). Формат файла любой, который читает FFmpeg: OGG/Opus (голосовые Telegram), MP3,
-M4A, WAV… Декодирует PyAV, который идёт вместе с faster-whisper (FFmpeg в образе не нужен).
+M4A, WAV… Декодирует PyAV, который идёт вместе с faster-whisper (FFmpeg в образе не нужен). Длина проверяется по
+ходу декодирования: как только звука больше `WHISPER_MAX_AUDIO_S`, декодирование останавливается и сервис отвечает
+413 — сколько бы ни шёл файл и что бы ни было записано в его заголовке (час тишины во FLAC — это меньше 1 МБ).
 
 | Ответ | Когда |
 |---|---|
@@ -40,7 +42,10 @@ M4A, WAV… Декодирует PyAV, который идёт вместе с f
 `GET /health` — `{"status": "ok", "model": "small", "loaded": false}` (`loaded` — модель уже в памяти).
 
 Запросы обрабатываются по одному (остальные ждут в очереди): так память ограничена, а ядра не делятся между
-двумя распознаваниями. Пока идёт распознавание, `/health` отвечает.
+двумя распознаваниями. Пока идёт распознавание, `/health` отвечает. Если клиент отключился (у бота истёк
+`LOCAL_STT_TIMEOUT_S`), сервис останавливает его распознавание после текущего фрагмента (около 30 с звука), а
+запрос, который ещё ждал очереди, не выполняется вовсе: следующее голосовое не ждёт работы, которую никто не
+прочитает. Загрузка модели при этом не прерывается — ею воспользуется следующий запрос.
 
 ## Настройки (переменные окружения)
 
@@ -72,4 +77,13 @@ M4A, WAV… Декодирует PyAV, который идёт вместе с f
 PyAV закреплён ниже 19: faster-whisper 1.2.1 передаёт в `av.open` параметр `metadata_errors`, которого в PyAV 19 нет.
 
 Тесты сервиса — в общем наборе бота (`tests/whisper/`), с фейковой моделью и декодером, без faster-whisper и
-скачиваний: `uv run pytest tests/whisper`.
+скачиваний: `uv run pytest tests/whisper`. Тест настоящего декодера (PyAV + numpy) там пропускается; в образе сервиса
+он идёт так:
+
+```bash
+docker build -t dumpbot-whisper:test whisper/
+docker run --rm --user root -v "$PWD/whisper:/src/whisper:ro" -v "$PWD/tests/whisper:/src/tests/whisper:ro" \
+  -w /src dumpbot-whisper:test sh -c "pip install -q pytest pytest-asyncio && python -m pytest tests/whisper -q \
+  -p no:cacheprovider -o asyncio_mode=auto --import-mode=importlib --rootdir /src"
+docker rmi dumpbot-whisper:test
+```

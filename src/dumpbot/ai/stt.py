@@ -20,7 +20,7 @@ import math
 import shutil
 import tempfile
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Final, Protocol
 from urllib.parse import urlsplit
@@ -168,9 +168,11 @@ class ChutesWhisperSTT(_HttpSTT):
 class LocalWhisperSTT(_HttpSTT):
     """The local faster-whisper service (``whisper/app.py``). Free: ``ai_usage`` rows cost 0.
 
-    Network errors, timeouts and 5xx (503 = the model could not be loaded yet) -> ``AIUnavailable``; 413 (audio over
-    the service's limit) and 400 (cannot decode) -> ``AIBadResponse``; 404 (wrong ``LOCAL_STT_URL``) ->
-    ``AIModelNotFound``. The audio is sent as it is: the service decodes OGG/Opus, MP3, M4A, WAV itself.
+    Network errors, timeouts and 5xx (503 = the model could not be loaded yet) -> ``AIUnavailable``; any other status
+    -> ``AIBadResponse``: 413 (audio over the service's limit), 400 (cannot decode), 404 (``LOCAL_STT_URL`` points at
+    something else). Never ``AIConfigError``: that one is about chutes (the owner's key, balance and model IDs).
+    ``LOCAL_STT_URL`` is the service's base URL; one given with the ``/transcribe`` path works too.
+    The audio is sent as it is: the service decodes OGG/Opus, MP3, M4A, WAV itself.
     """
 
     def __init__(
@@ -180,7 +182,8 @@ class LocalWhisperSTT(_HttpSTT):
         http: aiohttp.ClientSession | None = None,
     ) -> None:
         super().__init__(settings, sessionmaker, http)
-        self._url = settings.local_stt_url.strip().rstrip("/") + "/transcribe"
+        base = settings.local_stt_url.strip().rstrip("/").removesuffix("/transcribe").rstrip("/")
+        self._url = f"{base}/transcribe"
         self._model = "whisper"  # replaced by the model name the service reports
 
     async def transcribe(self, audio: bytes, *, mime_type: str | None = None, language: str | None = None) -> str:
@@ -201,8 +204,9 @@ class LocalWhisperSTT(_HttpSTT):
         if status != 200:
             snippet = error_snippet(raw)
             await self._record(ok=False, latency_s=latency_s, error=f"HTTP {status}: {snippet}")
-            log.warning("local STT HTTP %s: %s", status, snippet)
-            raise http_error(status, raw, headers)
+            hint = " (check LOCAL_STT_URL: it should be the service's base URL, e.g. http://whisper:9000)"
+            log.warning("local STT HTTP %s: %s%s", status, snippet, hint if status == 404 else "")
+            raise _local_error(status, raw, headers)
         try:
             data = json.loads(raw)
             text = data["text"]
@@ -232,6 +236,13 @@ class LocalWhisperSTT(_HttpSTT):
             latency_ms=int(latency_s * 1000),
             error=error,
         )
+
+
+def _local_error(status: int, raw: bytes, headers: Mapping[str, str]) -> AIError:
+    """A non-200 answer of the local service: temporary (``AIUnavailable``) or not usable for this audio
+    (``AIBadResponse``), never a chutes configuration problem (``AIConfigError`` → "check the chutes key")."""
+    error = http_error(status, raw, headers)
+    return error if isinstance(error, AIUnavailable) else AIBadResponse(f"local STT {error}")
 
 
 # --- routing ----------------------------------------------------------------------------------------------------

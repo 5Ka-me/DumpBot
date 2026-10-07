@@ -164,3 +164,36 @@ async def test_rows_for_llm_mark_spans_and_someday(session, prefs, now, make, we
     by_title = {r["title"]: r for r in query.rows_for_llm(rows, prefs)}
     assert by_title["Посмотреть расбери пай"]["period"] == "2026-10-05..2026-10-11"
     assert by_title["Испанский"]["someday"] is True and "due" not in by_title["Испанский"]
+
+
+async def test_due_range_query_lists_a_redone_period_item_once(session, prefs, now, local, make):
+    """Done today at 11:00, then «сделай ещё раз на этой неделе»: the span counts for its own occurrence only, not
+    for the earlier done one ("что у меня завтра?" must not list the task twice, once as done)."""
+    today_11 = {"text": "сегодня в 11", "day": "+0", "time": "11:00"}
+    [c] = await make({"kind": "task", "title": "Полить цветы", "when": today_11}, now=now)
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 6, 11, 0), prefs)
+    await items.apply_patch(session, c.item.id, EditPatch(when=WEEK), prefs, local(2026, 10, 6, 12, 0))
+    await session.commit()
+    at = local(2026, 10, 6, 14, 0)
+
+    rows = await query.run_query(session, QuerySpec(range="tomorrow", status="any"), prefs, at)
+    assert [(r.due_at, r.occ_status) for r in rows] == [(local(2026, 10, 9, 19, 0), "open")]
+    rows = await query.run_query(session, QuerySpec(range="today", status="any"), prefs, at)
+    assert sorted((r.due_at, r.occ_status) for r in rows) == [
+        (local(2026, 10, 6, 11, 0), "done"),
+        (local(2026, 10, 9, 19, 0), "open"),
+    ]
+    rows = await query.run_query(session, QuerySpec(range="tomorrow", status="done"), prefs, at)
+    assert rows == []
+
+
+async def test_due_range_query_skips_the_done_occurrence_of_an_earlier_span(session, prefs, now, local, make):
+    """Done this week, then «и на следующей неделе»: next week's range lists next week's occurrence only."""
+    [c] = await make({"kind": "task", "title": "Шины", "when": WEEK}, now=now)
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 7, 12, 0), prefs)
+    next_week = {"text": "на следующей неделе", "period": "next_week"}
+    await items.apply_patch(session, c.item.id, EditPatch(when=next_week), prefs, local(2026, 10, 7, 13, 0))
+    await session.commit()
+
+    rows = await query.run_query(session, QuerySpec(range="next_week", status="any"), prefs, local(2026, 10, 7, 14, 0))
+    assert [(r.due_at, r.occ_status) for r in rows] == [(local(2026, 10, 16, 19, 0), "open")]

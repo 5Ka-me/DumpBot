@@ -8,6 +8,8 @@ v2 (iteration 2, docs/features/iteration-2.md §A): ``when.period`` for fuzzy sp
 "летом", "на днях", "когда-нибудь") and deadlines "до конца недели / месяца".
 v3 (§C): ``RELATED CANDIDATES`` in the input and ``items[].related``; ``items[].steps`` ("распиши по шагам") and
 ``edit.action = "split"``; a separate prompt for the "split" call (🪄 Разбить на шаги).
+v4: a deadline by a season / month ("к лету", "до октября") is the first day of that span (``day`` MM-DD), not a
+period: the code reads period + deadline as "до конца …", the end of the span.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v3"
+PROMPT_VERSION = "v4"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -103,6 +105,18 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
                     "kind": "task",
                     "title": "Сдать отчёт",
                     "when": {"text": "до пятницы", "day": "FR", "role": "deadline"},
+                }
+            ]
+        },
+    ),
+    (
+        "к лету сделать загранпаспорт",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Сделать загранпаспорт",
+                    "when": {"text": "к лету", "day": "06-01", "role": "deadline"},
                 }
             ]
         },
@@ -267,8 +281,9 @@ night (ночью, перед сном, at night).
 conf low, ask with both options.
 - in_min only for "через N минут/часов" (2 часа → 120); "через 3 дня" → day +3.
 - at: local YYYY-MM-DD[THH:MM] ONLY if day/time can't express it; use CAL.
-- role: remind = the time to ping ("напомни в 15"); deadline = до/к/by ("до пятницы" → day FR; "до конца \
-недели/месяца" → period this_week/this_month); else event.
+- role: remind = the time to ping ("напомни в 15"); deadline = до/к/by ("до пятницы" → day FR; a season/month \
+"к лету", "до октября" → day = its first day MM-DD: 06-01, 10-01; only "до конца недели/месяца" → period \
+this_week/this_month); else event.
 - lead, only if stated: за 30 минут → [30], за час → [60], за день → [1440].
 - rrule only for explicit repetition (каждый, по понедельникам, every): RFC 5545 without DTSTART; time of day \
 still in when.time.

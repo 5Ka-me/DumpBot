@@ -71,6 +71,7 @@ from dumpbot.services import items as items_svc
 from dumpbot.services import query, usage
 from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY
 from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, try_once
+from dumpbot.workers.jobs import WATCH_NAME as JOBS_WATCH
 
 __all__ = [
     "HANDLERS",
@@ -1042,6 +1043,9 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
     if raw.duration is not None and raw.duration > ctx.settings.stt_max_duration_s:
         log.info("message %s: %d s of audio is over the STT limit, not transcribed", raw.message_id, raw.duration)
         return ""
+    # Every part of an album of audio files is transcribed in this one job (up to stt_timeout_s + local_stt_timeout_s
+    # each), while the worker beats only between jobs: each part is progress for the jobs watchdog.
+    ctx.watchdog.beat(JOBS_WATCH)
     audio = await _download(ctx, raw)
     if audio is None:
         return ""

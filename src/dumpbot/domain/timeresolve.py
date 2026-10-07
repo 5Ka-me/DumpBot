@@ -82,6 +82,11 @@ _PERIOD_KINDS: Final[dict[str, str]] = {
     "someday": "someday",
 }
 _WORKDAYS: Final = 5  # Monday..Friday: weekday() < 5
+# A deadline "by" a span that is not "by its end": "к лету", "до октября", "by summer" (not "до конца недели",
+# "к концу месяца", "by the end of the month").
+_BY_SPAN_RE = re.compile(
+    r"(?:^|\s)(?:до|к|ко|by|before|till|until)\s+(?!(?:самого\s+)?конц|(?:the\s+)?end\b)", re.IGNORECASE
+)
 # A date without a time that is today, once its bare-date time and task_default_time have passed: due this long
 # from now (but still today), so the item stays on today's list and gets one automatic nudge.
 _LATER_TODAY: Final = timedelta(hours=1)
@@ -145,7 +150,8 @@ def resolve_when(when: When, now: datetime, prefs: Prefs) -> WhenResult:
     (None, "none", [], False); an impossible date (e.g. "02-30") gives (None, "none", [WARN_BAD_TIME], True).
     Periods: someday -> (None, "someday", …); soon -> ``soon_days`` ahead at ``when.time`` or ``task_default_time``,
     precision "soon"; a week / month / season -> its reminder (2), precision "period" (``_period_due``); with role
-    ``deadline`` ("до конца недели") -> the last working day of the span as a plain date.
+    ``deadline`` ("до конца недели") -> the last working day of the span as a plain date, but "к лету" / "до октября"
+    (``text`` says by the span, not by its end, and the span has not begun) -> its first day.
     """
     now_utc = _as_utc(now)
     if when.at:
@@ -403,10 +409,13 @@ def _resolve_period(when: When, now_utc: datetime, prefs: Prefs) -> WhenResult:
             return localize(end, t, tz).astimezone(UTC), "soon", [], False
     except (ValueError, KeyError):
         return None, "none", [WARN_BAD_TIME], True
-    if when.role == "deadline":  # "до конца недели": the last working day of the span, as a plain date
+    if when.role == "deadline":  # a plain date
         today = now_utc.astimezone(tz).date()
-        last = _last_workday(start, end)
-        day = last if last is not None and last >= today else end
+        if start > today and _BY_SPAN_RE.search(when.text or ""):
+            day = start  # "к лету", "до октября": by the time the span begins (the prompt asks for that day itself)
+        else:  # "до конца недели": the last working day of the span
+            last = _last_workday(start, end)
+            day = last if last is not None and last >= today else end
         return resolve_when(when.model_copy(update={"period": None, "day": day.isoformat()}), now_utc, prefs)
     return _period_due(start, end, now_utc, prefs), "period", [], False
 

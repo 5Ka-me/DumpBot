@@ -5,9 +5,12 @@ Reference time: Tue 2026-10-06 10:00 Europe/Warsaw (services conftest)."""
 
 from __future__ import annotations
 
+from datetime import date
+
 from sqlalchemy import select, update
 
 from dumpbot.ai.schemas import EditPatch, QuerySpec, When
+from dumpbot.bot import views
 from dumpbot.db.models import Item, ItemLink
 from dumpbot.services import items, query
 
@@ -160,3 +163,21 @@ async def test_untimed_step_moved_to_a_time_shows_up(session, make, now, prefs):
     await session.commit()
     rows = await query.open_tasks(session, prefs, now)
     assert [(r.title, r.steps_total) for r in rows] == [("Переезд", 0)]
+
+
+async def test_card_extras_carry_the_span_of_a_step(session, make, now, prefs):
+    """A step «на следующей неделе»: the parent's checklist names the span, not the date of its reminder (2)."""
+    spec = {
+        "kind": "task",
+        "title": "Переезд",
+        "steps": [{"title": "Упаковать вещи", "when": {"text": "на следующей неделе", "period": "next_week"}}],
+    }
+    [parent] = await make(spec, now=now)
+    [step] = (await query.card_extras(session, parent.item)).steps
+    assert (step.precision, step.period_kind, step.period_start, step.period_end) == (
+        "period",
+        "week",
+        date(2026, 10, 12),
+        date(2026, 10, 18),
+    )
+    assert views.checklist_lines([step], prefs, now)[1] == "☐ 1. Упаковать вещи · на следующей неделе"

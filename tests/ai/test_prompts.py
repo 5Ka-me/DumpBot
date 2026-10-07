@@ -27,7 +27,7 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v3"
+    assert PROMPT_VERSION == "v4"
 
 
 def test_static_prompt_explains_every_kind():
@@ -67,7 +67,8 @@ def test_static_prompt_describes_the_when_grammar_and_rules():
 
 def test_static_prompt_size_budget():
     # ~2200 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
-    # (~350 tokens), v3 related items and steps (~300); the static prompt is a cacheable prefix.
+    # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60); the static prompt is
+    # a cacheable prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
     assert estimate < 2300
@@ -234,6 +235,8 @@ def test_static_prompt_describes_the_period_grammar():
         assert phrase in period_line, phrase
     role_line = _line("- role:")
     assert "до пятницы" in role_line and "до конца" in role_line and "period this_week/this_month" in role_line
+    # v4: "к лету" is by the START of the span (the code reads period + deadline as "до конца …")
+    assert "к лету" in role_line and "до октября" in role_line and "first day MM-DD" in role_line
 
 
 def test_examples_cover_fuzzy_time():
@@ -242,6 +245,7 @@ def test_examples_cover_fuzzy_time():
         "на этой неделе посмотреть Raspberry Pi": {"text": "на этой неделе", "period": "this_week"},
         "в октябре поменять шины": {"text": "в октябре", "period": "2026-10"},
         "до пятницы сдать отчёт": {"text": "до пятницы", "day": "FR", "role": "deadline"},
+        "к лету сделать загранпаспорт": {"text": "к лету", "day": "06-01", "role": "deadline"},
         "на днях позвонить Пете": {"text": "на днях", "period": "soon"},
         "когда-нибудь выучить испанский": {"text": "когда-нибудь", "period": "someday"},
     }

@@ -140,6 +140,20 @@ async def test_patch_period_and_someday(api, make_items) -> None:
     assert [r["id"] for r in (await api.get("/api/tasks")).data["rows"]] == [created.item.id]
 
 
+async def test_period_chip_on_a_deadline_item_sets_the_span(api, make_items) -> None:
+    """«Сдать отчёт до пятницы» → chip «на следующей неделе»: that span (🗓, its reminders, the digest section), as
+    the bot's reply «перенеси на следующую неделю» does, not «⏳ до пт 16 окт»."""
+    deadline = {"text": "до пятницы", "day": "FR", "role": "deadline"}
+    [created] = await make_items({"kind": "task", "title": "Сдать отчёт", "when": deadline})
+    path = f"/api/items/{created.item.id}"
+    assert (await api.get(path)).data["role"] == "deadline"
+
+    item = (await api.patch(path, {"period": "next_week"})).data["item"]
+    assert item["period"]["kind"] == "week" and item["period"]["label"] == "на следующей неделе"
+    assert item["occurrence"]["precision"] == "period" and item["role"] == "event"
+    assert item["when_text"].startswith("🗓 на следующей неделе (до вс 18 окт)")
+
+
 async def test_patch_validation(api, make_items) -> None:
     [created] = await make_items({"kind": "task", "title": "Задача"})
     path = f"/api/items/{created.item.id}"

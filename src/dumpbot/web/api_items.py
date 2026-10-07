@@ -201,7 +201,7 @@ async def _apply_edits(
         await items.set_lead(session, item.id, edits["lead"], prefs, now)
     period = edits.get("period") or ("someday" if edits.get("someday") is True else None)
     if period is not None:
-        patch = EditPatch(when=_period_when(item, period))
+        patch = EditPatch(when=_period_when(period))
         warnings += (await items.apply_patch(session, item.id, patch, prefs, now)).warnings
     elif edits.get("someday") is False:
         await items.clear_someday(session, item.id, prefs, now)
@@ -230,8 +230,10 @@ def _role(item: Item) -> str:
     return str((item.when_spec or {}).get("role") or "event")
 
 
-def _period_when(item: Item, period: str) -> When:
-    return When(text=period, period=period, role=_role(item))  # type: ignore[arg-type]
+def _period_when(period: str) -> When:
+    """A chip "на следующей неделе" / "в декабре" / "когда-нибудь" means that span, whatever the item's role was: a
+    deadline item does not turn it into "до пт …" (like the bot's reply «перенеси на следующую неделю»)."""
+    return When(text=period, period=period)  # type: ignore[arg-type]
 
 
 def _due_when(item: Item, value: Any) -> When:

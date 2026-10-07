@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import importlib.util
+import io
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -40,19 +42,30 @@ def audio(seconds: float) -> bytes:
     return f"AUDIO:{seconds}".encode()
 
 
-def fake_decode(data: bytes) -> list[float]:
+def fake_decode(data: bytes, max_samples: int) -> list[float]:
+    """Like the real decoder, it stops right after ``max_samples``."""
     if not data.startswith(b"AUDIO:"):
         raise ValueError("Invalid data found when processing input")
-    return [0.0] * int(float(data[6:]) * svc.SAMPLE_RATE)
+    return [0.0] * min(int(float(data[6:]) * svc.SAMPLE_RATE), max_samples + 1)
 
 
 class FakeModel:
+    """``segments`` (all at once), or with ``per_second`` lazily like faster-whisper: one segment per second of audio,
+    each taking that long to decode."""
+
     supported_languages = ("en", "ru", "uk")
 
-    def __init__(self, segments: tuple[str, ...] = (" Купить ", "хлеб и молоко. ", "  "), delay: float = 0.0) -> None:
+    def __init__(
+        self,
+        segments: tuple[str, ...] = (" Купить ", "хлеб и молоко. ", "  "),
+        delay: float = 0.0,
+        per_second: float = 0.0,
+    ) -> None:
         self.segments = segments
         self.delay = delay
+        self.per_second = per_second
         self.calls: list[dict[str, Any]] = []
+        self.produced = 0  # lazy segments decoded so far
         self.active = 0
         self.max_active = 0
         self._lock = threading.Lock()
@@ -65,10 +78,25 @@ class FakeModel:
             time.sleep(self.delay)
             self.calls.append({"samples": len(samples), "language": language, "beam": beam_size, "vad": vad_filter})
         finally:
-            with self._lock:
-                self.active -= 1
+            if not self.per_second:
+                self._done()
         info = SimpleNamespace(language=language or "ru")
+        if self.per_second:
+            return self._lazy(len(samples) // svc.SAMPLE_RATE), info
         return (SimpleNamespace(text=t) for t in self.segments), info
+
+    def _lazy(self, n: int):
+        try:
+            for i in range(n):
+                time.sleep(self.per_second)
+                self.produced += 1
+                yield SimpleNamespace(text=f"s{i}")
+        finally:
+            self._done()
+
+    def _done(self) -> None:
+        with self._lock:
+            self.active -= 1
 
 
 class Loader:
@@ -171,6 +199,22 @@ async def test_audio_over_120_seconds_is_413_without_loading_the_model(client, l
     assert status == 200
 
 
+async def test_long_audio_is_never_decoded_whole(loader) -> None:
+    """Twelve hours of silence fit into a few MB of FLAC (and a forwarded file's duration is whatever its sender
+    said): the decoder is told to stop right after the limit, so memory stays bounded and the answer is 413."""
+    asked: list[int] = []
+
+    def decoder(data: bytes, max_samples: int) -> list[float]:
+        asked.append(max_samples)
+        return fake_decode(data, max_samples)
+
+    app = svc.make_app(svc.Config(max_audio_s=120), loader=loader, decoder=decoder)
+    async with TestClient(TestServer(app, host="127.0.0.1")) as c:
+        status, body = await _post(c, {"audio_b64": b64(audio(12 * 3600))})
+    assert status == 413 and body["error"] == "audio is longer than the limit of 120 s"
+    assert asked == [120 * svc.SAMPLE_RATE] and loader.configs == []
+
+
 async def test_body_over_the_limit_is_413(loader) -> None:
     app = svc.make_app(svc.Config(max_body_mb=1), loader=loader, decoder=fake_decode)
     async with TestClient(TestServer(app, host="127.0.0.1")) as c:
@@ -232,6 +276,98 @@ async def test_health_answers_during_a_transcription() -> None:
         resp = await c.get("/health")
         assert resp.status == 200 and time.monotonic() - started < 0.3
         assert (await work)[0] == 200
+
+
+async def _give_up(client: TestClient, data: bytes, when: Callable[[], bool]) -> None:
+    """Send a request and disconnect (like the bot's timeout) once ``when()`` holds on the service's side."""
+    request = asyncio.create_task(client.post("/transcribe", json={"audio_b64": b64(data)}))
+    deadline = time.monotonic() + 5
+    while not when():
+        assert time.monotonic() < deadline and not request.done(), "the service never got that far"
+        await asyncio.sleep(0.01)
+    request.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await request
+
+
+async def test_a_client_that_gives_up_stops_its_transcription() -> None:
+    """The bot's timeout ended the wait for 100 s of audio: the service stops after the current segment instead of
+    decoding the rest for nobody, and the next voice note does not queue behind that work."""
+    model = FakeModel(per_second=0.05)  # 100 s of audio = 5 s of work
+    app = svc.make_app(svc.Config(), loader=Loader(model), decoder=fake_decode)
+    async with TestClient(TestServer(app, host="127.0.0.1")) as c:
+        await _give_up(c, audio(100), lambda: model.produced >= 3)  # the transcription is under way
+        started = time.monotonic()
+        status, body = await _post(c, {"audio_b64": b64(audio(2))})
+        waited = time.monotonic() - started
+    assert status == 200 and body["text"] == "s0 s1"
+    assert waited < 2.0  # not behind the ~4.5 s left of the abandoned one
+    assert model.produced < 40  # a few segments of the first request, then the 2 of the second, not 102
+    assert model.max_active == 1  # the slot was given up only once the abandoned thread had stopped
+
+
+async def test_a_model_load_outlives_the_request_that_started_it(model) -> None:
+    """The first download may take longer than the bot waits: the load goes on, and the next request uses it."""
+    release = threading.Event()
+
+    class SlowLoader(Loader):
+        def __call__(self, cfg: Any) -> FakeModel:
+            self.configs.append(cfg)
+            release.wait(10)
+            return self.model
+
+    loader = SlowLoader(model)
+    app = svc.make_app(svc.Config(), loader=loader, decoder=fake_decode)
+    async with TestClient(TestServer(app, host="127.0.0.1")) as c:
+        await _give_up(c, audio(1), lambda: bool(loader.configs))  # the load has started
+        await asyncio.sleep(0.2)  # the service notices the disconnect while still loading
+        release.set()
+        status, _ = await _post(c, {"audio_b64": b64(audio(1))})
+    assert status == 200 and len(loader.configs) == 1  # loaded once, not again for the second request
+
+
+def test_main_cancels_the_requests_of_clients_that_left(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(svc.web, "run_app", lambda app, **kwargs: seen.update(kwargs))
+    svc.main([])
+    assert seen["handler_cancellation"] is True  # aiohttp's default (False) lets a handler run on for nobody
+
+
+# --- the real decoder (PyAV + numpy: in the service's image, not in the bot's environment) -------------------------
+
+
+def _flac_of_silence(seconds: int, rate: int = 8000) -> bytes:
+    import av
+    import numpy as np
+
+    buf = io.BytesIO()
+    with av.open(buf, mode="w", format="flac") as out:
+        stream = out.add_stream("flac", rate=rate, layout="mono", format="s16")
+        chunk, pts = 4000, 0
+        for _ in range(seconds * rate // chunk):
+            frame = av.AudioFrame.from_ndarray(np.zeros((1, chunk), dtype=np.int16), format="s16", layout="mono")
+            frame.sample_rate, frame.pts = rate, pts
+            pts += chunk
+            for packet in stream.encode(frame):
+                out.mux(packet)
+        for packet in stream.encode(None):
+            out.mux(packet)
+    return buf.getvalue()
+
+
+def test_the_real_decoder_stops_right_after_the_limit() -> None:
+    pytest.importorskip("av")
+    np = pytest.importorskip("numpy")
+    limit = 120 * svc.SAMPLE_RATE
+    hour = _flac_of_silence(3600)
+    assert len(hour) < 2_000_000  # an hour of silence is a small file
+
+    samples = svc.decode_audio(hour, limit)
+    assert limit < len(samples) <= limit + svc.SAMPLE_RATE  # stopped within a second after the limit
+    short = svc.decode_audio(_flac_of_silence(2), limit)
+    assert short.dtype == np.float32 and abs(len(short) - 2 * svc.SAMPLE_RATE) <= 400
+    with pytest.raises(Exception):  # noqa: B017 - PyAV raises its own error types
+        svc.decode_audio(b"not audio at all", limit)
 
 
 # --- config -------------------------------------------------------------------------------------------------------

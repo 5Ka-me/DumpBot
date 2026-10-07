@@ -34,7 +34,7 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import case, exists, func, select
+from sqlalchemy import case, exists, false, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -97,6 +97,7 @@ _LOCAL_FMT: Final = "%Y-%m-%d %H:%M"
 STEP_KIND: Final = "task"  # every step of a checklist is a task
 MAX_CHECKLIST: Final = 20  # steps of one checklist added by hand (the AI gives at most MAX_STEPS)
 _EVENTS_KEY: Final = "dumpbot.parent_events"  # Session.info key of ParentEvents
+_FUZZY: Final = ("period", "soon")  # precisions of a span's occurrence: due at its reminder (2), not a named day
 
 
 class NotFoundError(LookupError):
@@ -578,6 +579,9 @@ async def mark_undone(
 ) -> Occurrence:
     """Back to open (item too) and re-plan its reminders if it is still ahead.
 
+    A "когда-нибудь" item has no live occurrence: its occurrence (an old reminder's "↩️ Не сделано") is no longer
+    done but stays out of the plan (cancelled, as ``_make_someday`` leaves open ones), and only the item opens.
+
     ``prefs``/``now`` are optional extensions of the contract; without them the owner's stored prefs and the
     current time are used.
     """
@@ -586,12 +590,13 @@ async def mark_undone(
     if occ.status == "open":
         return occ
     await _lock_parent(session, item)
-    occ.status = "open"
+    occ.status = "cancelled" if item.someday else "open"
     occ.done_at = None
     _reopen(item)
     prefs = prefs if prefs is not None else await _owner_prefs(session)
     now = _utc(now) if now is not None else clock.utcnow()
-    await _replan(session, item, occ, prefs, now)
+    if not item.someday:
+        await _replan(session, item, occ, prefs, now)
     await _sync_parent(session, item, prefs, now)
     _touch(item)
     return occ
@@ -667,8 +672,9 @@ async def restore_item(session: AsyncSession, item_id: int, now: datetime, prefs
 async def _restore(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> None:
     item.status = "done" if item.done_at is not None else "open"
     item.deleted_at = None
-    # delete_item cleared rec_active; a stopped-then-deleted series cannot be told apart and resumes too.
-    item.rec_active = item.rrule is not None and item.status == "open"
+    # delete_item cleared rec_active; a stopped-then-deleted series cannot be told apart and resumes too. A series
+    # moved to "когда-нибудь" (``_make_someday`` keeps the rule, stopped) can: it stays stopped.
+    item.rec_active = item.rrule is not None and item.status == "open" and not item.someday
     for occ in await _open_occurrences(session, item.id, after=now):
         await _replan(session, item, occ, prefs, now)
     if item.rec_active:
@@ -861,9 +867,14 @@ async def _patch_done(session: AsyncSession, item: Item, prefs: Prefs, now: date
 
 
 async def _patch_undone(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> None:
+    """The latest done occurrence open again (with the item). A "когда-нибудь" item only takes back its own done mark:
+    an instance done before it became someday stays history, and none of its occurrences is planned again."""
+    conds = [Occurrence.item_id == item.id, Occurrence.status == "done"]
+    if item.someday:  # only the occurrence whose "done" closed the item (a stale reminder's ✅), if any
+        conds.append(Occurrence.done_at >= item.done_at if item.done_at is not None else false())
     stmt = (
         select(Occurrence)
-        .where(Occurrence.item_id == item.id, Occurrence.status == "done")
+        .where(*conds)
         .order_by(Occurrence.done_at.desc().nulls_last(), Occurrence.due_at.desc())
         .limit(1)
     )
@@ -946,12 +957,13 @@ async def _set_rrule(
         return False
     tz = prefs.zone
     first = await _first_open(session, item.id)
-    reference = first or await current_occurrence(session, item.id)
-    start, time_spec = _series_start(patch.when, reference, prefs, now)
+    # A cancelled occurrence is no time of the item any more ("когда-нибудь", a task turned into an idea).
+    reference = first or await _latest_kept(session, item.id)
+    start, time_spec = _series_start(patch.when, reference, prefs, now, span_start=item.period_start)
     dtstart = start.replace(tzinfo=None)
     after, inclusive = now, True
-    if first is None and reference is not None and reference.due_at >= now:
-        # Nothing open (e.g. just marked done ahead of time): the series continues after that instance.
+    if first is None and reference is not None and reference.status == "done" and reference.due_at >= now:
+        # Nothing open, just marked done ahead of time: the series continues after that instance.
         after, inclusive = reference.due_at, False
     due = recurrence.next_occurrence(rule, dtstart, tz, after, inclusive=inclusive)
     if due is None:
@@ -986,18 +998,30 @@ async def _set_rrule(
 
 
 def _series_start(
-    when: When | None, reference: Occurrence | None, prefs: Prefs, now: datetime
+    when: When | None,
+    reference: Occurrence | None,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    span_start: date | None = None,
 ) -> tuple[datetime, str | None]:
     """Local aware start of a series edited in place, and the time spec it keeps ("HH:MM", slot name or None).
 
     The time of day comes from ``when`` if it names one, else from the item's current occurrence, else from
     ``task_default_time``; the date from ``when``, else the current occurrence (its weekday matters for a bare
-    FREQ=WEEKLY), else today.
+    FREQ=WEEKLY), else today. A fuzzy span ("на этой неделе", "на днях": in ``when``, or the item's own with
+    ``span_start``) names no day: its occurrence sits at the reminder (2) moment, so the series starts on the span's
+    first day (today once it has begun) at ``task_default_time``.
     """
     tz = prefs.zone
-    due, precision = None, "none"
+    today = now.astimezone(tz).date()
+    due, precision, first_day = None, "none", None
     if when is not None:
         due, precision, _, _ = timeresolve.resolve_when(when, now, prefs)
+        if precision in _FUZZY:  # "каждый день со следующей недели"
+            due, first_day = None, timeresolve.when_period(when, now, prefs)[1] or today
+    if reference is not None and reference.precision in _FUZZY:  # the item's own span
+        first_day, reference = first_day or span_start or today, None
     ref_local = reference.due_at.astimezone(tz) if reference is not None else None
     ref_timed = reference is not None and reference.precision in ("exact", "slot")
 
@@ -1007,10 +1031,12 @@ def _series_start(
         return start, time_spec
     if due is not None:
         day = due.astimezone(tz).date()
+    elif first_day is not None:
+        day = max(first_day, today)
     elif ref_local is not None:
         day = ref_local.date()
     else:
-        day = now.astimezone(tz).date()
+        day = today
     clock_time = ref_local.time() if ref_local is not None else prefs.task_default_time
     start = timeresolve.localize(day, clock_time, tz)
     return start, start.strftime("%H:%M") if ref_timed else None
@@ -1169,9 +1195,9 @@ async def move_to_tomorrow(
     tomorrow, which before ``night_cutoff`` is the day that has just started; never a day in the past) at that
     time of day, or to the day after when that moment has passed as well.
 
-    Done/cancelled occurrences and deleted items are skipped. Moving onto an existing occurrence of the same
-    item (a daily series) merges into it. ``day`` is an optional extension of the contract (the evening
-    digest passes its own day + 1).
+    Done/cancelled occurrences, deleted items and "когда-нибудь" ones (no date on purpose) are skipped. Moving onto
+    an existing occurrence of the same item (a daily series) merges into it. ``day`` is an optional extension of the
+    contract (the evening digest passes its own day + 1).
     """
     now = _utc(now)
     tz = prefs.zone
@@ -1182,7 +1208,7 @@ async def move_to_tomorrow(
         if occ is None or occ.status in ("done", "cancelled"):
             continue
         item = await _get_item(session, occ.item_id)
-        if item.status == "deleted":
+        if item.status == "deleted" or item.someday:
             continue
         local = occ.due_at.astimezone(tz)
         new_day = local.date() + timedelta(days=1) if occ.due_at > now else past_due_day
@@ -1250,6 +1276,17 @@ async def _first_open(session: AsyncSession, item_id: int) -> Occurrence | None:
         select(Occurrence)
         .where(Occurrence.item_id == item_id, Occurrence.status == "open")
         .order_by(Occurrence.due_at, Occurrence.id)
+        .limit(1)
+    )
+    return await session.scalar(stmt)
+
+
+async def _latest_kept(session: AsyncSession, item_id: int) -> Occurrence | None:
+    """The latest occurrence by due that was not cancelled (done, missed, or open)."""
+    stmt = (
+        select(Occurrence)
+        .where(Occurrence.item_id == item_id, Occurrence.status != "cancelled")
+        .order_by(Occurrence.due_at.desc(), Occurrence.id.desc())
         .limit(1)
     )
     return await session.scalar(stmt)

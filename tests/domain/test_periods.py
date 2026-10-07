@@ -423,6 +423,34 @@ def test_deadline_end_of_next_week():
     assert fires(res) == [(L(2026, 10, 15, 19, 0), True), (L(2026, 10, 16, 10, 0), True)]
 
 
+@pytest.mark.parametrize(
+    ("text", "period", "now", "due"),
+    [
+        ("к лету", "summer", TUE, L(2027, 6, 1, 10, 0)),  # by summer = by 1 June, not by 31 August
+        ("до зимы", "winter", TUE, L(2026, 12, 1, 10, 0)),
+        ("до октября", "2026-10", L(2026, 9, 10, 12, 0), L(2026, 10, 1, 10, 0)),
+        ("к следующей неделе", "next_week", TUE, L(2026, 10, 12, 10, 0)),
+        ("by next month", "next_month", TUE, L(2026, 11, 1, 10, 0)),
+        # "до конца …" is the end of the span; a span that has begun has no start to be "by"
+        ("до конца лета", "summer", TUE, L(2027, 8, 31, 10, 0)),
+        ("к концу следующей недели", "next_week", TUE, L(2026, 10, 16, 10, 0)),
+        ("by the end of next month", "next_month", TUE, L(2026, 11, 30, 10, 0)),
+        ("до этой недели", "this_week", TUE, L(2026, 10, 9, 10, 0)),
+        ("в течение месяца", "this_month", TUE, L(2026, 10, 30, 10, 0)),
+    ],
+)
+def test_deadline_by_a_span_is_its_first_day_unless_it_says_its_end(text, period, now, due):
+    """The prompt asks for day MM-DD here (v4); a model that still sends period + deadline gets the same date."""
+    res = resolve({"text": text, "period": period, "role": "deadline"}, now)
+    assert (res.precision, res.due_at, res.period_kind) == ("date", due, None)
+    assert fires(res)[-1] == (due, True)
+
+
+def test_deadline_by_a_season_as_the_prompt_asks_for_it():
+    res = resolve({"text": "к лету", "day": "06-01", "role": "deadline"}, TUE)
+    assert fires(res) == [(L(2027, 5, 31, 19, 0), True), (L(2027, 6, 1, 10, 0), True)]
+
+
 def test_event_and_remind_roles_get_no_evening_before():
     for role in ("event", "remind"):
         res = resolve({"text": "в пятницу", "day": "FR", "role": role}, TUE)

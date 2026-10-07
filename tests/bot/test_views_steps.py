@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from datetime import date
+
 from dumpbot.bot import views
 from dumpbot.bot.cbdata import ItemCb, SubCb
 from dumpbot.dto import CardExtras, RelatedRef, Step
@@ -113,3 +115,35 @@ def test_steps_closed_message_and_help(check_view):
     for phrase in ("распиши по шагам", "🪄 Разбить на шаги", "разбей на шаги", "(из «Переезд»)", "2/5", "🔗 Похожее"):
         assert phrase in help_text, phrase
     assert views.PURPOSE_LABELS["split"] == "разбивка на шаги"
+
+
+def test_a_step_with_a_span_shows_it_as_words(make_item, prefs, now, at, check_view):
+    """«упаковать вещи на следующей неделе» is any day of 12–18 Oct, not a Friday deadline (its reminder (2))."""
+    week = Step(
+        item_id=BIG + 1,
+        position=1,
+        title="Упаковать вещи",
+        done=False,
+        due_at=at(2026, 10, 16, 19, 0),
+        precision="period",
+        period_kind="week",
+        period_start=date(2026, 10, 12),
+        period_end=date(2026, 10, 18),
+    )
+    soon = Step(
+        item_id=BIG + 2,
+        position=2,
+        title="Позвонить",
+        done=False,
+        due_at=at(2026, 10, 8, 19, 0),
+        precision="soon",
+        period_kind="soon",
+        period_start=date(2026, 10, 6),
+        period_end=date(2026, 10, 8),
+    )
+    text, _ = check_view(
+        views.item_card(make_item(id=BIG), None, [], prefs, now, extras=CardExtras(steps=(week, soon)))
+    )
+    assert "☐ 1. Упаковать вещи · на следующей неделе" in text.split("\n")
+    assert "☐ 2. Позвонить · чт 8 окт" in text.split("\n")  # "на днях" reads as its day, like list rows
+    assert views.step_when(week, prefs, now) == "на следующей неделе"

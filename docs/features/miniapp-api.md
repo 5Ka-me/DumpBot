@@ -197,7 +197,7 @@ TypeScript-типы этого контракта — [`webapp/src/api/types.ts`
 | `tags` | string[] ≤ 20 | заменить теги (нормализуются как у ИИ: нижний регистр, без `#`) |
 | `kind` | `Kind` | категория; стала задачей без времени → напоминание по умолчанию (19:00), перестала → снимается |
 | `lead` | number[] (≤ 3, 0…43200 мин) \| null | «напомнить за»; `[]`/`null` — по умолчанию из настроек; включает напоминания обратно |
-| `period` | `this_week` `next_week` `this_month` `next_month` `YYYY-MM` `spring` `summer` `autumn` `winter` `soon` `someday` | размытый срок без ИИ |
+| `period` | `this_week` `next_week` `this_month` `next_month` `YYYY-MM` `spring` `summer` `autumn` `winter` `soon` `someday` | размытый срок без ИИ; роль времени становится `event` (у записи «до пятницы» тоже: чип — это срок, а не «до …», как ответ «перенеси на следующую неделю» в боте) |
 | `someday` | boolean | `true` — «когда-нибудь» (без даты и напоминаний); `false` — убрать «когда-нибудь» (задача получит 19:00) |
 
 `period` и `someday` вместе — 400. → `ItemResponse` (`message: "✅ Сохранено"`). Удалённая запись — 409 `deleted`.

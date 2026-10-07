@@ -88,6 +88,11 @@ class Step:
     done: bool
     due_at: datetime | None = None  # due of the step's current occurrence (a step with a time of its own)
     precision: str | None = None
+    # The step's fuzzy span (Item.period_kind/start/end): "на следующей неделе" shows as words, not as the date of
+    # its reminder (2).
+    period_kind: str | None = None
+    period_start: date | None = None
+    period_end: date | None = None
 
 
 @dataclass(frozen=True)

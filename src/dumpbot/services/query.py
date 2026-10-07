@@ -107,19 +107,19 @@ async def agenda(session: AsyncSession, prefs: Prefs, now: datetime, *, day_offs
     """Occurrences of one local day: not done (open, or missed instances of a series) by time; overdue open
     ones from the previous 30 days (only for today); done that day (by done_at); open items whose calendar
     period contains the day (they are not in open / overdue while the period runs: "на этой неделе" is due on
-    Friday 19:00 but still fine on Saturday)."""
+    Friday 19:00 but still fine on Saturday). "Когда-нибудь" items are never due, whatever occurrence they kept."""
     tz = prefs.zone
     day = _utc(now).astimezone(tz).date() + timedelta(days=day_offset)
     start = timeresolve.localize(day, time(0), tz).astimezone(UTC)
     end = timeresolve.localize(day + timedelta(days=1), time(0), tz).astimezone(UTC)
-    not_running = _no_running_period(day)
+    dated = and_(_no_running_period(day), Item.someday.is_(False))  # not in period_items, not someday
 
     open_rows = await _occ_rows(
         session,
         Occurrence.status.in_(_NOT_DONE),
         Occurrence.due_at >= start,
         Occurrence.due_at < end,
-        not_running,
+        dated,
         order=(Occurrence.due_at, Occurrence.id),
     )
     overdue: list[Row] = []
@@ -129,7 +129,7 @@ async def agenda(session: AsyncSession, prefs: Prefs, now: datetime, *, day_offs
             Occurrence.status == "open",
             Occurrence.due_at < start,
             Occurrence.due_at >= start - timedelta(days=OVERDUE_DAYS),
-            not_running,
+            dated,
             order=(Occurrence.due_at, Occurrence.id),
         )
     done = await _occ_rows(
@@ -293,16 +293,28 @@ async def card_extras(session: AsyncSession, item: Item) -> CardExtras:
 
 
 async def _steps(session: AsyncSession, parent_id: int) -> list[Step]:
-    """Not deleted steps in order, numbered 1..n, with the due of their current occurrence (not a cancelled one)."""
+    """Not deleted steps in order, numbered 1..n, with the due of their current occurrence (not a cancelled one) and
+    their fuzzy span."""
     occ = _occ_subquery(open_only=False)
     stmt = (
-        select(Item.id, Item.title, Item.status, occ.c.due_at, occ.c.precision, occ.c.occ_status)
+        select(
+            Item.id,
+            Item.title,
+            Item.status,
+            occ.c.due_at,
+            occ.c.precision,
+            occ.c.occ_status,
+            Item.period_kind,
+            Item.period_start,
+            Item.period_end,
+        )
         .outerjoin(occ, occ.c.item_id == Item.id)
         .where(Item.parent_id == parent_id, Item.status != "deleted")
         .order_by(Item.position.asc().nulls_last(), Item.id)
     )
     out: list[Step] = []
-    for n, (step_id, title, status, due_at, precision, occ_status) in enumerate((await session.execute(stmt)).all(), 1):
+    for n, row in enumerate((await session.execute(stmt)).all(), 1):
+        step_id, title, status, due_at, precision, occ_status, period_kind, period_start, period_end = row
         timed = due_at is not None and occ_status != "cancelled"
         out.append(
             Step(
@@ -312,6 +324,9 @@ async def _steps(session: AsyncSession, parent_id: int) -> list[Step]:
                 done=status == "done",
                 due_at=due_at if timed else None,
                 precision=precision if timed else None,
+                period_kind=period_kind,
+                period_start=period_start,
+                period_end=period_end,
             )
         )
     return out
@@ -582,8 +597,15 @@ async def _run_due_query(
     tz = prefs.zone
     first_day = window[0].astimezone(tz).date()
     last_day = (window[1] - timedelta(microseconds=1)).astimezone(tz).date()
+    # The item's span overlaps the range: that counts for the occurrence of the span only (precision "period", due
+    # inside it), not for an earlier done one of the same item at some other time.
+    due_day = func.date(func.timezone(prefs.tz, Occurrence.due_at))
     overlaps = and_(
-        Item.period_kind.in_(_CALENDAR_PERIODS), Item.period_start <= last_day, Item.period_end >= first_day
+        Item.period_kind.in_(_CALENDAR_PERIODS),
+        Item.period_start <= last_day,
+        Item.period_end >= first_day,
+        Occurrence.precision == "period",
+        due_day.between(Item.period_start, Item.period_end),
     )
     occ_conds: list[ColumnElement[bool]] = [
         or_(and_(Occurrence.due_at >= window[0], Occurrence.due_at < window[1]), overlaps),

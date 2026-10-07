@@ -9,8 +9,10 @@ from decimal import Decimal
 import pytest
 
 from dumpbot.ai.client import AIModelNotFound, AIUnavailable
+from dumpbot.ai.stt import RoutedSTT
 from dumpbot.db.models import AiUsage, RawMessage
 from dumpbot.services import processor
+from dumpbot.watchdog import Watchdog
 from dumpbot.workers import jobs
 from dumpbot.workers.jobs import RetryLater
 
@@ -274,3 +276,40 @@ async def test_duration_limit_applies_to_both_backends(
     fake_ai.push(SAVE_NOTE)
     await processor.handle_message(ctx, {"raw_id": at_limit.id})
     assert len(stt.calls) + len(local_stt.calls) == 1
+
+
+# --- an album of audio files and the jobs watchdog ------------------------------------------------------------------
+
+
+async def test_every_transcribed_part_of_an_album_is_progress_for_the_watchdog(ctx, add_raw, bot, fake_ai) -> None:
+    """Seven lecture recordings in one album, each taking 20 minutes of STT on a slow CPU: one job for 2 h 20 min.
+    The worker beats only between jobs; the parts beat themselves, so the 30-minute watchdog never fires."""
+    clock_s = [0.0]
+
+    class SlowSTT:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def transcribe(self, audio: bytes, **kwargs: object) -> str:
+            self.calls += 1
+            clock_s[0] += 20 * 60
+            assert not watchdog.stalled(), f"stalled during part {self.calls}"
+            return f"лекция {self.calls}"
+
+    watchdog = Watchdog(monotonic=lambda: clock_s[0])
+    watchdog.watch(jobs.WATCH_NAME, jobs.STALL_AFTER.total_seconds())
+    slow = SlowSTT()
+    ctx.watchdog = watchdog
+    ctx.stt = RoutedSTT(slow)  # type: ignore[arg-type]
+    for n in range(7):
+        bot.files[f"lecture-{n}"] = b"MP3"
+        await add_raw(
+            None, content_type="audio", file_id=f"lecture-{n}", duration=270, media_group_id="L", message_id=300 + n
+        )
+    fake_ai.push(SAVE_NOTE)
+
+    await processor.handle_album(ctx, {"media_group_id": "L", "chat_id": ctx.settings.owner_id})
+
+    assert slow.calls == 7
+    assert fake_ai.inputs[0].text == "\n\n".join(f"лекция {n}" for n in range(1, 8))
+    assert watchdog.stalled() == {}
