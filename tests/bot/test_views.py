@@ -660,7 +660,7 @@ def test_settings_marks_current_values(check_view, buttons):
     assert ("✓ Русский", "s:stt:ru") in buttons(views.settings_stt_menu(prefs)[1])
     assert ("✓ $10", "s:budget:10") in buttons(views.settings_budget_menu(prefs)[1])
     assert ("🔕 Включить тихие часы", "s:quiet_toggle:") in buttons(views.settings_quiet_menu(prefs)[1])
-    auto = Prefs()
+    auto = Prefs(stt_language=None)
     assert ("✓ Авто", "s:stt:auto") in buttons(views.settings_stt_menu(auto)[1])
     assert ("✓ 🔀 Авто: chutes, при сбое — локальный", "s:stt_mode:auto") in buttons(views.settings_stt_menu(auto)[1])
     assert ("✓ 5 мин", "s:lead:5") not in buttons(views.settings_lead_menu(prefs)[1])

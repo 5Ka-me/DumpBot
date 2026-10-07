@@ -57,7 +57,7 @@ async def test_voice_note_falls_back_to_the_local_whisper_when_chutes_stt_is_dow
     assert e2e.tg.reactions(message_id) == ["👀", "👌"]  # no ✍: the fallback ran in the same job
     assert len(e2e.ai.stt_requests) == 1  # chutes was tried first ("auto")
     [local] = e2e.ai.local_requests
-    assert base64.b64decode(local["audio_b64"]) == OGG and local["language"] is None
+    assert base64.b64decode(local["audio_b64"]) == OGG and local["language"] == "ru"
     [req] = e2e.ai.extraction_requests()
     assert (req.msg, req.line("SRC ")) == ("Купить наушники в обед", "SRC voice")
     assert card.text.startswith("🛒 <b>Купить наушники</b>")

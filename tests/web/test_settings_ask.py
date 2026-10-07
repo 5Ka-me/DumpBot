@@ -14,7 +14,7 @@ async def test_get_settings_lists_every_preference(api) -> None:
     assert set(data["prefs"]) == set(Prefs.model_fields)
     prefs = data["prefs"]
     assert prefs["tz"] == "Europe/Warsaw" and prefs["slot_lunch"] == "13:00" and prefs["quiet_start"] == "23:00"
-    assert prefs["lead_minutes"] == 5 and prefs["budget_usd"] == 5.0 and prefs["stt_language"] is None
+    assert prefs["lead_minutes"] == 5 and prefs["budget_usd"] == 5.0 and prefs["stt_language"] == "ru"
     assert prefs["stt_mode"] == "auto" and prefs["quiet_enabled"] is True
     assert data["local_stt"] is False
 
