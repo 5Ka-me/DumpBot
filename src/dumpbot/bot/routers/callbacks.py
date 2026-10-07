@@ -7,7 +7,8 @@ scheduler is woken after anything that changes reminders, the job worker after a
 Checklists (docs/features/iteration-2.md §C2): [☐ N] / [☑ N] (``SubCb``) toggle a step and redraw the parent's
 card; whenever a commit closed a parent by its last step (whatever button did it: a step's reminder too) the
 "🎉 Все шаги выполнены" message follows and other cards of the parent are redrawn (``common.after_steps``).
-[🪄 Разбить на шаги] queues job "split"; [🔗 Похожее] sends the cards of the related items.
+[🪄 Разбить на шаги] queues job "split" (one at a time per item; nothing with the month's AI budget spent);
+[🔗 Похожее] sends the cards of the related items.
 
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
@@ -48,7 +49,7 @@ from dumpbot.db.models import Occurrence, RawMessage
 from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import fmt_date, fmt_dt, fmt_duration
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
-from dumpbot.services import digest, items, query
+from dumpbot.services import digest, items, processor, query
 from dumpbot.workers import jobs
 
 if TYPE_CHECKING:
@@ -261,13 +262,17 @@ async def _item_done(c: ItemCall) -> Outcome:
 
 async def _split(c: ItemCall) -> Outcome:
     """[🪄 Разбить на шаги]: job "split" (the AI breaks the task down, then this card turns into the checklist).
-    While a split of the item is queued or running another press only says so (a redelivered press is deduplicated
-    by its callback id); a failed split can be tried again. An item that has steps already or cannot have them just
-    gets its card redrawn."""
-    extras = await query.card_extras(c.session, c.item)
-    if extras.steps or not items.can_split(c.item):
+    The item row is locked first, so two quick presses (handled concurrently) run one after the other: while a split
+    of the item is queued or running another press only says so (a redelivered press is deduplicated by its callback
+    id); a failed split can be tried again. An item that has steps already or cannot have them just gets its card
+    redrawn; with the month's AI budget spent nothing is queued (the toast says until when)."""
+    item = await items.lock_item(c.session, c.item.id)
+    extras = await query.card_extras(c.session, item)
+    if extras.steps or not items.can_split(item):
         toast = "У задачи уже есть шаги" if extras.steps else "Эту запись не разбить на шаги"
-        return Outcome(await common.card_view(c.session, c.item, c.prefs, c.now), toast)
+        return Outcome(await common.card_view(c.session, item, c.prefs, c.now), toast)
+    if (no_budget := await processor.split_budget_block(c.session, c.prefs, c.now)) is not None:
+        return Outcome(None, no_budget)
     if await _split_pending(c.session, c.item.id):
         return Outcome(None, SPLITTING)
     payload = {"item_id": c.item.id, "message_id": c.message_id, "now": c.now.isoformat()}

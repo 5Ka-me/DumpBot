@@ -240,7 +240,9 @@ async def _attempt[M: BaseModel](
             return None
         try:
             return out_cls.model_validate(parse_json_object(res.content))
-        except ValueError as e:  # JSONDecodeError and pydantic ValidationError are both ValueErrors
+        except (ValueError, TypeError) as e:
+            # JSONDecodeError and pydantic ValidationError are ValueErrors; pydantic passes through a TypeError of a
+            # validator that met a value of an unexpected type: invalid output too, not a failed message.
             if res.finish_reason == "length" and max_tokens < LONG_MAX_TOKENS:
                 log.warning(
                     "model %s output was cut at %d tokens, asking again with %d", model, max_tokens, LONG_MAX_TOKENS
@@ -262,7 +264,7 @@ async def _attempt[M: BaseModel](
             ]
 
 
-def _error_summary(e: ValueError) -> str:
+def _error_summary(e: ValueError | TypeError) -> str:
     """Short, value-free description of what failed (no message text ends up in logs)."""
     if isinstance(e, ValidationError):
         parts = [

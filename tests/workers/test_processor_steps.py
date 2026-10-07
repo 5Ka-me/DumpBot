@@ -10,8 +10,9 @@ from datetime import timedelta
 from sqlalchemy import select
 
 from dumpbot.ai.client import AIBadResponse, AIUnavailable
-from dumpbot.db.models import Item, ItemLink, Job, OnceKey, RawMessage
-from dumpbot.services import processor
+from dumpbot.db.models import BotMessage, Item, ItemLink, Job, OnceKey, RawMessage
+from dumpbot.domain.prefs import Prefs
+from dumpbot.services import items, processor
 
 MOVE = {
     "intent": "save",
@@ -207,7 +208,41 @@ async def test_split_job_failures(ctx, fake_ai, bot, make_items, t0, db) -> None
     assert bot.reactions == []  # the message is the bot's own card
 
 
+async def test_a_split_job_that_waited_plans_from_its_run_time(ctx, fake_ai, make_items, t0) -> None:
+    [created] = await make_items({"kind": "task", "title": "Ремонт"}, now=t0)
+    fake_ai.splits.extend([["Выбрать плитку"], ["Найти мастера"]])
+    pressed = t0 - timedelta(days=12)  # queued on Sep 24, deferred by the budget until today
+    await processor.handle_split(ctx, {"item_id": created.item.id, "message_id": 555, "now": pressed.isoformat()})
+    assert fake_ai.split_inputs[0].now == t0  # "завтра" of a step is tomorrow, not Sep 25
+
+    [other] = await make_items({"kind": "task", "title": "Переезд"}, now=t0)
+    fresh = t0 - timedelta(minutes=2)  # a job that ran right away keeps the press time
+    await processor.handle_split(ctx, {"item_id": other.item.id, "message_id": 556, "now": fresh.isoformat()})
+    assert fake_ai.split_inputs[1].now == fresh
+
+
 # --- 🎉 after an edit ------------------------------------------------------------------------------------------------
+
+
+async def test_a_new_time_for_a_ticked_step_redraws_the_reopened_parent(
+    ctx, fake_ai, bot, make_items, t0, db, sessionmaker
+) -> None:
+    [created] = await make_items({"kind": "task", "title": "Переезд", "steps": [{"title": "Упаковать вещи"}]}, now=t0)
+    [step] = await steps_of(db, created.item.id)
+    async with sessionmaker() as s:
+        await items.toggle_step(s, step.id, done=True, prefs=Prefs(tz="Europe/Warsaw"), now=t0)
+        s.add(BotMessage(chat_id=ctx.chat_id, message_id=700, purpose="card", item_id=created.item.id))
+        await s.commit()
+    [parent] = await db(select(Item).where(Item.id == created.item.id))
+    assert parent.status == "done"
+
+    # "🕒 Время" of the ticked step: «завтра 12:00»
+    fake_ai.push({"intent": "edit", "edit": {"when": {"text": "завтра 12:00", "day": "+1", "time": "12:00"}}})
+    await processor.handle_edit_time(ctx, {"item_id": step.id, "text": "завтра 12:00", "now": t0.isoformat()})
+    [parent] = await db(select(Item).where(Item.id == created.item.id))
+    assert parent.status == "open"
+    [edit] = bot.calls_of("edit_message_text")  # the parent's chat card is not left at «✅ сделано»
+    assert edit["message_id"] == 700 and "☐ 1. Упаковать вещи" in edit["text"] and "✅ сделано" not in edit["text"]
 
 
 async def test_done_by_a_reply_to_the_last_step_celebrates(ctx, add_raw, fake_ai, bot, make_items, t0, db) -> None:

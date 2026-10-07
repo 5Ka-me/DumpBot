@@ -85,12 +85,14 @@ __all__ = [
     "handle_split",
     "on_dead",
     "run_question",
+    "split_budget_block",
 ]
 
 log = logging.getLogger(__name__)
 
 DOWNLOAD_RETRY: Final = timedelta(minutes=5)
 CONFIG_RETRY: Final = timedelta(hours=1)
+SPLIT_NOW_MAX_AGE: Final = timedelta(hours=1)  # an older press time of a split job is replaced by the run time
 BUDGET_WARN_RATIO: Final = 0.8
 MAX_IMAGES: Final = 4
 # Bigger pictures are not sent to the model: the upload counts against llm_timeout_s, and the models downscale anyway.
@@ -321,8 +323,10 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
         view = await _patch_view(session, result, prefs)
         await session.commit()
+        events = items_svc.take_parent_events(session)
     if not app:
         await _send_patch_card(ctx, prefs, view, result, reply_to=message_id)
+    await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))  # a step's new time
     if message_id:
         await sender.react(ctx, message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
@@ -353,9 +357,12 @@ def _usable_when(when: When, now: datetime, prefs: Prefs) -> bool:
 async def handle_split(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any] | None:
     """Job "split" ``{item_id, message_id?, now?, app?}`` from the card's [🪄 Разбить на шаги]: the AI breaks the task
     into steps and the card (``message_id``) turns into the checklist. ``app`` (the Mini App): nothing goes to the
-    chat, the outcome is returned for ``Job.result``."""
+    chat, the outcome is returned for ``Job.result``. ``now`` (the press) is the steps' reference time only while it
+    is fresh (``SPLIT_NOW_MAX_AGE``): a job that waited (AI down, budget) plans them from the time it runs, so
+    "завтра" is never already past."""
     prefs = await _prefs(ctx)
-    now = _payload_time(payload.get("now")) or clock.utcnow()
+    run_at, pressed = clock.utcnow(), _payload_time(payload.get("now"))
+    now = pressed if pressed is not None and run_at - pressed <= SPLIT_NOW_MAX_AGE else run_at
     card = _opt_int(payload.get("message_id"))
     app = bool(payload.get("app"))
     outcome = await _split(ctx, prefs, int(payload["item_id"]), now=now, note=None, card_message=card, app=app)
@@ -1259,7 +1266,7 @@ async def _check_budget(
             notify = await try_once(session, f"budget80:{month}")
         await session.commit()
     if state.exhausted:
-        resume = quiet.shift_out_of_quiet(usage.next_month_start(now, prefs), prefs)
+        resume = _budget_resume(now, prefs)
         if notify:
             await _send(ctx, _budget_exhausted_text(state, resume, prefs), prefs=prefs, purpose="notice")
         await _defer(ctx, raws, message_id=message_id)
@@ -1267,6 +1274,24 @@ async def _check_budget(
         raise RetryLater(reason=BUDGET_REASON, at=resume, count_attempt=False)
     if notify:
         await _send(ctx, _budget_warning_text(state), prefs=prefs, purpose="notice")
+
+
+def _budget_resume(now: datetime, prefs: Prefs) -> datetime:
+    """When jobs deferred by an exhausted budget run: the next month, after the quiet hours of that night."""
+    return quiet.shift_out_of_quiet(usage.next_month_start(now, prefs), prefs)
+
+
+async def split_budget_block(session: AsyncSession, prefs: Prefs, now: datetime) -> str | None:
+    """Why [🪄 Разбить на шаги] cannot run now — the month's AI budget is spent (a toast) — or None. Checked before the
+    job is queued: it would only wait until next month, with the owner told nothing but "Разбиваю на шаги…"."""
+    state = await usage.budget_state(session, prefs, now)
+    if not state.exhausted:
+        return None
+    if state.limit_usd <= 0:
+        return "⛔ ИИ выключен (бюджет $0) — включи его в настройках, чтобы разбить на шаги."
+    today = now.astimezone(prefs.zone).date()
+    day = fmt_date(_budget_resume(now, prefs).astimezone(prefs.zone).date(), today=today)
+    return f"⛔ Бюджет на ИИ исчерпан до {day} — увеличь его в настройках, чтобы разбить на шаги сейчас."
 
 
 def _budget_warning_text(state: BudgetState) -> str:

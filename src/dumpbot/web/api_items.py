@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import web
-from sqlalchemy import select
 
 from dumpbot import clock
 from dumpbot.ai.schemas import MAX_LEAD_MINUTES, PERIOD_RE, EditPatch, When
@@ -25,7 +24,7 @@ from dumpbot.db.models import Item
 from dumpbot.domain.fmt import fmt_dt
 from dumpbot.domain.kinds import KINDS
 from dumpbot.services import items, query
-from dumpbot.services.processor import CANT_SPLIT_TEXT, HAS_STEPS_TEXT
+from dumpbot.services.processor import CANT_SPLIT_TEXT, HAS_STEPS_TEXT, split_budget_block
 from dumpbot.web import serialize
 from dumpbot.web.http import ApiError, bad_request, conflict, ctx_of, json_response, path_id, read_json
 from dumpbot.workers import jobs
@@ -362,20 +361,21 @@ async def snooze(request: web.Request) -> web.Response:
 
 async def split(request: web.Request) -> web.Response:
     """[🪄 Разбить на шаги]: job "split" (202 ``{job_id, pending}``); while one runs for the item its id is returned.
-    The item row is locked first, so two quick taps queue one job."""
+    The item row is locked first, so two quick taps queue one job. With the month's AI budget spent nothing is queued
+    (402 ``budget_exhausted``: the job would only wait until next month)."""
     item_id = path_id(request)
     ctx = ctx_of(request)
     now = clock.utcnow()
     async with ctx.sessionmaker() as session:
-        item = await session.scalar(select(Item).where(Item.id == item_id).with_for_update())
-        if item is None:
-            raise items.NotFoundError(f"item {item_id} not found")
+        item = await items.lock_item(session, item_id)
         if item.status == "deleted":
             raise conflict("deleted", DELETED)
         if (await query.card_extras(session, item)).steps:
             raise conflict("has_steps", HAS_STEPS_TEXT)
         if item.kind not in views.SPLIT_KINDS or not items.can_split(item):
             raise conflict("cant_split", CANT_SPLIT_TEXT)
+        if (no_budget := await split_budget_block(session, await ctx.prefs(session), now)) is not None:
+            raise ApiError(402, "budget_exhausted", no_budget)
         pending = await jobs.pending_job(session, "split", item_id)
         payload = {"item_id": item_id, "now": now.isoformat(), "app": True}
         job_id = pending if pending is not None else await jobs.enqueue(session, "split", payload)

@@ -340,6 +340,15 @@ async def test_split_that_finds_no_steps(api, make_items, fake_ai, run_jobs) -> 
     assert result["ok"] is False and result["reason"] == "no_steps" and result["message"].startswith("🤷")
 
 
+async def test_split_with_the_budget_spent_queues_nothing(api, make_items, jobs_all) -> None:
+    [created] = await make_items({"kind": "task", "title": "Переезд"})
+    await api.patch("/api/settings", {"budget_usd": 0})
+    reply = await api.post(f"/api/items/{created.item.id}/split")
+    assert (reply.status, reply.data["error"]["code"]) == (402, "budget_exhausted")
+    assert reply.data["error"]["message"].startswith("⛔ ИИ выключен")
+    assert await jobs_all() == []
+
+
 async def test_split_is_only_for_open_tasks(api, make_items) -> None:
     [idea] = await make_items({"kind": "idea", "title": "Идея"})
     reply = await api.post(f"/api/items/{idea.item.id}/split")
@@ -423,6 +432,35 @@ async def test_toggle_closes_and_reopens_the_parent(api, make_items, bot) -> Non
     assert reply.data["closed"] is False and reply.data["message"] == "☐ Заказать машину"
     assert reply.data["item"]["status"] == "open"
     assert (await api.post(f"/api/steps/{steps[0]['id']}/toggle", {"done": "yes"})).status == 400
+
+
+async def test_deleting_and_restoring_a_step_moves_the_parent(api, make_items, bot) -> None:
+    [created] = await make_items({"kind": "task", "title": "Переезд", "when": TOMORROW_13})
+    path = f"/api/items/{created.item.id}/steps"
+    await api.post(path, {"title": "Упаковать вещи"})
+    steps = (await api.post(path, {"title": "Отдать ключи"})).data["item"]["steps"]
+    await api.post(f"/api/steps/{steps[0]['id']}/toggle", {"done": True})
+
+    # 🗑 of the only open step: every step left is ticked, so the parent closes (🎉 here and in the chat)
+    reply = await api.delete(f"/api/steps/{steps[1]['id']}")
+    assert reply.data["closed"] is True and reply.data["message"] == "🎉 Все шаги выполнены — «Переезд» закрыт"
+    assert reply.data["item"]["status"] == "done" and reply.data["item"]["reminders"] == []
+    assert bot.texts == ["🎉 Все шаги выполнены — «Переезд» закрыт"]
+
+    # ↩️ of the deleted open step: the parent is open again, with its reminder
+    reply = await api.post(f"/api/items/{steps[1]['id']}/restore")
+    assert reply.data["item"]["status"] == "open"
+    parent = (await api.get(f"/api/items/{created.item.id}")).data
+    assert parent["status"] == "open" and len(parent["reminders"]) == 1 and parent["steps_done"] == 1
+
+
+async def test_restoring_a_step_of_a_deleted_parent_restores_the_parent(api, make_items) -> None:
+    [created] = await make_items({"kind": "task", "title": "Переезд"})
+    steps = (await api.post(f"/api/items/{created.item.id}/steps", {"title": "Шаг"})).data["item"]["steps"]
+    await api.post(f"/api/items/{created.item.id}/delete")
+    reply = await api.post(f"/api/items/{steps[0]['id']}/restore")
+    assert reply.status == 200 and reply.data["item"]["status"] == "open"
+    assert (await api.get(f"/api/items/{created.item.id}")).data["status"] == "open"
 
 
 async def test_adding_a_step_reopens_a_done_parent(api, make_items) -> None:

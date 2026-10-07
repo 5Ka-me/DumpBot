@@ -69,11 +69,20 @@ def _max_length(info: FieldInfo) -> int | None:
     return next((m.max_length for m in info.metadata if isinstance(getattr(m, "max_length", None), int)), None)
 
 
+def _as_list(v: Any) -> list[Any]:
+    """A list field as the model sent it: a lone string or number is a one-element list, anything else that is not a
+    list (null, true, an object) is empty. A before-validator must not raise TypeError: pydantic passes it through
+    instead of a ValidationError, which would skip the repair / fallback path and fail the whole message."""
+    if isinstance(v, list | tuple):
+        return list(v)
+    if isinstance(v, str | int | float) and not isinstance(v, bool):
+        return [v]
+    return []
+
+
 def _norm_tags(v: Any) -> list[str]:
-    if v is None:
-        return []
     out: list[str] = []
-    for t in v:
+    for t in _as_list(v):
         t = re.sub(r"\s+", "_", str(t).strip().lstrip("#").lower())[:30]
         if t and t not in out:
             out.append(t)
@@ -119,9 +128,10 @@ class ExtractedItem(_S):
     @field_validator("related", mode="before")
     @classmethod
     def _related_ids(cls, v: Any) -> list[int]:
-        """Positive integer ids, unique; anything else (a title, null) is dropped instead of failing the message."""
+        """Positive integer ids, unique; anything else (a title, null) is dropped instead of failing the message. A lone
+        id (``"related": 12``) counts as a list of one."""
         out: list[int] = []
-        for x in v or []:
+        for x in _as_list(v):
             try:
                 n = int(x)
             except (TypeError, ValueError):

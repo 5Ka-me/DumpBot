@@ -114,6 +114,8 @@ def test_steps_closed_message_and_help(check_view):
     help_text = views.help_text()
     for phrase in ("распиши по шагам", "🪄 Разбить на шаги", "разбей на шаги", "(из «Переезд»)", "2/5", "🔗 Похожее"):
         assert phrase in help_text, phrase
+    assert "«↩️ Не сделано» сразу после — снимает эти отметки" in help_text
+    assert "у задачи с шагами нет повтора" in help_text
     assert views.PURPOSE_LABELS["split"] == "разбивка на шаги"
 
 

@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 import pytest
 from sqlalchemy import select
 
+from dumpbot.ai import schemas
 from dumpbot.ai.client import AIUnavailable, ChutesClient
 from dumpbot.ai.extract import ExtractInput, SplitInput, extract, split_steps
 from dumpbot.ai.prompts import EXAMPLES, SPLIT_SYSTEM_PROMPT, SYSTEM_PROMPT, build_split_text, build_user_text
@@ -35,6 +36,33 @@ def test_related_ids_are_cleaned_not_rejected():
     assert item.related == [12]  # clipped to 3 first (12, 12, "Наушники"), then cleaned
     item = ExtractedItem.model_validate({"kind": "task", "title": "Купить чехол", "related": [5, "7", 0]})
     assert item.related == [5, 7]
+
+
+def test_a_lone_or_odd_list_value_is_coerced_or_dropped_never_raised():
+    for value, expected in [(12, [12]), ("7", [7]), (True, []), ({"id": 3}, []), (None, []), ([], [])]:
+        item = ExtractedItem.model_validate({"kind": "task", "title": "x", "related": value})
+        assert item.related == expected, value
+    for value, expected in [("Дом", ["дом"]), (5, ["5"]), ({"a": 1}, []), (False, []), (None, [])]:
+        assert ExtractedItem.model_validate({"kind": "task", "title": "x", "tags": value}).tags == expected, value
+    assert EditPatch.model_validate({"tags_add": 7, "tags_remove": True}).model_dump()["tags_add"] == ["7"]
+
+
+async def test_a_scalar_related_from_the_model_keeps_the_message(fake, client, settings):
+    fake.chat_json({"items": [{"kind": "task", "title": "Купить чехол", "related": 12}]})
+    out = await extract(client, settings, ExtractInput(text="купить чехол", source="text", now=NOW, prefs=WARSAW))
+    assert out.extraction.items[0].related == [12] and len(fake.chat_requests) == 1
+
+
+async def test_a_type_error_of_a_validator_is_an_invalid_answer_not_a_crash(fake, client, settings, monkeypatch):
+    def boom(value):
+        raise TypeError("'int' object is not iterable")
+
+    monkeypatch.setattr(schemas, "_as_list", boom)  # a validator that meets a value it cannot handle
+    fake.chat_json({"items": [{"kind": "task", "title": "Купить чехол", "related": 12}]})
+    fake.chat_json({"items": [{"kind": "task", "title": "Купить чехол"}]})
+    out = await extract(client, settings, ExtractInput(text="купить чехол", source="text", now=NOW, prefs=WARSAW))
+    assert out.extraction.items[0].title == "Купить чехол" and len(fake.chat_requests) == 2
+    assert "not iterable" in fake.chat_requests[1]["messages"][-1]["content"]  # the usual repair round
 
 
 def test_steps_are_clipped_to_eight_and_validated():
