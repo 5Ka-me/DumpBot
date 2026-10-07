@@ -13,7 +13,6 @@ ItemCb    ``i:<a>:<item id>``           Item card actions (``a``):
                                         ``norem``   cancel all pending reminders (items.remove_reminders)
                                         ``stoprec`` stop the recurrence (items.stop_recurrence)
                                         ``kind``    open the category menu (views.kind_menu)
-                                        ``lead``    open the "remind before" menu (views.lead_menu)
                                         ``back``    back to the card (views.item_card)
                                         ``time``    ask for a new time as text (FSM -> job "edit_time")
                                         ``title``   ask for a new title as text (FSM -> items.set_title)
@@ -25,7 +24,6 @@ ItemCb    ``i:<a>:<item id>``           Item card actions (``a``):
 OccCb     ``o:<a>:<occurrence id>``     Occurrence actions (cards and reminders): ``done``, ``undone``,
                                         ``s15`` / ``s60`` (snooze 15 / 60 min), ``tmr`` (snooze to tomorrow)
 KindCb    ``k:<item id>:<kind>``        Set the item's category; ``k`` is a ``domain.kinds.Kind`` code
-LeadCb    ``l:<item id>:<minutes>``     Set the item's "remind N minutes before" (items.set_lead(..., [m]))
 AskCb     ``a:<raw id>:<n>``            Answer option ``n`` (index in ``Ask.options``) of a clarifying question
                                         about raw message ``raw`` (-> job "clarify")
 PickCb    ``p:<raw id>:<item id>``      The user picked ``item`` among edit candidates for raw message ``raw``
@@ -39,6 +37,9 @@ SubCb     ``c:<a>:<step item id>``      A checklist line of a parent's card: ``d
                                         (☑ pressed). The wanted state is in the data, so a stale card never flips
                                         a step the wrong way.
 ========  ============================  =============================================================================
+
+Removed 2026-10-07 (an item's time is its notification time): ``ItemCb`` ``lead`` (the "⏱ Напомнить за…" menu) and
+``LeadCb`` ``l:<item id>:<minutes>``. Buttons still in old messages answer "Кнопка устарела" (``on_stale``).
 """
 
 from __future__ import annotations
@@ -57,7 +58,6 @@ ITEM_ACTIONS: Final[frozenset[str]] = frozenset(
         "norem",
         "stoprec",
         "kind",
-        "lead",
         "back",
         "time",
         "title",
@@ -90,11 +90,6 @@ class KindCb(CallbackData, prefix="k"):
     k: str
 
 
-class LeadCb(CallbackData, prefix="l"):
-    id: int
-    m: int
-
-
 class AskCb(CallbackData, prefix="a"):
     raw: int
     n: int
@@ -124,7 +119,6 @@ ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     ItemCb,
     OccCb,
     KindCb,
-    LeadCb,
     AskCb,
     PickCb,
     DigestCb,

@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from dumpbot.ai.schemas import When
 from dumpbot.bot import views
-from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, LeadCb, OccCb, PickCb
+from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, OccCb, PickCb
 from dumpbot.bot.keyboards import button, markup
 from dumpbot.db.models import Item, Occurrence, Reminder
 from dumpbot.domain.prefs import Prefs
@@ -109,14 +109,16 @@ async def test_undone_on_a_reminder_shows_the_reminder_again(feed, updates, seed
 
 
 @pytest.mark.parametrize(("action", "delta"), [("s15", timedelta(minutes=15)), ("s60", timedelta(hours=1))])
-async def test_snooze_minutes(feed, updates, seed, tg, frozen, ctx, action, delta) -> None:
-    created = await seed.item()  # tomorrow 13:00, reminder tomorrow 12:55
+async def test_snooze_minutes_moves_the_time(feed, updates, seed, tg, frozen, ctx, action, delta) -> None:
+    created = await seed.item(when=When(text="сегодня в 10:30", time="10:30"))  # due (and reminded) at 10:30
+    frozen.advance(hours=1)  # 11:00: the reminder came; "⏰ 15 мин" / "⏰ 1 час" on it
 
     await feed(updates.callback(OccCb(a=action, id=created.occurrence.id)))
 
-    snoozed, planned = await _pending(seed, created.occurrence.id)
-    assert snoozed.fire_at == frozen.now + delta
-    assert planned.fire_at == created.reminders[0].fire_at  # a later reminder is not replaced by the snooze
+    occ = await _occ(seed, created.occurrence.id)
+    assert occ.due_at == frozen.now + delta  # the item's time moved: /today shows the new time
+    [snoozed] = await _pending(seed, occ.id)  # exactly one notification, at that time
+    assert snoozed.fire_at == occ.due_at
     assert tg.toasts[0].startswith("⏰ Напомню сегодня")
     assert "💤 отложено" in tg.edits[0].text
     assert tg.edits[0].reply_markup is None  # no [✅ Готово]: the snoozed reminder comes with its own buttons
@@ -128,8 +130,10 @@ async def test_snooze_to_tomorrow(feed, updates, seed, tg, frozen) -> None:
 
     await feed(updates.callback(OccCb(a="tmr", id=created.occurrence.id)))
 
-    [reminder] = await _pending(seed, created.occurrence.id)
-    assert reminder.fire_at == created.occurrence.due_at + timedelta(days=1)
+    occ = await _occ(seed, created.occurrence.id)
+    assert occ.due_at == created.occurrence.due_at + timedelta(days=1)
+    [reminder] = await _pending(seed, occ.id)
+    assert reminder.fire_at == occ.due_at
     assert tg.toasts[0].startswith("⏰ Напомню завтра")
 
 
@@ -250,22 +254,21 @@ async def test_stop_recurrence_from_the_list_rerenders_the_list(feed, updates, s
     assert get_buttons(edit.reply_markup) == [("⏹ 1. Планёрка", ItemCb(a="stoprec", id=second.item.id).pack())]
 
 
-async def test_edit_kind_and_lead_menus_and_back(feed, updates, seed, tg, get_buttons) -> None:
+async def test_edit_and_kind_menus_and_back(feed, updates, seed, tg, get_buttons) -> None:
     created = await seed.item()
     item_id = created.item.id
 
     await feed(updates.callback(ItemCb(a="edit", id=item_id)))
     await feed(updates.callback(ItemCb(a="kind", id=item_id)))
-    await feed(updates.callback(ItemCb(a="lead", id=item_id)))
     await feed(updates.callback(ItemCb(a="back", id=item_id)))
 
-    edit_menu, kind_menu, lead_menu, card = tg.edits
+    edit_menu, kind_menu, card = tg.edits
     assert "Что изменить?" in edit_menu.text
     assert ("🕒 Время", ItemCb(a="time", id=item_id).pack()) in get_buttons(edit_menu.reply_markup)
+    assert all("Напомнить за" not in label for label, _ in get_buttons(edit_menu.reply_markup))
     assert len([b for b in get_buttons(kind_menu.reply_markup) if b[1].startswith("k:")]) == 9
-    assert ("15 мин", LeadCb(id=item_id, m=15).pack()) in get_buttons(lead_menu.reply_markup)
     assert card.text.startswith("📌 <b>Купить наушники</b>")
-    assert tg.toasts == [None, None, None, None]
+    assert tg.toasts == [None, None, None]
 
 
 async def test_kind_change_to_actionable_adds_the_default_reminder(feed, updates, seed, tg, ctx) -> None:
@@ -304,43 +307,19 @@ async def test_unknown_kind_is_stale(feed, updates, seed, tg) -> None:
     assert (await _item(seed, created.item.id)).kind == "task"
 
 
-async def test_lead_replans_reminders(feed, updates, seed, tg) -> None:
+async def test_old_lead_buttons_are_harmless(feed, updates, seed, tg) -> None:
+    """ "⏱ Напомнить за…" was removed (2026-10-07): its buttons in old messages only say so."""
     created = await seed.item()
 
-    await feed(updates.callback(LeadCb(id=created.item.id, m=30)))
+    await feed(updates.callback(ItemCb(a="lead", id=created.item.id), message_id=905))
+    await feed(updates.callback(f"l:{created.item.id}:30", message_id=905))
+    await feed(updates.callback("l:424242:5", message_id=905))
 
-    [reminder] = await _pending(seed, created.occurrence.id)
-    assert reminder.fire_at == created.occurrence.due_at - timedelta(minutes=30)
-    assert (await _item(seed, created.item.id)).lead_minutes == [30]
-    assert tg.toasts == ["⏱ Напомню за 30 мин"]
-
-
-async def test_lead_zero(feed, updates, seed, tg) -> None:
-    created = await seed.item()
-    await feed(updates.callback(LeadCb(id=created.item.id, m=0)))
+    assert tg.toasts == ["Кнопка устарела"] * 3
+    assert tg.edits == []
+    assert (await _item(seed, created.item.id)).lead_minutes is None
     [reminder] = await _pending(seed, created.occurrence.id)
     assert reminder.fire_at == created.occurrence.due_at
-    assert tg.toasts == ["⏱ Напомню в момент события"]
-
-
-async def test_lead_on_an_item_without_an_exact_time_tells_the_real_reminder(feed, updates, seed, tg) -> None:
-    created = await seed.item("Позвонить маме", when=When(text="завтра", day="+1"))  # bare date: 10:00, auto
-
-    await feed(updates.callback(LeadCb(id=created.item.id, m=30)))
-
-    [reminder] = await _pending(seed, created.occurrence.id)
-    assert reminder.fire_at == created.occurrence.due_at
-    assert tg.toasts == ["⏱ У записи нет точного времени — напомню завтра 10:00"]
-
-
-async def test_lead_on_a_relative_time_is_honoured(feed, updates, seed, tg) -> None:
-    created = await seed.item("Созвон", kind="event", when=When(text="через 2 часа", in_min=120))
-
-    await feed(updates.callback(LeadCb(id=created.item.id, m=30)))
-
-    [reminder] = await _pending(seed, created.occurrence.id)
-    assert reminder.fire_at == created.occurrence.due_at - timedelta(minutes=30)
-    assert tg.toasts == ["⏱ Напомню за 30 мин"]
 
 
 async def test_item_done_without_occurrence(feed, updates, seed, tg) -> None:
@@ -360,9 +339,8 @@ async def test_item_done_without_occurrence(feed, updates, seed, tg) -> None:
 async def test_unknown_item(feed, updates, seed, tg) -> None:
     await feed(updates.callback(ItemCb(a="del", id=424242)))
     await feed(updates.callback(KindCb(id=424242, k="idea")))
-    await feed(updates.callback(LeadCb(id=424242, m=5)))
 
-    assert tg.toasts == ["Запись не найдена"] * 3
+    assert tg.toasts == ["Запись не найдена"] * 2
     assert tg.edits == []
 
 
@@ -477,7 +455,7 @@ async def test_digest_leaves_items_still_ahead_tonight(feed, updates, seed, tg, 
     tonight = await _occ(seed, pills.occurrence.id)
     assert (tonight.due_at, tonight.status) == (pills.occurrence.due_at, "open")
     [reminder] = await _pending(seed, tonight.id)
-    assert reminder.fire_at == pills.occurrence.due_at - timedelta(minutes=5)  # 21:55 tonight
+    assert reminder.fire_at == pills.occurrence.due_at  # 22:00 tonight
     assert tg.toasts == ["📅 Перенёс на завтра: 1"]
     assert "Ещё сегодня" in tg.edits[0].text and "Таблетки" in tg.edits[0].text
 

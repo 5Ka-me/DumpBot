@@ -28,7 +28,7 @@ async def test_live_example_gets_a_period_card(
     [card] = bot.texts
     assert card.split("\n")[:2] == [
         "📌 <b>Посмотреть Raspberry Pi</b>",
-        "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00",
+        "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00",
     ]
     assert bot.reactions[-1] == (raw.message_id, "👌")
 
@@ -67,7 +67,7 @@ async def test_reply_moves_the_item_to_next_week(
     assert (item.period_kind, item.period_start, item.period_end) == ("week", date(2026, 10, 12), date(2026, 10, 18))
     [occ] = [o for o in await occurrences_of(item.id) if o.status == "open"]
     assert (occ.precision, occ.due_at) == ("period", local(2026, 10, 16, 19, 0))
-    assert "🗓 на следующей неделе (до вс 18 окт) · напомню пн в 10:00 и пт 16 окт в 19:00" in bot.texts[-1]
+    assert "🗓 на следующей неделе (до вс 18 окт) · 🔔 пн 10:00, пт 16 окт 19:00" in bot.texts[-1]
 
 
 async def test_time_button_answered_with_someday(ctx, fake_ai, bot, make_items, t0, get, occurrences_of) -> None:

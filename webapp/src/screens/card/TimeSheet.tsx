@@ -94,7 +94,7 @@ export function TimeSheet({
             Готово
           </button>
         </div>
-        <span className="field-hint">Разберёт ИИ — как «🕒 Время» в боте: время, повтор, «напомнить за».</span>
+        <span className="field-hint">Разберёт ИИ — как «🕒 Время» в боте: время, повтор, «за час до встречи в 15».</span>
       </form>
       <form
         className="field-group"
@@ -103,7 +103,7 @@ export function TimeSheet({
           if (date) onPick(dueLocal(date, time));
         }}
       >
-        <span className="field-label">Дата и время</span>
+        <span className="field-label">Когда напомнить</span>
         <div className="input-row">
           <input className="input" type="date" aria-label="Дата" value={date} onChange={(e) => setDate(e.target.value)} required />
           <input className="input input--time" type="time" aria-label="Время" value={time} onChange={(e) => setTime(e.target.value)} />
@@ -111,7 +111,7 @@ export function TimeSheet({
             OK
           </button>
         </div>
-        <span className="field-hint">Без времени — напомню в «дата без времени» из настроек.</span>
+        <span className="field-hint">Это и есть время записи. Без времени — в «дата без времени» из настроек.</span>
       </form>
       <div className="field-group">
         <span className="field-label">Без точной даты</span>

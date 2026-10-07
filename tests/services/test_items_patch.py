@@ -1,4 +1,5 @@
-"""apply_patch: every EditPatch action and the usual combinations."""
+"""apply_patch: every EditPatch action and the usual combinations. An item's time is its notification time
+(2026-10-07): a new time notifies at itself, "за N" moves the notification before the stated time."""
 
 from __future__ import annotations
 
@@ -34,10 +35,10 @@ async def test_reschedule_moves_current_occurrence(session, make, reminders_of, 
     assert result.warnings == []
     assert result.occurrence.id == c.occurrence.id
     assert (result.occurrence.due_at, result.occurrence.precision) == (local(2026, 10, 7, 16, 0), "exact")
-    assert fires(result) == [(local(2026, 10, 7, 15, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 7, 16, 0), 0, False)]
     assert await reminders_of(c.occurrence.id) == [
-        (local(2026, 10, 6, 14, 55), "cancelled", 5, False),
-        (local(2026, 10, 7, 15, 55), "pending", 5, False),
+        (local(2026, 10, 6, 15, 0), "cancelled", 0, False),
+        (local(2026, 10, 7, 16, 0), "pending", 0, False),
     ]
     assert c.item.when_spec["time"] == "16:00"
 
@@ -49,7 +50,7 @@ async def test_time_only_keeps_a_later_date(session, make, local, now, prefs):
     result = await items.apply_patch(session, c.item.id, patch(when={"text": "на 15:00", "time": "15:00"}), prefs, now)
     assert result.occurrence.due_at == local(2026, 10, 9, 15, 0)
     assert result.warnings == []
-    assert fires(result) == [(local(2026, 10, 9, 14, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 9, 15, 0), 0, False)]
 
 
 async def test_time_only_on_todays_item_uses_the_usual_rule(session, make, local, now, prefs):
@@ -66,17 +67,55 @@ async def test_reschedule_creates_occurrence_for_item_without_due(session, make,
 
 
 async def test_reschedule_with_lead(session, make, local, now, prefs):
+    # "перенеси на 18, напомни за полчаса": the item's time is 17:30.
     [c] = await make(MEETING, now=now)
     result = await items.apply_patch(session, c.item.id, patch(when={"time": "18:00"}, lead=[30]), prefs, now)
     assert c.item.lead_minutes == [30]
-    assert fires(result) == [(local(2026, 10, 6, 17, 30), 30, False)]
+    assert result.occurrence.due_at == local(2026, 10, 6, 17, 30)
+    assert fires(result) == [(local(2026, 10, 6, 17, 30), 0, False)]
 
 
-async def test_lead_without_when_replans(session, make, local, now, prefs):
+async def test_lead_without_when_moves_the_notification(session, make, local, now, prefs):
+    # "напомни за 15 минут" as a reply: the notification (the item's time) moves 15 minutes before 15:00.
     [c] = await make(MEETING, now=now)
     result = await items.apply_patch(session, c.item.id, patch(lead=[15]), prefs, now)
-    assert result.occurrence.due_at == local(2026, 10, 6, 15, 0)
-    assert fires(result) == [(local(2026, 10, 6, 14, 45), 15, False)]
+    assert (result.occurrence.id, result.occurrence.due_at) == (c.occurrence.id, local(2026, 10, 6, 14, 45))
+    assert c.item.lead_minutes == [15]
+    assert fires(result) == [(local(2026, 10, 6, 14, 45), 0, False)]
+    # Another lead counts from the stated 15:00 again, not from 14:45.
+    result = await items.apply_patch(session, c.item.id, patch(lead=[60]), prefs, now)
+    assert result.occurrence.due_at == local(2026, 10, 6, 14, 0)
+    assert c.item.lead_minutes == [60]
+
+
+async def test_several_leads_from_a_reply(session, make, reminders_of, local, now, prefs):
+    [c] = await make({**MEETING, "when": {"day": "FR", "time": "15:00"}}, now=now)
+    result = await items.apply_patch(session, c.item.id, patch(lead=[60, 1440]), prefs, now)
+    assert result.occurrence.due_at == local(2026, 10, 8, 15, 0)
+    assert [r.fire_at for r in result.reminders] == [local(2026, 10, 8, 15, 0), local(2026, 10, 9, 14, 0)]
+
+
+async def test_a_new_time_without_a_lead_is_the_notification_time(session, make, local, now, prefs):
+    # "Встреча (15:00)" notified at 14:30; "перенеси на 17": 17:00 is when it notifies now, the lead goes.
+    [c] = await make({**MEETING, "title": "Встреча (15:00)", "lead": [30]}, now=now)
+    assert c.occurrence.due_at == local(2026, 10, 6, 14, 30)
+    result = await items.apply_patch(session, c.item.id, patch(when={"time": "17:00"}), prefs, now)
+    assert result.occurrence.due_at == local(2026, 10, 6, 17, 0)
+    assert c.item.lead_minutes is None
+    assert fires(result) == [(local(2026, 10, 6, 17, 0), 0, False)]
+
+
+async def test_lead_on_a_series_moves_every_instance_ahead(session, make, occurrences_of, local, now, prefs):
+    [c] = await make(DAILY_9, now=now)  # Wed 09:00
+    result = await items.apply_patch(session, c.item.id, patch(lead=[15]), prefs, now)
+    assert result.occurrence.due_at == local(2026, 10, 7, 8, 45)
+    assert c.item.lead_minutes == [15]
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 7, 8, 50), prefs)
+    assert [(o.due_at, o.status) for o in await occurrences_of(c.item.id)] == [
+        (local(2026, 10, 7, 8, 45), "done"),
+        (local(2026, 10, 8, 8, 45), "open"),  # the rule still says 09:00
+    ]
+    assert c.item.rec_time_local == time(9, 0)
 
 
 async def test_relative_reschedule(session, make, local, now, prefs):
@@ -91,7 +130,7 @@ async def test_bad_when_only_warns(session, make, reminders_of, local, now, pref
     result = await items.apply_patch(session, c.item.id, patch(when={"day": "02-30"}), prefs, now)
     assert result.warnings == ["не понял дату или время"]
     assert result.occurrence.due_at == local(2026, 10, 6, 15, 0)
-    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 6, 14, 55), "pending", 5, False)]
+    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 6, 15, 0), "pending", 0, False)]
 
 
 async def test_past_date_keeps_date_without_reminders(session, make, local, now, prefs):
@@ -125,7 +164,7 @@ async def test_done_and_undone(session, make, local, now, prefs):
     result = await items.apply_patch(session, c.item.id, patch(action="undone"), prefs, now)
     assert c.item.status == "open"
     assert result.occurrence.status == "open"
-    assert fires(result) == [(local(2026, 10, 6, 14, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 6, 15, 0), 0, False)]
 
 
 async def test_done_and_undone_for_item_without_occurrence(session, make, now, prefs):
@@ -141,7 +180,7 @@ async def test_done_on_series_creates_next(session, make, occurrences_of, local,
     result = await items.apply_patch(session, c.item.id, patch(action="done"), prefs, local(2026, 10, 12, 9, 30))
     assert c.item.status == "open"
     assert (result.occurrence.due_at, result.occurrence.status) == (local(2026, 10, 19, 9, 0), "open")
-    assert fires(result) == [(local(2026, 10, 19, 8, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 19, 9, 0), 0, False)]
     assert len(await occurrences_of(c.item.id)) == 2
 
 
@@ -173,7 +212,7 @@ async def test_no_reminder_then_new_time_turns_reminders_back_on(session, make, 
 
     result = await items.apply_patch(session, c.item.id, patch(when={"time": "17:00"}), prefs, now)
     assert c.item.lead_minutes is None
-    assert fires(result) == [(local(2026, 10, 6, 16, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 6, 17, 0), 0, False)]
 
 
 async def test_reschedule_and_no_reminder_together(session, make, local, now, prefs):
@@ -209,12 +248,24 @@ async def test_rrule_turns_one_off_into_series(session, make, occurrences_of, re
     assert item.rec_time_local == time(15, 0)
     assert result.occurrence.id == c.occurrence.id
     assert result.occurrence.due_at == local(2026, 10, 9, 15, 0)
-    assert fires(result) == [(local(2026, 10, 9, 14, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 9, 15, 0), 0, False)]
 
     await items.mark_done(session, c.occurrence.id, local(2026, 10, 9, 15, 30), prefs)
     nxt = (await occurrences_of(item.id))[-1]
     assert (nxt.due_at, nxt.precision) == (local(2026, 10, 16, 15, 0), "exact")
-    assert await reminders_of(nxt.id) == [(local(2026, 10, 16, 14, 55), "pending", 5, False)]
+    assert await reminders_of(nxt.id) == [(local(2026, 10, 16, 15, 0), "pending", 0, False)]
+
+
+async def test_rrule_of_an_item_with_a_lead_repeats_the_stated_time(session, make, occurrences_of, local, now, prefs):
+    # "Планёрка (15:00)" notified at 14:45, then "повторяй каждую неделю": the series is at 15:00, each due 14:45.
+    spec = {"kind": "event", "title": "Планёрка (15:00)", "when": {"day": "FR", "time": "15:00"}, "lead": [15]}
+    [c] = await make(spec, now=now)
+    assert c.occurrence.due_at == local(2026, 10, 9, 14, 45)
+    result = await items.apply_patch(session, c.item.id, patch(rrule="FREQ=WEEKLY"), prefs, now)
+    assert (c.item.rec_time_local, c.item.lead_minutes) == (time(15, 0), [15])
+    assert result.occurrence.due_at == local(2026, 10, 9, 14, 45)
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 9, 14, 50), prefs)
+    assert (await occurrences_of(c.item.id))[-1].due_at == local(2026, 10, 16, 14, 45)
 
 
 async def test_rrule_with_time(session, make, reminders_of, local, now, prefs):
@@ -232,7 +283,7 @@ async def test_rrule_with_time(session, make, reminders_of, local, now, prefs):
     assert result.occurrence.precision == "exact"
     assert await reminders_of(c.occurrence.id) == [
         (local(2026, 10, 6, 19, 0), "cancelled", 0, True),
-        (local(2026, 10, 13, 9, 55), "pending", 5, False),
+        (local(2026, 10, 13, 10, 0), "pending", 0, False),
     ]
 
 
@@ -276,7 +327,7 @@ async def test_done_ahead_of_time_and_rrule_starts_after_it(session, make, occur
         (local(2026, 10, 9, 15, 0), "done"),
         (local(2026, 10, 16, 15, 0), "open"),
     ]
-    assert fires(result) == [(local(2026, 10, 16, 14, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 16, 15, 0), 0, False)]
 
 
 async def test_invalid_rrule_only_warns(session, make, local, now, prefs):
@@ -373,7 +424,7 @@ async def test_when_onto_existing_instance_merges(session, make, occurrences_of,
     result = await items.apply_patch(session, c.item.id, patch(when={"day": "+1", "time": "09:00"}), prefs, later)
     assert result.occurrence.id == tomorrow.id
     assert today.status == "cancelled"
-    assert fires(result) == [(local(2026, 10, 8, 8, 55), 5, False)]
+    assert fires(result) == [(local(2026, 10, 8, 9, 0), 0, False)]
 
 
 async def test_attributes_stay_loaded_after_edits(session, make, now, prefs):

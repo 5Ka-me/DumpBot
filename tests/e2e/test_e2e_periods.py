@@ -65,7 +65,7 @@ async def test_this_week_card_digest_section_and_friday_reminder(e2e: Any) -> No
     # the card: the span in words, the end of the week, the Friday 19:00 reminder
     assert card.text.split("\n") == [
         "📌 <b>Посмотреть Raspberry Pi</b>",
-        "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00",
+        "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00",
         "🏷 Задача · #raspberry_pi",
     ]
     assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить", "🪄 Разбить на шаги"]
@@ -161,7 +161,7 @@ async def test_deadline_reminds_the_evening_before_and_in_the_morning(e2e: Any) 
     )
     message_id = e2e.tg.push_message("до пятницы сдать отчёт")
     card = await e2e.card_for(message_id)
-    assert "⏳ до пт 9 окт · напомню чт в 19:00 и пт в 10:00" in card.text.split("\n")
+    assert "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00" in card.text.split("\n")
     item = await e2e.item("Сдать отчёт")
     assert [(wall(r.fire_at), r.auto) for r in await e2e.reminders(item.id)] == [
         ("2026-10-08 19:00", True),
@@ -214,7 +214,7 @@ async def test_someday_lives_in_its_own_list_until_it_gets_a_week(e2e: Any) -> N
     new_card = await e2e.card_for(reply)
     replying = e2e.ai.extraction_requests()[-1].line("REPLYING TO ITEM ")
     assert replying is not None and '"someday": true' in replying
-    assert "🗓 на следующей неделе (до вс 18 окт) · напомню пн в 10:00 и пт 16 окт в 19:00" in new_card.text
+    assert "🗓 на следующей неделе (до вс 18 окт) · 🔔 пн 10:00, пт 16 окт 19:00" in new_card.text
     item = await e2e.item("Выучить испанский")
     assert (item.someday, item.period_kind) == (False, "week")
     assert [wall(r.fire_at) for r in await e2e.reminders(item.id)] == ["2026-10-12 10:00", "2026-10-16 19:00"]

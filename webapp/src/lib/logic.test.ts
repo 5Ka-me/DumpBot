@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { InboxStatus, JobStatus, Prefs, Row } from "../api/types";
 import { row } from "../test/fixtures";
 import { inboxStateText } from "../screens/Add";
-import { canBeDone, leadSummary, nextLead } from "../screens/card/CardScreen";
+import { canBeDone } from "../screens/card/CardScreen";
 import { addTags } from "../screens/card/TagsEditor";
 import { laterMonth } from "../screens/card/TimeSheet";
 import { jobOutcome } from "../screens/card/useJob";
@@ -75,9 +75,9 @@ describe("settings", () => {
   const prefs: Prefs = { ...DEFAULT_PREFS };
 
   it("sends only what changed, parsed", () => {
-    const draft = { ...toDraft(prefs), lead_minutes: "15", budget_usd: "7,5", slot_morning: "8:30", quiet_enabled: false };
+    const draft = { ...toDraft(prefs), soon_days: "3", budget_usd: "7,5", slot_morning: "8:30", quiet_enabled: false };
     expect(diffPrefs(prefs, draft)).toEqual({
-      patch: { lead_minutes: 15, budget_usd: 7.5, slot_morning: "08:30", quiet_enabled: false },
+      patch: { soon_days: 3, budget_usd: 7.5, slot_morning: "08:30", quiet_enabled: false },
       errors: {},
     });
     expect(diffPrefs(prefs, toDraft(prefs))).toEqual({ patch: {}, errors: {} });
@@ -90,18 +90,6 @@ describe("settings", () => {
 });
 
 describe("card choices", () => {
-  it("toggles «напомнить за» values (up to three, none = the default)", () => {
-    expect(nextLead(null, 15)).toEqual([15]);
-    expect(nextLead([], 60)).toEqual([60]);
-    expect(nextLead([15], 60)).toEqual([60, 15]);
-    expect(nextLead([60, 15], 15)).toEqual([60]);
-    expect(nextLead([15], 15)).toBeNull();
-    expect(nextLead([60, 30, 15], 5)).toEqual([60, 30, 15]);
-    expect(leadSummary({ lead_minutes: null, reminders_off: false })).toBe("как в настройках");
-    expect(leadSummary({ lead_minutes: [], reminders_off: true })).toBe("🔕 выключено");
-    expect(leadSummary({ lead_minutes: [60, 5], reminders_off: false })).toBe("за 1 ч, за 5 мин");
-  });
-
   it("adds typed tags without repeats", () => {
     expect(addTags(["дом"], "#Дом работа")).toEqual(["дом", "работа"]);
   });

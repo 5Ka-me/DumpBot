@@ -9,7 +9,7 @@ import pytest
 
 from dumpbot.ai.schemas import Ask
 from dumpbot.bot import views
-from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, LeadCb, OccCb, PickCb, SetCb
+from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, OccCb, PickCb, SetCb
 from dumpbot.domain.kinds import KINDS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, DigestData, UsageSummary
@@ -72,10 +72,11 @@ def test_short_url():
 def test_item_card_purchase_with_reminder(prefs, now, at, make_item, make_occ, make_reminder, check_view, buttons):
     item = make_item(kind="purchase", tags=["электроника", "sony"])
     occ = make_occ(at(2026, 10, 6, 15, 0))
-    text, kb = check_view(views.item_card(item, occ, [make_reminder(occ, 5)], prefs, now))
+    text, kb = check_view(views.item_card(item, occ, [make_reminder(occ)], prefs, now))
+    # The item's time is its notification time (2026-10-07): one line, no "напомню в 14:55".
     assert lines(text) == [
         "🛒 <b>Купить наушники</b>",
-        "⏰ сегодня 15:00 · напомню в 14:55",
+        "🔔 сегодня 15:00",
         "🏷 Покупка · #электроника #sony",
     ]
     # no [✅ Готово] on the "saved" card: it is on reminders and in the edit menu
@@ -87,29 +88,25 @@ def test_item_card_purchase_with_reminder(prefs, now, at, make_item, make_occ, m
     assert kb.inline_keyboard[0][-1].style == "danger"
 
 
-def test_item_card_several_reminders(prefs, now, at, make_item, make_occ, make_reminder, check_view):
-    occ = make_occ(at(2026, 10, 9, 15, 0), precision="slot")
-    rems = [make_reminder(occ, 60), make_reminder(occ, 1440)]
+def test_item_card_lunch_notifies_at_13(prefs, now, at, make_item, make_occ, make_reminder):
+    occ = make_occ(at(2026, 10, 6, 13, 0), precision="slot")
+    text, _ = views.item_card(make_item(), occ, [make_reminder(occ)], prefs, at(2026, 10, 6, 10, 0))
+    assert "🔔 сегодня 13:00" in lines(text)
+    assert "12:55" not in text and "напомню" not in text
+
+
+def test_item_card_several_notification_times(prefs, now, at, make_item, make_occ, make_reminder, check_view):
+    # "за день и за час до встречи в пн 10:00": due Sun 10:00, then Mon 09:00.
+    occ = make_occ(at(2026, 10, 11, 10, 0), precision="exact")
+    rems = [make_reminder(occ, 0), make_reminder(occ, 0, id=2, fire_at=at(2026, 10, 12, 9, 0))]
     text, _ = check_view(views.item_card(make_item(kind="event"), occ, rems, prefs, now))
-    assert lines(text)[:2] == ["📅 <b>Купить наушники</b>", "⏰ пт 9 окт 15:00 · напомню за 1 дн и за 1 ч"]
+    assert lines(text)[:2] == ["📅 <b>Купить наушники</b>", "🔔 вс 11 окт 10:00 · пн 12 окт 09:00"]
 
 
-def test_item_card_lead_zero_among_several(prefs, now, at, make_item, make_occ, make_reminder):
-    occ = make_occ(at(2026, 10, 7, 9, 30))
-    text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 0), make_reminder(occ, 30)], prefs, now)
-    assert "⏰ завтра 09:30 · напомню за 30 мин и в 09:30" in text
-
-
-def test_item_card_reminder_on_another_day(prefs, now, at, make_item, make_occ, make_reminder):
-    occ = make_occ(at(2026, 10, 12, 10, 0))
-    text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 1440)], prefs, now)
-    assert "⏰ пн 12 окт 10:00 · напомню вс 11 окт в 10:00" in text
-
-
-def test_item_card_reminder_due_now(prefs, now, make_item, make_occ, make_reminder):
+def test_item_card_shows_the_reminder_times_themselves(prefs, now, at, make_item, make_occ, make_reminder):
     occ = make_occ(now + timedelta(minutes=3))
-    text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 5, fire_at=now)], prefs, now)
-    assert "· напомню сейчас" in text
+    text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 3, fire_at=now)], prefs, now)
+    assert "🔔 сегодня 14:05" in lines(text)
 
 
 def test_item_card_without_pending_reminders(prefs, now, at, make_item, make_occ, make_reminder, buttons):
@@ -117,35 +114,42 @@ def test_item_card_without_pending_reminders(prefs, now, at, make_item, make_occ
     sent = make_reminder(occ, 5, status="sent")
     cancelled = make_reminder(occ, 10, status="cancelled")
     text, kb = views.item_card(make_item(), occ, [sent, cancelled], prefs, now)
-    assert "⏰ завтра 09:30 · без напоминания" in text
+    assert "🔕 завтра 09:30" in lines(text)
     assert ("🔕 Без напоминания", "i:norem:1") not in buttons(kb)
+
+
+def test_item_card_default_time_without_reminder(prefs, now, at, make_item, make_occ):
+    occ = make_occ(at(2026, 10, 6, 19, 0), precision="default")
+    assert "🔕 без напоминания" in lines(views.item_card(make_item(), occ, [], prefs, now)[0])
 
 
 def test_item_card_overdue(prefs, now, at, make_item, make_occ):
     occ = make_occ(at(2026, 10, 5, 19, 0), precision="default")
     text, _ = views.item_card(make_item(), occ, [], prefs, now)
-    assert "⏰ без срока · просрочено" in text
+    assert "⏰ вчера 19:00 · просрочено" in lines(text)
     occ = make_occ(at(2026, 10, 5, 18, 0))
-    assert "⏰ вчера 18:00 · просрочено" in views.item_card(make_item(), occ, [], prefs, now)[0]
+    assert "⏰ вчера 18:00 · просрочено" in lines(views.item_card(make_item(), occ, [], prefs, now)[0])
 
 
 def test_item_card_default_time(prefs, now, at, make_item, make_occ, make_reminder):
     occ = make_occ(at(2026, 10, 6, 19, 0), precision="default")
     text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 0, auto=True)], prefs, now)
-    assert "⏰ без срока · напомню сегодня в 19:00" in text
+    assert "🔔 сегодня 19:00" in lines(text)
 
 
 def test_item_card_cancelled_default_time_shows_no_time(prefs, now, at, make_item, make_occ):
     # A task without a time turned into an idea: its 19:00 default occurrence is cancelled.
     occ = make_occ(at(2026, 10, 6, 19, 0), precision="default", status="cancelled")
     text, _ = views.item_card(make_item(kind="idea"), occ, [], prefs, now)
-    assert "⏰" not in text
+    assert "⏰" not in text and "🔔" not in text and "🔕" not in text
 
 
 def test_item_card_date_precision(prefs, now, at, make_item, make_occ, make_reminder):
     occ = make_occ(at(2026, 10, 12, 10, 0), precision="date")
     text, _ = views.item_card(make_item(), occ, [make_reminder(occ, 0, auto=True)], prefs, now)
-    assert "⏰ пн 12 окт · напомню в 10:00" in text
+    assert "🔔 пн 12 окт 10:00" in lines(text)
+    done = make_occ(at(2026, 10, 12, 10, 0), precision="date", status="done")
+    assert "⏰ пн 12 окт" in lines(views.item_card(make_item(), done, [], prefs, now)[0])
 
 
 def test_item_card_recurring(prefs, now, at, make_item, make_occ, make_reminder, buttons):
@@ -280,7 +284,7 @@ def test_deleted_card(make_item, check_view, buttons):
 def test_edit_menu(make_item, check_view, buttons):
     _, kb = check_view(views.edit_menu(make_item(id=BIG)))
     assert [cb for _, cb in buttons(kb)] == [
-        ItemCb(a=a, id=BIG).pack() for a in ("done", "time", "kind", "tags", "title", "lead", "back")
+        ItemCb(a=a, id=BIG).pack() for a in ("done", "time", "kind", "tags", "title", "back")
     ]
     assert [label for label, _ in buttons(kb)] == [
         "✅ Готово",
@@ -288,7 +292,6 @@ def test_edit_menu(make_item, check_view, buttons):
         "🏷 Категория",
         "#️⃣ Теги",
         "✏️ Название",
-        "⏱ Напомнить за…",
         "← Назад",
     ]
 
@@ -301,37 +304,24 @@ def test_kind_menu(make_item, check_view, buttons):
     assert flat[-1] == ("← Назад", f"i:back:{BIG}")
 
 
-def test_lead_menu(make_item, check_view, buttons):
-    text, kb = check_view(views.lead_menu(make_item(id=BIG, lead_minutes=[1440, 60])))
-    assert "Сейчас: за 1 дн и за 1 ч" in text
-    flat = buttons(kb)
-    assert [cb for _, cb in flat[:-1]] == [LeadCb(id=BIG, m=m).pack() for m in (0, 5, 15, 30, 60, 1440)]
-    assert ("✓ 1 ч", f"l:{BIG}:60") in flat and ("✓ 1 дн", f"l:{BIG}:1440") in flat
-    assert "как в настройках" in views.lead_menu(make_item())[0]
-    assert "Сейчас: напоминания выключены" in views.lead_menu(make_item(lead_minutes=[]))[0]  # after 🔕
+def test_no_lead_menu_any_more(make_item, buttons):
+    # "⏱ Напомнить за…" is gone (2026-10-07): "напомни за час" is a reply to the card.
+    assert not hasattr(views, "lead_menu")
+    text, kb = views.edit_menu(make_item(id=BIG))
+    assert "Напомнить за" not in text and all("⏱" not in label for label, _ in buttons(kb))
+    assert "напомни за час" in text
 
 
 # --- reminders ---------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("delta", "relative"),
-    [
-        (timedelta(minutes=5), "через 5 мин"),
-        (timedelta(seconds=20), "сейчас"),
-        (timedelta(0), "сейчас"),
-        (timedelta(hours=-2), "просрочено на 2 ч"),
-        (timedelta(hours=1, minutes=30), "через 1 ч 30 мин"),
-        (timedelta(days=1, hours=2, minutes=5), "через 1 дн 2 ч"),
-    ],
-)
-def test_reminder_message(prefs, at, make_item, make_occ, make_reminder, check_view, buttons, delta, relative):
+@pytest.mark.parametrize("delta", [timedelta(0), timedelta(minutes=5), timedelta(hours=-2), timedelta(days=1)])
+def test_reminder_message(prefs, at, make_item, make_occ, make_reminder, check_view, buttons, delta):
+    # The reminder comes at the item's time: just the title, no "через 5 мин".
     due = at(2026, 10, 6, 13, 0)
     occ = make_occ(due, id=BIG)
     text, kb = check_view(views.reminder_message(make_item(), occ, make_reminder(occ), prefs, due - delta))
-    first, second = lines(text)[:2]
-    assert first == "🔔 <b>Купить наушники</b>"
-    assert second.startswith(f"{relative} · ")
+    assert lines(text) == ["🔔 <b>Купить наушники</b>"]
     assert buttons(kb) == [
         ("✅ Готово", f"o:done:{BIG}"),
         ("⏰ 15 мин", f"o:s15:{BIG}"),
@@ -346,7 +336,6 @@ def test_reminder_message_absolute_time_and_extras(prefs, now, at, make_item, ma
     text, _ = check_view(views.reminder_message(item, occ, None, prefs, now))
     assert lines(text) == [
         "🔔 <b>Купить наушники</b>",
-        "через 5 мин · сегодня 14:10",
         "🔁 каждый день",
         "<i>&lt;взять паспорт&gt;</i>",
     ]
@@ -610,7 +599,6 @@ def test_settings_menu_shows_all_values(check_view, buttons):
     prefs = Prefs(
         tz="Europe/Berlin",
         task_default_time="18:00",
-        lead_minutes=10,
         quiet_enabled=False,
         digest_evening_enabled=False,
         budget_usd=7.5,
@@ -621,7 +609,6 @@ def test_settings_menu_shows_all_values(check_view, buttons):
     for expected in (
         "Часовой пояс: Europe/Berlin",
         "Задача без времени: 18:00",
-        "Напоминать: за 10 мин",
         "обед 12:30",
         "Тихие часы: 23:00–08:00 (выкл)",
         "утро 09:00 (вкл), вечер 21:00 (выкл)",
@@ -630,10 +617,10 @@ def test_settings_menu_shows_all_values(check_view, buttons):
         "новых напоминаний",
     ):
         assert expected in text
+    assert "Напоминать" not in text  # no default lead (2026-10-07)
     assert [cb for _, cb in buttons(kb)] == [
         "s:menu:tz",
         "s:ask:task_default_time",
-        "s:menu:lead",
         "s:menu:slots",
         "s:menu:quiet",
         "s:menu:digest",
@@ -657,16 +644,19 @@ def test_settings_view_unknown_name_falls_back_to_main(prefs):
 
 
 def test_settings_marks_current_values(check_view, buttons):
-    prefs = Prefs(tz="Europe/Kyiv", lead_minutes=15, stt_language="ru", budget_usd=10, quiet_enabled=False)
+    prefs = Prefs(tz="Europe/Kyiv", stt_language="ru", budget_usd=10, quiet_enabled=False)
     assert ("✓ Europe/Kyiv", "s:tz:Europe/Kyiv") in buttons(views.settings_tz_menu(prefs)[1])
-    assert ("✓ 15 мин", "s:lead:15") in buttons(views.settings_lead_menu(prefs)[1])
     assert ("✓ Русский", "s:stt:ru") in buttons(views.settings_stt_menu(prefs)[1])
     assert ("✓ $10", "s:budget:10") in buttons(views.settings_budget_menu(prefs)[1])
     assert ("🔕 Включить тихие часы", "s:quiet_toggle:") in buttons(views.settings_quiet_menu(prefs)[1])
     auto = Prefs(stt_language=None)
     assert ("✓ Авто", "s:stt:auto") in buttons(views.settings_stt_menu(auto)[1])
     assert ("✓ 🔀 Авто: chutes, при сбое — локальный", "s:stt_mode:auto") in buttons(views.settings_stt_menu(auto)[1])
-    assert ("✓ 5 мин", "s:lead:5") not in buttons(views.settings_lead_menu(prefs)[1])
+
+
+def test_old_lead_settings_menu_falls_back_to_main(prefs):
+    assert "lead" not in views.SETTINGS_MENUS and "lead" not in views.SETTINGS_PARENT
+    assert views.settings_view("lead", prefs) == views.settings_menu(prefs)
 
 
 @pytest.mark.parametrize("local_stt", [True, False])
@@ -762,7 +752,6 @@ def test_every_emitted_set_callback_is_documented(buttons):
         "menu",
         "close",
         "tz",
-        "lead",
         "quiet_toggle",
         "digest_toggle",
         "stt",
@@ -777,7 +766,7 @@ def test_every_emitted_set_callback_is_documented(buttons):
 
 
 def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_reminder, make_row, check_view):
-    item = make_item(id=BIG, kind="event", rrule="FREQ=DAILY", rec_active=True, lead_minutes=[5])
+    item = make_item(id=BIG, kind="event", rrule="FREQ=DAILY", rec_active=True, lead_minutes=[1440, 5])
     occ = make_occ(now + timedelta(hours=1), id=BIG, item_id=BIG)
     rem = make_reminder(occ, 5, id=BIG)
     row = make_row(item_id=BIG, occurrence_id=BIG, due_at=now)
@@ -788,7 +777,6 @@ def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_remind
         views.deleted_card(item),
         views.edit_menu(item),
         views.kind_menu(item),
-        views.lead_menu(item),
         views.reminder_message(item, occ, rem, prefs, now),
         views.reminder_done(item, occ, prefs, now),
         views.reminder_snoozed(item, rem, prefs, now),
@@ -804,5 +792,5 @@ def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_remind
     for view in built:
         check_view(view)
     occ_cbs = {OccCb(a=a, id=BIG).pack() for a in ("done", "s15", "s60", "tmr")}
-    reminder_kb = built[6][1]
+    reminder_kb = built[5][1]
     assert {b.callback_data for row in reminder_kb.inline_keyboard for b in row} == occ_cbs

@@ -196,11 +196,6 @@ export function fmtDuration(minutes: number): string {
   return text ? sign + text : "0 мин";
 }
 
-/** "напомнить за" choice: 0 -> "в момент", else a duration. */
-export function leadLabel(minutes: number): string {
-  return minutes === 0 ? "в момент" : `за ${fmtDuration(minutes)}`;
-}
-
 /** "$0.42"; tiny sums with four digits ("$0.0004"), as /usage in the bot. */
 export function fmtMoney(usd: number): string {
   return usd > 0 && usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;

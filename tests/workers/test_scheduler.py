@@ -55,8 +55,8 @@ async def no_digests(set_prefs) -> Prefs:
 
 @pytest.fixture
 async def meeting(make_items, t0):
-    """Event today 11:00 (created at 10:00): one reminder at 10:55."""
-    [created] = await make_items({"kind": "event", "title": "Созвон", "when": {"time": "11:00"}}, now=t0)
+    """Event today 10:55 (created at 10:00): one reminder at 10:55 — the item's time is its notification time."""
+    [created] = await make_items({"kind": "event", "title": "Созвон", "when": {"time": "10:55"}}, now=t0)
     return created
 
 
@@ -82,7 +82,7 @@ async def test_due_reminder_is_sent_with_buttons_and_marked_sent(
     now = frozen.set(local(2026, 10, 6, 10, 55))
     await scheduler.tick(now)
     [msg] = bot.sent
-    assert "Созвон" in msg["text"] and "через 5 мин" in msg["text"]
+    assert msg["text"] == "🔔 <b>Созвон</b>"  # no "через 5 мин": it comes at the item's time
     occ_id = meeting.occurrence.id
     assert OccCb(a="done", id=occ_id).pack() in buttons(msg)
     assert OccCb(a="s15", id=occ_id).pack() in buttons(msg)
@@ -124,8 +124,8 @@ async def test_deleted_item_or_done_occurrence_cancels(
     ctx, no_digests, make_items, t0, bot, sessionmaker, local, get
 ) -> None:
     deleted, done = await make_items(
-        {"kind": "event", "title": "Удалю", "when": {"time": "11:00"}},
-        {"kind": "event", "title": "Сделаю", "when": {"time": "11:00"}},
+        {"kind": "event", "title": "Удалю", "when": {"time": "10:55"}},
+        {"kind": "event", "title": "Сделаю", "when": {"time": "10:55"}},
         now=t0,
     )
     async with sessionmaker() as session:
@@ -186,8 +186,8 @@ async def test_transient_failure_leaves_the_rest_of_the_batch_for_the_next_tick(
     ctx, no_digests, make_items, t0, bot, local, get, monkeypatch
 ) -> None:
     first, second = await make_items(
-        {"kind": "event", "title": "Созвон", "when": {"time": "11:00"}},
-        {"kind": "event", "title": "Обед", "when": {"time": "11:00"}},
+        {"kind": "event", "title": "Созвон", "when": {"time": "10:55"}},
+        {"kind": "event", "title": "Обед", "when": {"time": "10:55"}},
         now=t0,
     )
     monkeypatch.setattr(scheduler_module, "CLAIM_LIMIT", 2)  # a full claim: normally ticks again right away
@@ -267,7 +267,7 @@ async def test_disabled_digest_is_not_sent(ctx, set_prefs, make_items, t0, bot, 
 async def test_evening_digest_with_done_and_open(ctx, make_items, t0, bot, sessionmaker, local, get) -> None:
     done, _ = await make_items(
         {"kind": "task", "title": "Отчёт", "when": {"time": "12:00"}},
-        {"kind": "task", "title": "Звонок", "when": {"time": "15:00"}},
+        {"kind": "task", "title": "Звонок", "when": {"time": "14:00"}},  # its reminder is over the 6 h grace at 21:00
         now=t0,
     )
     async with sessionmaker() as session:
@@ -414,7 +414,7 @@ async def test_tomorrow_snooze_of_a_series_instance_is_delivered(
     [created] = await make_items(spec, now=local(2026, 10, 6, 10, 0))
     assert created.occurrence.due_at == local(*due)
     scheduler = Scheduler(ctx)
-    await scheduler.tick(local(*due) - timedelta(minutes=5))  # the reminder
+    await scheduler.tick(local(*due))  # the reminder, at the item's time
     await scheduler.tick(local(*due) + timedelta(seconds=30))  # the next instance is generated
     assert len(bot.sent) == 1
 
@@ -477,5 +477,5 @@ async def test_late_automatic_reminder_waits_for_the_end_of_short_quiet_hours(
 
 async def test_explicit_time_reminder_is_sent_in_quiet_hours(ctx, no_digests, make_items, t0, bot, local) -> None:
     await make_items({"kind": "event", "title": "Поезд", "when": {"time": "23:30"}}, now=t0)
-    await Scheduler(ctx).tick(local(2026, 10, 6, 23, 26))  # 23:25 reminder, a minute late
+    await Scheduler(ctx).tick(local(2026, 10, 6, 23, 31))  # the 23:30 reminder, a minute late
     assert len(bot.sent) == 1

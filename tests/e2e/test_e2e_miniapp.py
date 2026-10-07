@@ -59,7 +59,7 @@ async def test_inbox_to_card_to_done_without_the_chat(e2e: Any) -> None:
     assert req.msg == CALL_BANK
 
     status, item = await e2e.api("GET", f"/api/items/{row['id']}")
-    assert item["when_text"] == "⏰ завтра 10:00 · напомню в 09:55" and item["source"]["from_app"] is True
+    assert item["when_text"] == "🔔 завтра 10:00" and item["source"]["from_app"] is True
 
     status, answer = await e2e.api("POST", f"/api/items/{row['id']}/done")
     assert status == 200 and answer["message"] == "✅ Готово" and answer["item"]["status"] == "done"
@@ -103,8 +103,8 @@ async def test_ask_and_settings(e2e: Any) -> None:
     assert status == 200 and answer["answer"] == "Завтра в 10 — позвонить в банк."
     assert [r["title"] for r in answer["rows"]] == ["Позвонить в банк"]
 
-    status, settings = await e2e.api("PATCH", "/api/settings", {"lead_minutes": 15, "slot_evening": "20:00"})
-    assert status == 200 and settings["prefs"]["lead_minutes"] == 15 and settings["prefs"]["slot_evening"] == "20:00"
+    status, settings = await e2e.api("PATCH", "/api/settings", {"soon_days": 3, "slot_evening": "20:00"})
+    assert status == 200 and settings["prefs"]["soon_days"] == 3 and settings["prefs"]["slot_evening"] == "20:00"
     status, usage = await e2e.api("GET", "/api/usage")
     assert usage["calls"] == 3 and {p["purpose"] for p in usage["by_purpose"]} == {"extract", "answer"}
     assert json.dumps(usage)  # plain JSON

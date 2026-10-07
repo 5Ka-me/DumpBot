@@ -5,9 +5,9 @@
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../api";
 import type { Prefs, SettingsPatch, SettingsResponse } from "../api/types";
-import { Chip, ErrorBox, Loading, ScreenHeader, Section, Segmented, Switch } from "../components/ui";
+import { ErrorBox, Loading, ScreenHeader, Section, Segmented, Switch } from "../components/ui";
 import { clearDraft, getDraft, setDraft as keepDraft } from "../lib/drafts";
-import { fmtDuration, parseClock } from "../lib/format";
+import { parseClock } from "../lib/format";
 import { useMainButton } from "../lib/mainButton";
 import { MeContext } from "../lib/me";
 import { useBackHandler, useNav } from "../lib/nav";
@@ -20,7 +20,6 @@ type NumberKeys = { [K in keyof Prefs]: Prefs[K] extends number ? K : never }[ke
 export type Draft = { [K in keyof Prefs]: Prefs[K] extends number ? string : Prefs[K] };
 
 const INT_LIMITS: Partial<Record<NumberKeys, [number, number]>> = {
-  lead_minutes: [0, 10080],
   soon_days: [1, 14],
   missed_grace_minutes: [1, 1_000_000],
 };
@@ -40,14 +39,12 @@ const TIME_KEYS = [
   "digest_morning_time",
   "digest_evening_time",
 ] as const satisfies readonly (keyof Prefs)[];
-const SETTINGS_LEAD_CHOICES = [0, 5, 10, 15, 30];
 const SETTINGS_DRAFT = "settings";
 const TZ_FALLBACK = ["Europe/Warsaw", "Europe/Berlin", "Europe/Minsk", "Europe/Kyiv", "Europe/Moscow", "Europe/London"];
 
 export function toDraft(prefs: Prefs): Draft {
   return {
     ...prefs,
-    lead_minutes: String(prefs.lead_minutes),
     soon_days: String(prefs.soon_days),
     missed_grace_minutes: String(prefs.missed_grace_minutes),
     budget_usd: String(prefs.budget_usd),
@@ -289,20 +286,6 @@ function SettingsForm({ data, onSaved }: { data: SettingsResponse; onSaved: (nex
           <FieldError text={errors.tz} />
         </label>
         {time("task_default_time", "Задача без времени", "когда напомнить, если время не сказано")}
-        <NumberField
-          label="Напоминать о событии за"
-          value={draft.lead_minutes}
-          error={errors.lead_minutes}
-          unit="мин"
-          onChange={(v) => set("lead_minutes", v)}
-        />
-        <div className="chips chips--padded">
-          {SETTINGS_LEAD_CHOICES.map((m) => (
-            <Chip key={m} pressed={draft.lead_minutes === String(m)} onClick={() => set("lead_minutes", String(m))}>
-              {m === 0 ? "в момент" : fmtDuration(m)}
-            </Chip>
-          ))}
-        </div>
         <NumberField
           label="«На днях» — это через"
           value={draft.soon_days}

@@ -1,6 +1,8 @@
 """User preferences, stored as JSONB in ``user_settings.prefs`` and edited from the in-bot settings menu.
 
-Adding a field with a default needs no DB migration: old rows simply get the default on load.
+Adding a field with a default needs no DB migration: old rows simply get the default on load. A removed field is
+ignored on load (``extra="ignore"``): ``lead_minutes`` (the default "remind 5 minutes before", dropped 2026-10-07 —
+an item's time is its notification time) may still be in stored prefs.
 """
 
 from __future__ import annotations
@@ -46,7 +48,6 @@ class Prefs(BaseModel):
     bare_date_time: time = time(10, 0)  # a date without a time ("завтра")
     task_default_time: time = time(19, 0)  # actionable item without any time
 
-    lead_minutes: int = Field(5, ge=0, le=10080)  # default "remind N minutes before the event"
     soon_days: int = Field(2, ge=1, le=14)  # "на днях" = in this many days (at task_default_time)
 
     quiet_enabled: bool = True

@@ -14,13 +14,15 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class ReminderPlan:
     fire_at: datetime  # aware UTC
-    lead_minutes: int  # 0 = exactly at the time
+    lead_minutes: int  # how long before the occurrence's time; 0 = at it (or after it: a later explicit lead)
     auto: bool  # time chosen automatically -> shifted out of quiet hours
 
 
 @dataclass(frozen=True)
 class Resolution:
-    due_at: datetime | None  # aware UTC; None -> no time, no reminders
+    # aware UTC; None -> no time, no reminders. The item's time IS its notification time: "встреча в 15" is due at
+    # 15:00, "напомни за 30 минут до встречи в 15" at 14:30 (a deadline stays at the deadline).
+    due_at: datetime | None
     precision: Precision
     reminders: tuple[ReminderPlan, ...] = ()
     rrule: str | None = None
@@ -33,6 +35,12 @@ class Resolution:
     period_kind: str | None = None
     period_start: date | None = None
     period_end: date | None = None
+    # The explicit leads ("за день и за час" -> (1440, 60)) still in effect, largest first: what ``Item.lead_minutes``
+    # keeps. ``due_at`` is the stated time minus the largest one; the others are later notifications of the same
+    # occurrence. None: the stated time itself (no lead, or every lead moment had passed).
+    leads: tuple[int, ...] | None = None
+    # The time the message stated when a lead moved the notification before it ("(15:00)" for the title).
+    stated_at: datetime | None = None
 
 
 @dataclass

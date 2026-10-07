@@ -18,7 +18,6 @@ from dumpbot.bot.cbdata import (
     DigestCb,
     ItemCb,
     KindCb,
-    LeadCb,
     OccCb,
     PickCb,
     SetCb,
@@ -39,7 +38,7 @@ def _roundtrip(cb: CallbackData) -> str:
 
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
-    assert prefixes == ["i", "o", "k", "l", "a", "p", "d", "s", "c"]
+    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c"]  # "l" (LeadCb) is retired: never reuse it
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -56,7 +55,6 @@ def test_item_actions_match_contract():
         "norem",
         "stoprec",
         "kind",
-        "lead",
         "back",
         "time",
         "title",
@@ -88,9 +86,11 @@ def test_kind(kind: str):
     assert _roundtrip(KindCb(id=BIG, k=kind)) == f"k:{BIG}:{kind}"
 
 
-@pytest.mark.parametrize("minutes", [0, 5, 1440, 43200])
-def test_lead(minutes: int):
-    assert _roundtrip(LeadCb(id=BIG, m=minutes)) == f"l:{BIG}:{minutes}"
+def test_lead_buttons_are_retired():
+    # An item's time is its notification time (2026-10-07): no "⏱ Напомнить за…" menu, no lead setting.
+    assert "lead" not in ITEM_ACTIONS
+    assert all(cls.__prefix__ != "l" for cls in ALL_CALLBACKS)
+    assert "lead" not in SETTINGS_MENUS and "lead_minutes" not in ASK_FIELDS
 
 
 def test_ask_pick_digest():

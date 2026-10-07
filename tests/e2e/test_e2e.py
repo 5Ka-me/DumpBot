@@ -73,7 +73,7 @@ async def the_job_if_any(e2e: Any) -> Job | None:
         return (await s.scalars(select(Job))).one_or_none()
 
 
-# --- (a) flagship: voice -> card "напомню в 12:55" -> reminder at 12:55 -> Done -------------------------------------
+# --- (a) flagship: voice -> card "🔔 сегодня 13:00" -> reminder at 13:00 -> Done ------------------------------------
 
 
 async def test_voice_note_to_reminder_to_done(e2e: Any) -> None:
@@ -92,9 +92,10 @@ async def test_voice_note_to_reminder_to_done(e2e: Any) -> None:
     assert req.line("NOW ") == "NOW 2026-10-06T10:12 Tue Europe/Warsaw"
     assert req.images == []
 
-    # the card: today 13:00 ("в обед"), reminder 5 minutes before
+    # the card: today 13:00 ("в обед") — the item's time is its notification time, no "за 5 минут"
     assert card.text.startswith("🛒 <b>Купить наушники</b>")
-    assert "⏰ сегодня 13:00 · напомню в 12:55" in card.text
+    assert card.text.splitlines()[1] == "🔔 сегодня 13:00"
+    assert "12:55" not in card.text and "напомню" not in card.text
     assert "#электроника" in card.text
     assert [text for text, _ in card.buttons] == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить"]
 
@@ -105,27 +106,27 @@ async def test_voice_note_to_reminder_to_done(e2e: Any) -> None:
     [occ] = await e2e.occurrences(item.id)
     assert (wall(occ.due_at), occ.precision, occ.status) == ("2026-10-06 13:00", "slot", "open")
     [reminder] = await e2e.reminders(item.id)
-    assert (reminder.status, wall(reminder.fire_at), reminder.auto) == ("pending", "2026-10-06 12:55", False)
+    assert (reminder.status, wall(reminder.fire_at), reminder.auto) == ("pending", "2026-10-06 13:00", False)
 
     # both paid calls were accounted for
     usage = await e2e.all(AiUsage)
     assert sorted(u.purpose for u in usage) == ["extract", "stt"]
     assert all(u.ok and u.cost_usd > 0 for u in usage)
 
-    # nothing at 12:54 ...
+    # nothing at 12:55 or 12:59 ...
     sent_before = len(e2e.tg.sent)
-    await e2e.tick(local(2026, 10, 6, 12, 54))
-    assert len(e2e.tg.sent) == sent_before
-    # ... the reminder at 12:55
     await e2e.tick(local(2026, 10, 6, 12, 55))
+    await e2e.tick(local(2026, 10, 6, 12, 59))
+    assert len(e2e.tg.sent) == sent_before
+    # ... the notification at 13:00 itself
+    await e2e.tick(local(2026, 10, 6, 13, 0))
     [reminder_msg] = e2e.tg.sent[sent_before:]
-    assert reminder_msg.text.startswith("🔔 <b>Купить наушники</b>")
-    assert "через 5 мин · сегодня 13:00" in reminder_msg.text
+    assert reminder_msg.text == "🔔 <b>Купить наушники</b>"  # no "через 5 мин"
     assert [text for text, _ in reminder_msg.buttons] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
     assert reminder_msg.reply_to is None
     [reminder] = await e2e.reminders(item.id)
     assert (reminder.status, reminder.tg_message_id) == ("sent", reminder_msg.message_id)
-    await e2e.tick(local(2026, 10, 6, 12, 56))
+    await e2e.tick(local(2026, 10, 6, 13, 1))
     assert len(e2e.tg.sent) == sent_before + 1  # not sent twice
 
     # [✅ Готово] on the reminder edits that message to "done"
@@ -138,6 +139,30 @@ async def test_voice_note_to_reminder_to_done(e2e: Any) -> None:
     [occ] = await e2e.occurrences(item.id)
     assert occ.status == "done"
     assert (await e2e.item("Купить наушники")).status == "done"
+
+
+async def test_explicit_lead_moves_the_notification_and_keeps_the_stated_time_in_the_title(e2e: Any) -> None:
+    """ "Напомни за 30 минут до встречи с Олегом в 15": the item's time is 14:30, the meeting's 15:00 stays in the title
+    (the model is asked for that; here it forgot, the code adds it)."""
+    text = "Напомни за 30 минут до встречи с Олегом в 15"
+    out = task("Встреча с Олегом", {"text": "в 15", "time": "15:00"}, kind="event")
+    out["items"][0]["lead"] = [30]
+    e2e.ai.script(text, out)
+    message_id = e2e.tg.push_message(text)
+    card = await e2e.card_for(message_id)
+    assert card.text.splitlines()[:2] == ["📅 <b>Встреча с Олегом (15:00)</b>", "🔔 сегодня 14:30"]
+    item = await e2e.item("Встреча с Олегом (15:00)")
+    [occ] = await e2e.occurrences(item.id)
+    assert (wall(occ.due_at), item.lead_minutes) == ("2026-10-06 14:30", [30])
+
+    sent_before = len(e2e.tg.sent)
+    await e2e.tick(local(2026, 10, 6, 14, 29))
+    assert len(e2e.tg.sent) == sent_before
+    await e2e.tick(local(2026, 10, 6, 14, 30))
+    [reminder] = e2e.tg.sent[sent_before:]
+    assert reminder.text == "🔔 <b>Встреча с Олегом (15:00)</b>"
+    await e2e.tick(local(2026, 10, 6, 15, 0))
+    assert len(e2e.tg.sent) == sent_before + 1  # nothing more at 15:00
 
 
 # --- (b) a plain idea: only 👌 ---------------------------------------------------------------------------------------
@@ -195,7 +220,7 @@ async def test_query_then_reply_edit_replans_the_reminder(e2e: Any) -> None:
     assert replying is not None
     assert '"title": "Купить наушники"' in replying and '"due_local": "2026-10-06 13:00"' in replying
     assert new_card.text.startswith("🛒 <b>Купить наушники</b>")
-    assert "⏰ сегодня 15:00 · напомню в 14:55" in new_card.text
+    assert new_card.text.splitlines()[1] == "🔔 сегодня 15:00"
 
     item = await e2e.item("Купить наушники")
     assert (await e2e.raw(reply)).reply_item_id == item.id
@@ -204,18 +229,17 @@ async def test_query_then_reply_edit_replans_the_reminder(e2e: Any) -> None:
     assert wall(occ.due_at) == "2026-10-06 15:00"
     reminders = await e2e.reminders(item.id)
     assert [(r.status, wall(r.fire_at)) for r in reminders] == [
-        ("cancelled", "2026-10-06 12:55"),
-        ("pending", "2026-10-06 14:55"),
+        ("cancelled", "2026-10-06 13:00"),
+        ("pending", "2026-10-06 15:00"),
     ]
 
     # the old time no longer fires, the new one does
     sent_before = len(e2e.tg.sent)
-    await e2e.tick(local(2026, 10, 6, 12, 55))
+    await e2e.tick(local(2026, 10, 6, 13, 0))
     assert len(e2e.tg.sent) == sent_before
-    await e2e.tick(local(2026, 10, 6, 14, 55))
+    await e2e.tick(local(2026, 10, 6, 15, 0))
     [reminder_msg] = e2e.tg.sent[sent_before:]
-    assert reminder_msg.text.startswith("🔔 <b>Купить наушники</b>")
-    assert "через 5 мин · сегодня 15:00" in reminder_msg.text
+    assert reminder_msg.text == "🔔 <b>Купить наушники</b>"
 
 
 # --- (e) chutes down: ✍, retried after it recovers -------------------------------------------------------------------
@@ -256,7 +280,7 @@ async def test_ai_outage_is_retried_after_recovery(e2e: Any) -> None:
     card = await e2e.card_for(message_id)
     await e2e.reaction(message_id, "👌")
     assert card.text.startswith("📌 <b>Позвонить в банк</b>")
-    assert "⏰ завтра 11:00 · напомню в 10:55" in card.text  # resolved against the message date
+    assert card.text.splitlines()[1] == "🔔 завтра 11:00"  # resolved against the message date
     assert e2e.tg.reactions(message_id) == ["👀", "✍", "👌"]
     assert (await e2e.raw(message_id)).status == "done"
     await e2e.idle()
@@ -334,7 +358,7 @@ async def test_morning_and_evening_digests(e2e: Any) -> None:
     await e2e.idle()
     sent_before = len(e2e.tg.sent)
 
-    # Wed 08:59: no digest yet; Tuesday's 17:55 reminder is long missed and not sent anymore
+    # Wed 08:59: no digest yet; Tuesday's 18:00 reminder is long missed and not sent anymore
     await e2e.tick(local(2026, 10, 7, 8, 59))
     assert len(e2e.tg.sent) == sent_before
 
@@ -369,14 +393,14 @@ async def test_morning_and_evening_digests(e2e: Any) -> None:
     [occ] = await e2e.occurrences(mom_item.id)
     assert (wall(occ.due_at), occ.status) == ("2026-10-08 10:00", "open")
     pending = [wall(r.fire_at) for r in await e2e.reminders(mom_item.id) if r.status == "pending"]
-    assert pending == ["2026-10-08 09:55"]
+    assert pending == ["2026-10-08 10:00"]
     [occ] = await e2e.occurrences((await e2e.item("Оплатить интернет")).id)
     assert wall(occ.due_at) == "2026-10-08 18:00"
 
-    # Thursday: the morning digest, then the moved reminder at 09:55
+    # Thursday: the morning digest, then the moved reminder at 10:00
     sent_before = len(e2e.tg.sent)
     await e2e.tick(local(2026, 10, 8, 9, 0))
-    await e2e.tick(local(2026, 10, 8, 9, 55))
+    await e2e.tick(local(2026, 10, 8, 10, 0))
     texts = [c.text for c in e2e.tg.sent[sent_before:]]
     assert len(texts) == 2
     assert texts[0].startswith("☀️ <b>Доброе утро!</b>") and "10:00 · 📌 Позвонить маме" in texts[0]
@@ -388,29 +412,36 @@ async def test_morning_and_evening_digests(e2e: Any) -> None:
 
 async def test_snooze_from_the_reminder(e2e: Any) -> None:
     await headphones_by_voice(e2e)
-    await e2e.tick(local(2026, 10, 6, 12, 55))
+    await e2e.tick(local(2026, 10, 6, 13, 0))
     reminder_msg = e2e.tg.sent[-1]
     assert reminder_msg.text.startswith("🔔 <b>Купить наушники</b>")
 
-    # [⏰ 15 мин] pressed at 12:57 -> the reminder is edited, a new one comes at 13:12
-    e2e.clock.set(local(2026, 10, 6, 12, 57))
+    # [⏰ 15 мин] pressed at 13:02 -> the reminder is edited, the item's time moves to 13:17
+    e2e.clock.set(local(2026, 10, 6, 13, 2))
     e2e.tg.push_callback(reminder_msg, reminder_msg.button("o:s15:"))
     [edit] = await e2e.wait(lambda: e2e.tg.edits_of(reminder_msg.message_id), "the reminder edited")
-    assert "💤 отложено · напомню сегодня в 13:12" in edit.text
+    assert "💤 отложено · напомню сегодня в 13:17" in edit.text
     assert edit.buttons == []  # the snoozed reminder comes with its own buttons
-    assert e2e.tg.toasts() == ["⏰ Напомню сегодня 13:12"]
+    assert e2e.tg.toasts() == ["⏰ Напомню сегодня 13:17"]
+    item = await e2e.item("Купить наушники")
+    [occ] = await e2e.occurrences(item.id)
+    assert (wall(occ.due_at), occ.status) == ("2026-10-06 13:17", "open")
+
+    # /today shows the new time
+    e2e.tg.push_message("/today", entities=[{"type": "bot_command", "offset": 0, "length": 6}])
+    today = await e2e.wait(lambda: next((c for c in e2e.tg.sent if c.text.startswith("<b>📅")), None), "/today")
+    assert "13:17 · 🛒 Купить наушники" in today.text
 
     sent_before = len(e2e.tg.sent)
-    await e2e.tick(local(2026, 10, 6, 13, 11))
+    await e2e.tick(local(2026, 10, 6, 13, 16))
     assert len(e2e.tg.sent) == sent_before
-    await e2e.tick(local(2026, 10, 6, 13, 12))
+    await e2e.tick(local(2026, 10, 6, 13, 17))
     [again] = e2e.tg.sent[sent_before:]
     assert again.text.startswith("🔔 <b>Купить наушники</b>")
     assert [text for text, _ in again.buttons] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
-    item = await e2e.item("Купить наушники")
     assert [(r.status, wall(r.fire_at)) for r in await e2e.reminders(item.id)] == [
-        ("sent", "2026-10-06 12:55"),
-        ("sent", "2026-10-06 13:12"),
+        ("sent", "2026-10-06 13:00"),
+        ("sent", "2026-10-06 13:17"),
     ]
 
 
@@ -427,12 +458,12 @@ async def test_recurring_task_done_and_stopped(e2e: Any) -> None:
     )
     message_id = e2e.tg.push_message(text)
     card = await e2e.card_for(message_id)
-    assert "⏰ завтра 09:00 · напомню в 08:55" in card.text  # 09:00 has passed today
+    assert "🔔 завтра 09:00" in card.text.splitlines()  # 09:00 has passed today
     assert "🔁 каждый день" in card.text
     assert "⏹ Стоп повтор" in [t for t, _ in card.buttons]
 
-    await e2e.tick(local(2026, 10, 7, 8, 55))
-    reminder_msg = e2e.tg.sent[-1]
+    await e2e.tick(local(2026, 10, 7, 9, 0))  # the reminder (and the morning digest, also at 09:00)
+    [reminder_msg] = [c for c in e2e.tg.sent if c.text.startswith("🔔 ")]
     assert reminder_msg.text.startswith("🔔 <b>Зарядка</b>")
     e2e.clock.set(local(2026, 10, 7, 9, 2))
     e2e.tg.push_callback(reminder_msg, reminder_msg.button("o:done:"))
@@ -443,7 +474,7 @@ async def test_recurring_task_done_and_stopped(e2e: Any) -> None:
     occs = await e2e.occurrences(item.id)
     assert [(wall(o.due_at), o.status) for o in occs] == [("2026-10-07 09:00", "done"), ("2026-10-08 09:00", "open")]
     pending = [wall(r.fire_at) for r in await e2e.reminders(item.id) if r.status == "pending"]
-    assert pending == ["2026-10-08 08:55"]
+    assert pending == ["2026-10-08 09:00"]
     assert (item.status, item.rec_active) == ("open", True)
 
     # /recurring lists it; its stop button ends the series
@@ -491,7 +522,7 @@ async def test_edit_time_through_the_card_buttons(e2e: Any) -> None:
     new_card = await e2e.card_for(answer)
     await e2e.reaction(answer, "👌")
     assert e2e.tg.reactions(answer) == ["👀", "👌"]
-    assert "⏰ сегодня 16:30 · напомню в 16:25" in new_card.text
+    assert "🔔 сегодня 16:30" in new_card.text.splitlines()
     restored = e2e.tg.edits_of(card.message_id)[-1]  # the prompt turned back into the card
     assert restored.text.startswith("🛒 <b>Купить наушники</b>")
     assert len(await e2e.all(RawMessage)) == 1  # the answer was not captured as a new message
@@ -519,7 +550,7 @@ async def test_clarifying_question(e2e: Any) -> None:
 
     e2e.tg.push_callback(question, question.buttons[1][1])
     cards = await e2e.wait(lambda: e2e.tg.replies_to(message_id)[1:], "the card after the answer")
-    assert "⏰ сегодня 20:00 · напомню в 19:55" in cards[0].text
+    assert "🔔 сегодня 20:00" in cards[0].text.splitlines()
     [chosen] = e2e.tg.edits_of(question.message_id)
     assert "вечера" in chosen.text.split("\n")[-1]
     assert chosen.buttons == []
@@ -638,7 +669,7 @@ async def test_budget_exhausted_then_raised(e2e: Any) -> None:
     e2e.tg.push_callback(last, last.button("s:budget:5"))
     card = await e2e.card_for(message_id)
     assert "<b>Купить корм коту</b>" in card.text
-    assert "⏰ сегодня 19:00 · напомню в 18:55" in card.text
+    assert "🔔 сегодня 19:00" in card.text.splitlines()
     await e2e.reaction(message_id, "👌")
     assert e2e.tg.reactions(message_id) == ["👀", "✍", "👌"]
 
@@ -693,9 +724,9 @@ async def test_delete_and_restore_from_the_card(e2e: Any) -> None:
 
     e2e.tg.push_callback(deleted, deleted.button(f"i:undel:{item.id}"))
     restored = (await e2e.wait(lambda: e2e.tg.edits_of(card.message_id)[1:], "card restored"))[0]
-    assert "⏰ сегодня 13:00 · напомню в 12:55" in restored.text
+    assert "🔔 сегодня 13:00" in restored.text.splitlines()
     assert e2e.tg.toasts() == ["🗑 Удалено", "↩️ Восстановлено"]
-    await e2e.tick(local(2026, 10, 6, 12, 55))
+    await e2e.tick(local(2026, 10, 6, 13, 0))
     [reminder_msg] = e2e.tg.sent[sent_before:]
     assert reminder_msg.text.startswith("🔔 <b>Купить наушники</b>")
 
@@ -751,7 +782,7 @@ async def test_edit_by_description_with_candidates(e2e: Any) -> None:
     e2e.tg.push_callback(choice, data)
     card = (await e2e.wait(lambda: e2e.tg.replies_to(message_id)[1:], "card of the picked item"))[0]
     assert card.text.startswith("📅 <b>Созвон с Олегом</b>")
-    assert "⏰ сегодня 18:00 · напомню в 17:55" in card.text
+    assert "🔔 сегодня 18:00" in card.text.splitlines()
     [occ] = await e2e.occurrences(second.id)
     assert wall(occ.due_at) == "2026-10-06 18:00"
     first = await e2e.item("Встреча с Олегом")
@@ -782,7 +813,7 @@ async def test_user_text_is_escaped_everywhere(e2e: Any) -> None:
     message_id = e2e.tg.push_message(text)
     card = await e2e.card_for(message_id)
     assert "Проверить &lt;b&gt;теги&lt;/b&gt; &amp; «кавычки» &lt;script&gt;" in card.text
-    await e2e.tick(local(2026, 10, 6, 10, 55))  # the reminder and (still within its window) the morning digest
+    await e2e.tick(local(2026, 10, 6, 11, 0))  # the reminder and (still within its window) the morning digest
     e2e.tg.push_message("/today", entities=[{"type": "bot_command", "offset": 0, "length": 6}])
     e2e.tg.push_message("/recent", entities=[{"type": "bot_command", "offset": 0, "length": 7}])
     await e2e.wait(lambda: len(e2e.tg.sent) >= 5, "the lists")

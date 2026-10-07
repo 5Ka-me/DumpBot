@@ -166,7 +166,7 @@ def make_occ() -> Callable[..., Occurrence]:
 
 @pytest.fixture
 def make_reminder() -> Callable[..., Reminder]:
-    def build(occ: Occurrence, lead: int = 5, **kw: Any) -> Reminder:
+    def build(occ: Occurrence, lead: int = 0, **kw: Any) -> Reminder:
         values: dict[str, Any] = {
             "id": 100 + lead,
             "occurrence_id": occ.id,

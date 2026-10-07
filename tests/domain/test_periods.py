@@ -12,7 +12,7 @@ from dumpbot.ai.schemas import ExtractedItem, When
 from dumpbot.domain.prefs import Prefs
 from dumpbot.domain.timeresolve import (
     WARN_BAD_TIME,
-    lead_applies,
+    effective_leads,
     period_bounds,
     plan_reminders,
     resolve_item,
@@ -351,17 +351,22 @@ def test_deadline_date_reminds_the_evening_before_and_in_the_morning():
     assert [p.lead_minutes for p in res.reminders] == [15 * 60, 0]
 
 
-def test_deadline_with_a_time_reminds_the_evening_before_and_lead_before_it():
+def test_deadline_with_a_time_reminds_the_evening_before_and_at_its_time():
+    """No default lead (2026-10-07): "до пятницы 15:00" notifies Thu 19:00 and Fri 15:00 itself."""
     res = resolve({"text": "до пятницы 15:00", "day": "FR", "time": "15:00", "role": "deadline"}, TUE)
-    assert res.precision == "exact"
-    assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 14, 55), False)]
+    assert (res.precision, res.due_at, res.leads) == ("exact", L(2026, 10, 9, 15, 0), None)
+    assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 15, 0), False)]
+
+
+def test_deadline_with_an_explicit_lead_keeps_its_time_and_reminds_before_it():
     res = resolve({"text": "до пятницы 15:00", "day": "FR", "time": "15:00", "role": "deadline"}, TUE, lead=[60])
+    assert (res.due_at, res.leads, res.stated_at) == (L(2026, 10, 9, 15, 0), (60,), None)  # still due at 15:00
     assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 14, 0), False)]
 
 
 def test_deadline_with_a_slot():
     res = resolve({"text": "до пятницы вечером", "day": "FR", "time": "evening", "role": "deadline"}, TUE)
-    assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 18, 55), False)]
+    assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 19, 0), False)]
 
 
 def test_deadline_whole_day_lead_adds_to_the_evening_before():
@@ -383,15 +388,15 @@ def test_deadline_tomorrow_said_before_19_keeps_tonights_reminder():
     assert fires(res) == [(L(2026, 10, 6, 19, 0), True), (L(2026, 10, 7, 10, 0), True)]
 
 
-def test_deadline_today_with_a_time_only_has_the_lead_reminder():
+def test_deadline_today_with_a_time_only_reminds_at_it():
     res = resolve({"text": "до 18:00", "day": "+0", "time": "18:00", "role": "deadline"}, L(2026, 10, 6, 14, 5))
-    assert fires(res) == [(L(2026, 10, 6, 17, 55), False)]
+    assert fires(res) == [(L(2026, 10, 6, 18, 0), False)]
 
 
-def test_deadline_lead_already_past_fires_now_but_the_evening_before_is_skipped():
-    now = L(2026, 10, 6, 17, 58)
-    res = resolve({"text": "до 18:00", "day": "+0", "time": "18:00", "role": "deadline"}, now)
-    assert fires(res) == [(now.astimezone(UTC), False)]
+def test_deadline_lead_already_past_reminds_at_the_deadline_but_the_evening_before_is_skipped():
+    now = L(2026, 10, 6, 17, 30)
+    res = resolve({"text": "до 18:00", "day": "+0", "time": "18:00", "role": "deadline"}, now, lead=[60])
+    assert fires(res) == [(L(2026, 10, 6, 18, 0).astimezone(UTC), False)]
 
 
 def test_deadline_end_of_week_is_its_last_working_day():
@@ -479,13 +484,13 @@ def test_deadline_evening_before_is_shifted_and_dropped_when_it_lands_after_the_
     # Thu 23:30 -> Fri 08:00, still before the 10:00 deadline reminder
     assert fires(res) == [(L(2026, 10, 9, 8, 0), True), (L(2026, 10, 9, 10, 0), True)]
     res = resolve({"text": "до пятницы 7:30 утра", "day": "FR", "time": "07:30", "role": "deadline"}, TUE, prefs)
-    # Fri 08:00 would be after the 07:30 deadline: only the explicit lead reminder (not shifted: the owner's time)
-    assert fires(res) == [(L(2026, 10, 9, 7, 25), False)]
+    # Fri 08:00 would be after the 07:30 deadline: only the deadline's own time (not shifted: the owner's time)
+    assert fires(res) == [(L(2026, 10, 9, 7, 30), False)]
 
 
 def test_explicit_deadline_time_inside_quiet_hours_is_not_moved():
     res = resolve({"text": "до пятницы 23:45", "day": "FR", "time": "23:45", "role": "deadline"}, TUE)
-    assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 23, 40), False)]
+    assert fires(res) == [(L(2026, 10, 8, 19, 0), True), (L(2026, 10, 9, 23, 45), False)]
 
 
 def test_no_shift_when_quiet_hours_are_off():
@@ -535,7 +540,7 @@ def test_deadline_evening_before_across_the_autumn_switch():
     ]
 
 
-# --- plan_reminders directly / lead_applies ------------------------------------------------------------------------
+# --- plan_reminders directly / effective_leads ---------------------------------------------------------------------
 
 
 def test_period_plan_without_span_is_reminder_two_only():
@@ -566,7 +571,5 @@ def test_someday_plan_is_empty():
 
 
 @pytest.mark.parametrize("precision", ["period", "soon"])
-def test_lead_applies_only_at_the_moment_for_automatic_spans(precision: str):
-    assert lead_applies(precision, 0) is True
-    assert lead_applies(precision, 30) is False
-    assert lead_applies(precision, 1440) is False
+def test_spans_take_no_leads(precision: str):
+    assert effective_leads(precision, [0, 30, 1440]) == []

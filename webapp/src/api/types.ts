@@ -150,6 +150,7 @@ export interface Occurrence {
 export interface Reminder {
   id: number;
   fire_at: IsoDateTime;
+  /** How long before the occurrence's time (0: at it, or a later notification of "за день и за час"). */
   lead_minutes: number;
   /** Time chosen automatically (moved out of quiet hours). */
   auto: boolean;
@@ -217,8 +218,7 @@ export interface ItemDetail {
   urls: string[];
   /** url -> page title */
   link_titles: Record<string, string>;
-  /** null: the default from the settings; []: reminders off (🔕). */
-  lead_minutes: number[] | null;
+  /** 🔕: no notifications. (An item's time is its notification time: there is no "напомнить за" any more.) */
   reminders_off: boolean;
   rrule: string | null;
   rec_active: boolean;
@@ -231,7 +231,10 @@ export interface ItemDetail {
   position: number | null;
   occurrence: Occurrence | null;
   reminders: Reminder[];
-  /** "⏰ завтра 13:00 · напомню в 12:55", "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00", "🌙 когда-нибудь" */
+  /**
+   * When it notifies: "🔔 завтра 13:00", "🔔 вс 11 окт 10:00 · пн 12 окт 09:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00",
+   * "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00", "🔕 завтра 13:00", "🌙 когда-нибудь".
+   */
   when_text: string | null;
   steps: Step[];
   steps_done: number;
@@ -344,8 +347,6 @@ export interface ItemPatch {
   details?: string | null;
   tags?: string[];
   kind?: Kind;
-  /** Minutes before (≤ 3 values, 0…43200); [] or null: back to the default. */
-  lead?: number[] | null;
   period?: PeriodValue;
   someday?: boolean;
 }
@@ -470,8 +471,6 @@ export interface Prefs {
   weekend_time: HHMM;
   bare_date_time: HHMM;
   task_default_time: HHMM;
-  /** 0…10080 */
-  lead_minutes: number;
   /** 1…14 */
   soon_days: number;
   quiet_enabled: boolean;

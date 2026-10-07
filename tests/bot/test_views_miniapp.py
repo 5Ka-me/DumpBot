@@ -36,8 +36,8 @@ def test_time_text_is_the_card_line_without_html() -> None:
     occ = SimpleNamespace(
         id=5, due_at=datetime(2026, 10, 7, 11, 0, tzinfo=UTC), precision="exact", status="open", done_at=None
     )
-    reminder = SimpleNamespace(fire_at=datetime(2026, 10, 7, 10, 55, tzinfo=UTC), lead_minutes=5, status="pending")
-    assert views.time_text(_item(), occ, [reminder], PREFS, NOW) == "⏰ завтра 13:00 · напомню в 12:55"
+    reminder = SimpleNamespace(fire_at=datetime(2026, 10, 7, 11, 0, tzinfo=UTC), lead_minutes=0, status="pending")
+    assert views.time_text(_item(), occ, [reminder], PREFS, NOW) == "🔔 завтра 13:00"
     assert views.time_text(_item(someday=True), occ, [reminder], PREFS, NOW) == "🌙 когда-нибудь"
     assert views.time_text(_item(), None, [], PREFS, NOW) is None
 

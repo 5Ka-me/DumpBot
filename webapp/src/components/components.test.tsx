@@ -86,7 +86,6 @@ function detail(over: Partial<ItemDetail> = {}): ItemDetail {
     deleted_at: null,
     urls: [],
     link_titles: {},
-    lead_minutes: null,
     reminders_off: false,
     rrule: null,
     rec_active: false,

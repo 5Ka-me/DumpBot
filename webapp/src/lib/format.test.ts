@@ -12,7 +12,6 @@ import {
   fmtLongDate,
   fmtMoney,
   fmtStamp,
-  leadLabel,
   localDateTime,
   normalizeTags,
   parseClock,
@@ -99,8 +98,6 @@ describe("numbers and words", () => {
     expect(fmtDuration(1440)).toBe("1 дн");
     expect(fmtDuration(3060)).toBe("2 дн 3 ч");
     expect(fmtDuration(-15)).toBe("-15 мин");
-    expect(leadLabel(0)).toBe("в момент");
-    expect(leadLabel(60)).toBe("за 1 ч");
   });
 
   it("writes money with cents (four digits for tiny sums)", () => {

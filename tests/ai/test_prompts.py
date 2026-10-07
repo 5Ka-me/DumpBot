@@ -18,6 +18,7 @@ from dumpbot.ai.prompts import (
 from dumpbot.ai.schemas import MAX_ITEMS, Extraction, When, extraction_json_schema
 from dumpbot.domain.kinds import KINDS
 from dumpbot.domain.prefs import SLOT_NAMES, Prefs
+from dumpbot.domain.timeresolve import resolve_item
 
 WARSAW = Prefs(tz="Europe/Warsaw")
 
@@ -27,7 +28,27 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v5"
+    assert PROMPT_VERSION == "v6"
+
+
+def test_lead_example_keeps_the_stated_time_in_the_title_and_notifies_before_it():
+    """v6: "напомни за 30 минут до встречи в 15" — when is the stated 15:00, lead [30], the title keeps "(15:00)";
+    the item is due (notified) at 14:30."""
+    [out] = [out for src, out in EXAMPLES if src.startswith("напомни за 30 минут")]
+    extraction = Extraction.model_validate(out)
+    [item] = extraction.items
+    assert (item.lead, item.when.time, item.title) == ([30], "15:00", "Встреча с Олегом (15:00)")
+    now = datetime(2026, 10, 6, 12, 5, tzinfo=UTC)  # the prompt's NOW, Tue 14:05 in Warsaw
+    res = resolve_item(item, now, WARSAW, source="text")
+    assert res.due_at == datetime(2026, 10, 9, 12, 30, tzinfo=UTC)  # Fri 14:30 Warsaw
+    assert [r.fire_at for r in res.reminders] == [res.due_at]
+
+
+def test_prompt_explains_the_notification_time():
+    assert "The time is when the owner is notified" in SYSTEM_PROMPT
+    lead = _line("- lead,")
+    assert "[30]" in lead and "[1440, 60]" in lead and "(15:00)" in lead
+    assert "remind = the time to ping" not in SYSTEM_PROMPT  # role remind no longer differs from event
 
 
 def test_static_prompt_explains_every_kind():
@@ -66,12 +87,13 @@ def test_static_prompt_describes_the_when_grammar_and_rules():
 
 
 def test_static_prompt_size_budget():
-    # ~2300 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
+    # ~2400 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
     # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60), v5 the 24h-hour and
-    # stricter related rules (~35); the static prompt is a cacheable prefix.
+    # stricter related rules (~35), v6 the notification time and its leads (~80); the static prompt is a cacheable
+    # prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
-    assert estimate < 2350
+    assert estimate < 2420
 
 
 def test_examples_are_valid_extractions_and_rendered():

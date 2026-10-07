@@ -49,10 +49,10 @@ async def test_detail_of_a_timed_task(api, make_items) -> None:
     assert item["occurrence"]["due_at"] == "2026-10-07T11:00:00Z"
     assert item["occurrence"]["due_local"] == "2026-10-07T13:00"
     assert item["occurrence"]["precision"] == "exact" and item["occurrence"]["status"] == "open"
-    [reminder] = item["reminders"]
-    assert reminder["fire_at"] == "2026-10-07T10:55:00Z" and reminder["lead_minutes"] == 5
-    assert item["when_text"] == "⏰ завтра 13:00 · напомню в 12:55"
-    assert item["lead_minutes"] is None and item["reminders_off"] is False
+    [reminder] = item["reminders"]  # the item's time is its notification time: no "за 5 минут"
+    assert reminder["fire_at"] == "2026-10-07T11:00:00Z" and reminder["lead_minutes"] == 0
+    assert item["when_text"] == "🔔 завтра 13:00"
+    assert "lead_minutes" not in item and item["reminders_off"] is False
     assert item["can_split"] is True and item["split_pending"] is False
     assert item["steps"] == [] and item["related"] == [] and item["images"] == [] and item["parent"] is None
     assert item["source"] == {
@@ -119,18 +119,26 @@ async def test_patch_fields(api, make_items, db) -> None:
     [created] = await make_items({"kind": "idea", "title": "Идея"})
     reply = await api.patch(
         f"/api/items/{created.item.id}",
-        {"title": "  Новая   идея ", "details": "подробно", "tags": ["#Важное", "дом"], "kind": "task", "lead": [30]},
+        {"title": "  Новая   идея ", "details": "подробно", "tags": ["#Важное", "дом"], "kind": "task"},
     )
     assert reply.status == 200, reply.data
     assert reply.data["message"] == "✅ Сохранено"
     item = reply.data["item"]
     assert item["title"] == "Новая идея" and item["details"] == "подробно" and item["tags"] == ["важное", "дом"]
-    assert item["kind"] == "task" and item["lead_minutes"] == [30]
+    assert item["kind"] == "task"
     # An idea that became a task gets the default 19:00 reminder, like the bot's category menu.
     assert item["occurrence"]["precision"] == "default" and item["occurrence"]["due_local"] == "2026-10-06T19:00"
 
-    reply = await api.patch(f"/api/items/{created.item.id}", {"details": None, "lead": None})
-    assert reply.data["item"]["details"] is None and reply.data["item"]["lead_minutes"] is None
+    reply = await api.patch(f"/api/items/{created.item.id}", {"details": None})
+    assert reply.data["item"]["details"] is None
+
+
+async def test_patch_lead_is_gone(api, make_items) -> None:
+    # "напомнить за" was removed (2026-10-07): the item's time is its notification time.
+    [created] = await make_items({"kind": "task", "title": "Созвон", "when": TOMORROW_13})
+    for lead in ([30], None):
+        reply = await api.patch(f"/api/items/{created.item.id}", {"lead": lead})
+        assert (reply.status, reply.data["error"]["field"]) == (400, "lead")
 
 
 async def test_patch_period_and_someday(api, make_items) -> None:
@@ -207,7 +215,7 @@ async def test_when_from_the_picker(api, make_items) -> None:
     assert reply.status == 200 and reply.data["message"] == "🕒 Время изменено"
     item = reply.data["item"]
     assert item["occurrence"]["due_local"] == "2026-10-09T15:30" and item["occurrence"]["precision"] == "exact"
-    assert item["reminders"][0]["fire_at"] == "2026-10-09T13:25:00Z"
+    assert [r["fire_at"] for r in item["reminders"]] == ["2026-10-09T13:30:00Z"]  # the picker sets the notification
     assert item["needs_confirm"] is False and item["warnings"] == []
 
     item = (await api.post(path, {"due_local": "2026-10-12"})).data["item"]
@@ -313,7 +321,7 @@ async def test_a_row_closes_its_own_missed_instance_of_a_series(api, make_items,
     frozen.now = local(7, 21, 31)
     await _tick(sessionmaker, frozen.now)
     assert await _occurrences(db, item_id) == [(local(7, 9), "missed"), (local(8, 9), "open")]
-    assert await _pending(db, item_id) == [local(8, 8, 55)]
+    assert await _pending(db, item_id) == [local(8, 9)]
 
     [row] = [r for r in (await api.get("/api/today")).data["open"] if r["id"] == item_id]
     assert row["occ_status"] == "missed" and row["when_text"] == "сегодня 09:00"
@@ -322,7 +330,7 @@ async def test_a_row_closes_its_own_missed_instance_of_a_series(api, make_items,
     assert reply.status == 200
     assert reply.data["message"] == "✅ Готово · следующий раз завтра 09:00"
     assert await _occurrences(db, item_id) == [(local(7, 9), "done"), (local(8, 9), "open")]
-    assert await _pending(db, item_id) == [local(8, 8, 55)]  # Thursday's reminder is still coming
+    assert await _pending(db, item_id) == [local(8, 9)]  # Thursday's reminder is still coming
     today = (await api.get("/api/today")).data
     assert [r["id"] for r in today["open"]] == [] and [r["id"] for r in today["done"]] == [item_id]
 
@@ -409,10 +417,13 @@ async def test_snooze(api, make_items, db) -> None:
     path = f"/api/items/{created.item.id}/snooze"
     reply = await api.post(path, {"minutes": 15})
     assert reply.data["message"] == "⏰ Напомню сегодня 10:15"
+    # The snooze moves the item's time (2026-10-07): exactly one pending reminder, there.
+    assert reply.data["item"]["occurrence"]["due_local"] == "2026-10-06T10:15"
     fires = sorted(r.fire_at for r in await db(select(Reminder).where(Reminder.status == "pending")))
-    assert fires[0].isoformat() == "2026-10-06T08:15:00+00:00"
+    assert [f.isoformat() for f in fires] == ["2026-10-06T08:15:00+00:00"]
     reply = await api.post(path, {"tomorrow": True})
-    assert reply.data["message"] == "⏰ Напомню завтра 13:00"
+    assert reply.data["message"] == "⏰ Напомню завтра 10:15"
+    assert reply.data["item"]["when_text"] == "🔔 завтра 10:15"
     for body in [{}, {"minutes": 0}, {"minutes": 10081}, {"minutes": 5, "tomorrow": True}, {"minutes": "5"}]:
         assert (await api.post(path, body)).status == 400, body
 

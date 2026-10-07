@@ -6,7 +6,7 @@
  * "tma stranger" → 403).
  */
 import type { InboxStatus, ItemPatch, JobStatus, Kind, Prefs, Row } from "../src/api/types.ts";
-import { addDays, parseClock, zoned, zonedToUtc } from "../src/lib/format.ts";
+import { addDays, fmtDateTime, parseClock, zoned, zonedToUtc } from "../src/lib/format.ts";
 import { MockDb, periodOf, type MItem } from "./db.ts";
 
 export interface MockRequest {
@@ -198,7 +198,7 @@ export class MockApi {
         this.db.setDue(item, zonedToUtc(`${this.db.today(now)}T${this.db.prefs.task_default_time}`, this.db.prefs.tz).getTime(), "default");
       }
     }
-    if ("lead" in patch) item.lead = patch.lead && patch.lead.length ? patch.lead : null;
+    if ("lead" in body) throw bad("Это поле не меняется", "lead"); // no "напомнить за" any more (2026-10-07)
     if (patch.period && patch.someday !== undefined) throw bad("Либо period, либо someday", "someday");
     if (patch.period === "someday" || patch.someday === true) {
       item.someday = true;
@@ -302,18 +302,23 @@ export class MockApi {
         }
         return this.answer(item, "↩️ Не сделано", now);
       case "norem":
-        item.lead = [];
-        item.snoozes = [];
+        item.remindersOff = true;
+        item.later = [];
         return this.answer(item, "🔕 Напоминания выключены", now);
       case "stoprec":
         item.recActive = false;
         return this.answer(item, "⏹ Повтор остановлен", now);
       case "snooze": {
         if (item.occStatus !== "open" || item.due === null || item.someday) throw conflict("nothing_to_snooze", "Нечего откладывать: у записи нет открытого срока.");
-        const fire = body.tomorrow === true ? now + 86_400_000 : now + Number(body.minutes ?? 0) * 60_000;
         if (body.tomorrow !== true && !(Number(body.minutes) >= 1 && Number(body.minutes) <= 10080)) throw bad("Нужно либо minutes (1…10080), либо tomorrow: true", "minutes");
-        item.snoozes.push(fire);
-        return this.answer(item, `⏰ Напомню в ${new Date(fire).toLocaleTimeString("ru", { hour: "2-digit", minute: "2-digit", timeZone: this.db.prefs.tz })}`, now);
+        // The item's time moves there (tomorrow: at its time of day), as the bot's ⏰ buttons.
+        const tz = this.db.prefs.tz;
+        const fire =
+          body.tomorrow === true
+            ? zonedToUtc(`${addDays(this.db.today(now), 1)}T${zoned(item.due, tz).time}`, tz).getTime()
+            : now + Number(body.minutes) * 60_000;
+        this.db.snooze(item, fire);
+        return this.answer(item, `⏰ Напомню ${fmtDateTime(fire, tz, now)}`, now);
       }
       case "split":
         if (this.db.steps(item.id).length) throw conflict("has_steps", "У задачи уже есть шаги.");
@@ -604,6 +609,7 @@ export class MockApi {
     if (!Object.keys(body).length) throw bad("Нечего менять");
     const next: Record<string, unknown> = { ...this.db.prefs };
     for (const [key, value] of Object.entries(body)) {
+      if (key === "lead_minutes") continue; // retired 2026-10-07: an older app still sends it
       if (!(key in this.db.prefs)) throw bad("Нет такой настройки", key);
       const current = (this.db.prefs as unknown as Record<string, unknown>)[key];
       if (key === "tz") {

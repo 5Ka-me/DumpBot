@@ -12,7 +12,8 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items
 
 
-async def test_purchase_at_lunch_gets_1255_reminder(make, reminders_of, local, now):
+async def test_purchase_at_lunch_is_reminded_at_13(make, reminders_of, local, now):
+    """An item's time is its notification time (2026-10-07): "в обед" -> 13:00 itself, no "за 5 минут"."""
     [c] = await make(
         {
             "kind": "purchase",
@@ -35,9 +36,10 @@ async def test_purchase_at_lunch_gets_1255_reminder(make, reminders_of, local, n
     assert c.occurrence.precision == "slot"
     assert c.resolution.precision == "slot"
     assert [(r.fire_at, r.lead_minutes, r.auto, r.status) for r in c.reminders] == [
-        (local(2026, 10, 6, 12, 55), 5, False, "pending")
+        (local(2026, 10, 6, 13, 0), 0, False, "pending")
     ]
-    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 6, 12, 55), "pending", 5, False)]
+    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 6, 13, 0), "pending", 0, False)]
+    assert c.item.lead_minutes is None and c.item.title == "Купить наушники"
 
 
 async def test_task_without_time_gets_19_auto_reminder(make, reminders_of, local, now):
@@ -62,13 +64,60 @@ async def test_default_reminder_is_shifted_out_of_quiet_hours(make, reminders_of
 
 async def test_explicit_time_in_quiet_hours_is_not_shifted(make, reminders_of, local, now):
     [c] = await make({"kind": "event", "title": "Созвон", "when": {"time": "23:30"}}, now=now)
-    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 6, 23, 25), "pending", 5, False)]
+    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 6, 23, 30), "pending", 0, False)]
 
 
-async def test_explicit_lead_overrides_default(make, reminders_of, local, now):
-    [c] = await make({"kind": "event", "title": "Врач", "when": {"day": "+1", "time": "15:00"}, "lead": [30]}, now=now)
-    assert c.item.lead_minutes == [30]
-    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 7, 14, 30), "pending", 30, False)]
+async def test_explicit_lead_moves_the_items_time(make, reminders_of, local, now):
+    # "напомни за 30 минут до врача завтра в 15": the item is due at 14:30, its title keeps the 15:00.
+    when = {"day": "+1", "time": "15:00"}
+    [c] = await make({"kind": "event", "title": "Врач (15:00)", "when": when, "lead": [30]}, now=now)
+    assert (c.item.lead_minutes, c.item.title) == ([30], "Врач (15:00)")
+    assert c.occurrence.due_at == local(2026, 10, 7, 14, 30)
+    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 7, 14, 30), "pending", 0, False)]
+
+
+async def test_a_title_without_the_stated_time_gets_it(make, local, now):
+    # The prompt asks the model to keep "(15:00)" in the title; a model that forgot it is covered by the code.
+    [c] = await make({"kind": "event", "title": "Встреча с Олегом", "when": {"time": "15:00"}, "lead": [30]}, now=now)
+    assert c.item.title == "Встреча с Олегом (15:00)"
+    assert c.occurrence.due_at == local(2026, 10, 6, 14, 30)
+    when = {"day": "FR", "time": "15:00"}
+    [c] = await make({"kind": "event", "title": "Встреча в 15", "when": when, "lead": [1440]}, now=now)
+    assert c.item.title == "Встреча в 15"  # names the hour already
+    [c] = await make({"kind": "event", "title": "Созвон", "when": when, "lead": [1440]}, now=now)
+    assert c.item.title == "Созвон (пт 9 окт 15:00)"  # notified the day before
+    [c] = await make({"kind": "event", "title": "ДР мамы", "when": {"day": "10-12"}, "lead": [1440]}, now=now)
+    assert (c.item.title, c.occurrence.due_at) == ("ДР мамы (пн 12 окт)", local(2026, 10, 11, 10, 0))
+    [c] = await make({"kind": "event", "title": "Обед", "when": {"time": "15:00"}}, now=now)
+    assert c.item.title == "Обед"  # no lead: the time is the item's own
+
+
+async def test_several_explicit_leads_give_several_notifications(make, reminders_of, local, now):
+    # "стоматолог в пятницу в 10:30, напомни за день и за час"
+    when = {"day": "FR", "time": "10:30"}
+    [c] = await make({"kind": "event", "title": "Стоматолог (10:30)", "when": when, "lead": [60, 1440]}, now=now)
+    assert c.item.lead_minutes == [1440, 60]
+    assert c.occurrence.due_at == local(2026, 10, 8, 10, 30)  # the first notification is the item's time
+    assert await reminders_of(c.occurrence.id) == [
+        (local(2026, 10, 8, 10, 30), "pending", 0, False),
+        (local(2026, 10, 9, 9, 30), "pending", 0, False),
+    ]
+
+
+async def test_deadline_keeps_both_notifications(make, reminders_of, local, now):
+    # "до пятницы сдать отчёт": the evening before at 19:00 and the day itself at 10:00; due is the deadline.
+    [c] = await make({"kind": "task", "title": "Сдать отчёт", "when": {"day": "FR", "role": "deadline"}}, now=now)
+    assert (c.occurrence.due_at, c.occurrence.precision) == (local(2026, 10, 9, 10, 0), "date")
+    assert [(f, s) for f, s, _, _ in await reminders_of(c.occurrence.id)] == [
+        (local(2026, 10, 8, 19, 0), "pending"),
+        (local(2026, 10, 9, 10, 0), "pending"),
+    ]
+    when = {"day": "FR", "time": "15:00", "role": "deadline"}
+    [c] = await make({"kind": "task", "title": "Сдать отчёт", "when": when}, now=now)
+    assert [f for f, *_ in await reminders_of(c.occurrence.id)] == [
+        local(2026, 10, 8, 19, 0),
+        local(2026, 10, 9, 15, 0),
+    ]
 
 
 async def test_note_without_time_has_no_occurrence(make, now):
@@ -139,7 +188,20 @@ async def test_recurring_weekly_creation(make, reminders_of, local, now):
     assert item.rec_dtstart_local == datetime(2026, 10, 6, 9, 0)
     assert c.occurrence.due_at == local(2026, 10, 12, 9, 0)
     assert c.occurrence.precision == "exact"
-    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 12, 8, 55), "pending", 5, False)]
+    assert await reminders_of(c.occurrence.id) == [(local(2026, 10, 12, 9, 0), "pending", 0, False)]
+
+
+async def test_recurring_with_a_lead_is_due_its_lead_earlier(session, make, reminders_of, local, now, prefs):
+    when = {"text": "каждый понедельник в 10", "time": "10:00"}
+    [c] = await make(
+        {"kind": "event", "title": "Планёрка", "rrule": "FREQ=WEEKLY;BYDAY=MO", "when": when, "lead": [15]}, now=now
+    )
+    assert (c.item.rec_time_local, c.item.lead_minutes, c.item.title) == (time(10, 0), [15], "Планёрка (10:00)")
+    assert c.occurrence.due_at == local(2026, 10, 12, 9, 45)
+    await items.mark_done(session, c.occurrence.id, local(2026, 10, 12, 9, 50), prefs)
+    nxt = await items.current_occurrence(session, c.item.id)
+    assert (nxt.due_at, nxt.status) == (local(2026, 10, 19, 9, 45), "open")  # next Monday, not 10:00 again
+    assert [f for f, *_ in await reminders_of(nxt.id)] == [local(2026, 10, 19, 9, 45)]
 
 
 async def test_invalid_rrule_creates_one_off_with_warning(make, now):
@@ -183,7 +245,7 @@ async def test_replace_items_for_raw(session, make, new_raw, reminders_of, local
 
     assert old.item.status == "deleted"
     assert old.item.deleted_at == now
-    assert await reminders_of(old.occurrence.id) == [(local(2026, 10, 7, 7, 55), "cancelled", 5, False)]
+    assert await reminders_of(old.occurrence.id) == [(local(2026, 10, 7, 8, 0), "cancelled", 0, False)]
     assert [c.item.raw_message_id for c in created] == [raw.id, raw.id]
     assert created[0].occurrence.due_at == local(2026, 10, 6, 20, 0)
     assert created[1].occurrence is None
@@ -209,7 +271,7 @@ async def test_snapshot_and_reads(session, make, local, now, prefs):
     assert (await items.get_item(session, c.item.id)).title == "Встреча"
     assert await items.get_item(session, 999_999) is None
     assert (await items.current_occurrence(session, c.item.id)).id == c.occurrence.id
-    assert [r.fire_at for r in await items.pending_reminders(session, c.occurrence.id)] == [local(2026, 10, 6, 15, 55)]
+    assert [r.fire_at for r in await items.pending_reminders(session, c.occurrence.id)] == [local(2026, 10, 6, 16, 0)]
 
 
 async def test_snapshot_of_note_without_due(session, make, prefs, now):

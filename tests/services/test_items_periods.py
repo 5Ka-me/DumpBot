@@ -114,7 +114,7 @@ async def test_explicit_date_turns_a_period_item_into_a_dated_one(session, prefs
 
     assert (result.occurrence.precision, result.occurrence.due_at) == ("exact", local(2026, 10, 7, 15, 0))
     assert await _period_columns(session, c.item.id) == (None, None, None, False)
-    assert await _pending(reminders_of, c.occurrence.id) == [(local(2026, 10, 7, 14, 55), False)]
+    assert await _pending(reminders_of, c.occurrence.id) == [(local(2026, 10, 7, 15, 0), False)]
 
 
 async def test_someday_edit_drops_dates_and_reminders_then_a_period_brings_them_back(
@@ -207,10 +207,12 @@ async def test_undone_inside_the_span_skips_the_first_day_reminder(session, pref
     assert await _pending(reminders_of, c.occurrence.id) == [(local(2026, 10, 16, 19, 0), True)]
 
 
-async def test_lead_change_keeps_the_span_reminders(session, prefs, make, now, local):
+async def test_a_lead_does_not_move_a_span(session, prefs, make, now, local):
+    # "напомни за 30 минут" on "на следующей неделе": a span's time is the bot's choice, it takes no lead.
     [c] = await make({"kind": "task", "title": "Шины", "when": NEXT_WEEK}, now=now)
-    result = await items.set_lead(session, c.item.id, [30], prefs, now)
+    result = await items.apply_patch(session, c.item.id, EditPatch(lead=[30]), prefs, now)
     await session.commit()
+    assert result.occurrence.due_at == local(2026, 10, 16, 19, 0)
     assert [r.fire_at for r in result.reminders] == [local(2026, 10, 12, 10, 0), local(2026, 10, 16, 19, 0)]
 
 

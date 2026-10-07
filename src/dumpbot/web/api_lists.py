@@ -43,6 +43,9 @@ QUESTION_MAX: Final = 1000
 SEARCH_MAX: Final = 200
 TAGS_MAX: Final = 10
 CURSOR_ID_DIGITS: Final = 18  # ids are bigint: more digits may not fit
+# Preferences that no longer exist, skipped in PATCH /api/settings (an older app saves its whole form):
+# lead_minutes — "remind N minutes before", dropped 2026-10-07 (an item's time is its notification time).
+RETIRED_PREFS: Final = frozenset({"lead_minutes"})
 
 BUDGET_TEXT: Final = "⛔ Бюджет на ИИ исчерпан — увеличь его в настройках или подожди следующего месяца."
 AI_UNAVAILABLE_TEXT: Final = "✍ ИИ сейчас недоступен — попробуй чуть позже."
@@ -336,7 +339,8 @@ async def get_settings(request: web.Request) -> web.Response:
 
 async def patch_settings(request: web.Request) -> web.Response:
     """Some preferences, validated like the bot's settings dialog (HH:MM, an IANA zone, minutes, dollars) and by
-    ``Prefs`` itself. Saved together; a raised budget releases the jobs that waited for it."""
+    ``Prefs`` itself. Saved together; a raised budget releases the jobs that waited for it. ``RETIRED_PREFS`` are
+    skipped."""
     body = await read_json(request)
     if not body:
         raise bad_request("Нечего менять")
@@ -344,7 +348,7 @@ async def patch_settings(request: web.Request) -> web.Response:
     now = clock.utcnow()
     async with ctx.sessionmaker() as session:
         prefs = await ctx.prefs(session)
-        changes = {name: _pref_value(prefs, name, value) for name, value in body.items()}
+        changes = {name: _pref_value(prefs, name, value) for name, value in body.items() if name not in RETIRED_PREFS}
         try:
             new = Prefs.model_validate({**prefs.model_dump(), **changes})
         except ValidationError as e:

@@ -1,8 +1,9 @@
-"""resolve_item: defaults, confirmation rules, recurrence (docs/architecture.md §4.1)."""
+"""resolve_item: defaults, confirmation rules, recurrence (docs/architecture.md §4.1). An item's time is its
+notification time (2026-10-07): no default lead, an explicit lead moves the due."""
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -91,31 +92,68 @@ def test_when_with_only_text_counts_as_no_time(now: datetime, prefs: Prefs):
 # --- with when ----------------------------------------------------------------------------------------------
 
 
-def test_exact_event_default_lead(now: datetime, prefs: Prefs):
+def test_exact_event_notifies_at_its_time(now: datetime, prefs: Prefs):
     res = resolve_item(item("event", when={"day": "FR", "time": "15:00"}), now, prefs, source="text")
     assert res.due_at == L(2026, 10, 9, 15, 0)
     assert res.precision == "exact"
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 9, 14, 55), lead_minutes=5, auto=False),)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 9, 15, 0), lead_minutes=0, auto=False),)
+    assert (res.leads, res.stated_at) == (None, None)
     assert res.due_at.tzinfo is UTC
     assert all(r.fire_at.tzinfo is UTC for r in res.reminders)
 
 
-def test_slot_gets_default_lead(now: datetime, prefs: Prefs):
+def test_no_default_lead_anywhere(now: datetime):
+    # A stored "lead_minutes" from before 2026-10-07 is ignored: "в обед" notifies at 13:00, not 12:55.
+    prefs = Prefs.from_stored({"tz": "Europe/Warsaw", "lead_minutes": 5})
+    for when in ({"time": "lunch"}, {"time": "15:00"}, {"day": "FR", "time": "09:30"}, {"at": "2026-10-23T23:30"}):
+        res = resolve_item(item("event", when=when), now, prefs, source="text")
+        assert [r.fire_at for r in res.reminders] == [res.due_at], when
+
+
+def test_slot_notifies_at_the_slot(now: datetime, prefs: Prefs):
     res = resolve_item(item("purchase", when={"text": "в обед", "time": "lunch"}), now, prefs, source="text")
     assert res.due_at == L(2026, 10, 7, 13, 0)
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 7, 12, 55), lead_minutes=5, auto=False),)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 7, 13, 0), lead_minutes=0, auto=False),)
 
 
-def test_item_lead_overrides_default(now: datetime, prefs: Prefs):
+def test_explicit_lead_moves_the_due(now: datetime, prefs: Prefs):
+    # "напомни за 30 минут до встречи в 15": the item's time is 14:30, 15:00 is the stated time (for the title).
+    res = resolve_item(item("event", when={"time": "15:00"}, lead=[30]), now, prefs, source="text")
+    assert (res.due_at, res.precision, res.leads, res.stated_at) == (
+        L(2026, 10, 6, 14, 30),
+        "exact",
+        (30,),
+        L(2026, 10, 6, 15, 0),
+    )
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 14, 30), lead_minutes=0, auto=False),)
+
+
+def test_several_leads_give_several_notifications(now: datetime, prefs: Prefs):
     res = resolve_item(item("event", when={"day": "FR", "time": "15:00"}, lead=[1440, 60]), now, prefs, source="text")
+    assert (res.due_at, res.leads, res.stated_at) == (L(2026, 10, 8, 15, 0), (1440, 60), L(2026, 10, 9, 15, 0))
     assert [(r.fire_at, r.lead_minutes) for r in res.reminders] == [
-        (L(2026, 10, 8, 15, 0), 1440),
-        (L(2026, 10, 9, 14, 0), 60),
+        (L(2026, 10, 8, 15, 0), 0),
+        (L(2026, 10, 9, 14, 0), 0),
     ]
 
 
-def test_remind_role_fires_at_time(now: datetime, prefs: Prefs):
-    res = resolve_item(item(when={"time": "15:00", "role": "remind"}), now, prefs, source="text")
+def test_a_lead_moment_already_past_is_dropped(prefs: Prefs):
+    # Said on Thu at 16:00: "за день и за час до встречи завтра в 15" — only "за час" is left.
+    now = L(2026, 10, 8, 16, 0)
+    res = resolve_item(item("event", when={"day": "+1", "time": "15:00"}, lead=[1440, 60]), now, prefs, source="text")
+    assert (res.due_at, res.leads) == (L(2026, 10, 9, 14, 0), (60,))
+    assert [r.fire_at for r in res.reminders] == [L(2026, 10, 9, 14, 0)]
+
+
+def test_every_lead_moment_past_notifies_at_the_stated_time(prefs: Prefs):
+    now = L(2026, 10, 6, 14, 45)
+    res = resolve_item(item("event", when={"time": "15:00"}, lead=[30]), now, prefs, source="text")
+    assert (res.due_at, res.leads, res.stated_at) == (L(2026, 10, 6, 15, 0), None, None)
+
+
+@pytest.mark.parametrize("role", ["remind", "event"])
+def test_remind_and_event_roles_both_fire_at_the_time(role: str, now: datetime, prefs: Prefs):
+    res = resolve_item(item(when={"time": "15:00", "role": role}), now, prefs, source="text")
     assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 15, 0), lead_minutes=0, auto=False),)
 
 
@@ -128,7 +166,8 @@ def test_relative(now: datetime, prefs: Prefs):
 def test_relative_with_stated_lead(now: datetime, prefs: Prefs):
     it = item("event", when={"text": "через 2 часа", "in_min": 120}, lead=[30])  # "…созвон, напомни за 30 минут"
     res = resolve_item(it, now, prefs, source="text")
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 15, 35), lead_minutes=30, auto=False),)
+    assert (res.due_at, res.leads) == (L(2026, 10, 6, 15, 35), (30,))
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 15, 35), lead_minutes=0, auto=False),)
 
 
 def test_date_precision_is_auto(now: datetime, prefs: Prefs):
@@ -154,7 +193,13 @@ def test_today_without_time_late_at_night_is_reminded_after_quiet_hours(prefs: P
 
 def test_date_precision_honours_whole_day_lead(now: datetime, prefs: Prefs):
     res = resolve_item(item("event", when={"day": "10-12"}, lead=[1440]), now, prefs, source="text")
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 11, 10, 0), lead_minutes=1440, auto=True),)
+    assert (res.due_at, res.stated_at) == (L(2026, 10, 11, 10, 0), L(2026, 10, 12, 10, 0))
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 11, 10, 0), lead_minutes=0, auto=True),)
+
+
+def test_date_precision_ignores_minute_leads(now: datetime, prefs: Prefs):
+    res = resolve_item(item("event", when={"day": "10-12"}, lead=[30]), now, prefs, source="text")
+    assert (res.due_at, res.leads) == (L(2026, 10, 12, 10, 0), None)
 
 
 def test_non_actionable_with_time_gets_reminder(now: datetime, prefs: Prefs):
@@ -165,7 +210,7 @@ def test_non_actionable_with_time_gets_reminder(now: datetime, prefs: Prefs):
 
 def test_explicit_time_in_quiet_hours_is_not_shifted(now: datetime, prefs: Prefs):
     res = resolve_item(item("event", when={"time": "23:30"}), now, prefs, source="text")
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 23, 25), lead_minutes=5, auto=False),)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 23, 30), lead_minutes=0, auto=False),)
 
 
 def test_bare_date_in_quiet_hours_is_shifted(now: datetime):
@@ -189,11 +234,11 @@ def test_fallback_at(now: datetime, prefs: Prefs):
     assert res.reminders == (ReminderPlan(fire_at=L(2026, 11, 27, 10, 0), lead_minutes=0, auto=True),)
 
 
-def test_at_with_time_keeps_lead_and_ignores_quiet_hours(now: datetime, prefs: Prefs):
+def test_at_with_time_ignores_quiet_hours(now: datetime, prefs: Prefs):
     # "через две недели в пятницу в 23:30 поезд": an explicit time, sent as usual even in quiet hours.
     res = resolve_item(item("event", when={"at": "2026-10-23T23:30"}), now, prefs, source="text")
     assert (res.due_at, res.precision, res.needs_confirm) == (L(2026, 10, 23, 23, 30), "exact", True)
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 23, 23, 25), lead_minutes=5, auto=False),)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 23, 23, 30), lead_minutes=0, auto=False),)
 
 
 def test_bad_date_for_actionable_falls_back_to_default(now: datetime, prefs: Prefs):
@@ -247,8 +292,24 @@ def test_weekly_with_time(now: datetime, prefs: Prefs):
     assert res.rec_dtstart_local == datetime(2026, 10, 6, 9, 0)
     assert res.rec_dtstart_local.tzinfo is None
     assert (res.due_at, res.precision) == (L(2026, 10, 12, 9, 0), "exact")
-    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 12, 8, 55), lead_minutes=5, auto=False),)
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 12, 9, 0), lead_minutes=0, auto=False),)
     assert (res.needs_confirm, res.warnings) == (False, ())
+
+
+def test_weekly_with_a_lead_is_due_its_lead_earlier(now: datetime, prefs: Prefs):
+    # "каждый понедельник в 10 планёрка, напомни за 15 минут": the rule keeps 10:00, each instance is due 09:45.
+    it = item(when={"text": "каждый понедельник в 10", "time": "10:00"}, rrule="FREQ=WEEKLY;BYDAY=MO", lead=[15])
+    res = resolve_item(it, now, prefs, source="text")
+    assert (res.rec_time_local, res.leads) == (time(10, 0), (15,))
+    assert (res.due_at, res.stated_at) == (L(2026, 10, 12, 9, 45), L(2026, 10, 12, 10, 0))
+    assert [r.fire_at for r in res.reminders] == [L(2026, 10, 12, 9, 45)]
+
+
+def test_daily_series_skips_today_when_its_lead_moment_has_passed(now: datetime, prefs: Prefs):
+    # 14:05: "каждый день в 14:30, напомни за час" — today's 13:30 is gone, tomorrow 13:30 is the first.
+    it = item(when={"text": "каждый день в 14:30", "time": "14:30"}, rrule="FREQ=DAILY", lead=[60])
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.due_at == L(2026, 10, 7, 13, 30)
 
 
 def test_count_is_not_used_up_by_a_time_already_past_today(now: datetime, prefs: Prefs):
@@ -371,4 +432,4 @@ def test_recurring_due_across_dst(prefs: Prefs):
     it = item(when={"time": "09:00"}, rrule="FREQ=WEEKLY;BYDAY=MO")
     res = resolve_item(it, now, prefs, source="text")
     assert res.due_at == datetime(2026, 10, 26, 8, 0, tzinfo=UTC)  # 09:00 CET
-    assert res.reminders[0].fire_at == res.due_at - timedelta(minutes=5)
+    assert res.reminders[0].fire_at == res.due_at

@@ -72,7 +72,7 @@ async def test_task_message_gets_card_and_reaction(
     assert (item.ai_model, item.prompt_version) == ("fake-model", "v1")
     [occ] = await occurrences_of(item.id)
     assert occ.due_at == local(2026, 10, 7, 15, 0)
-    assert [r.fire_at for r in await reminders_of(occ.id)] == [local(2026, 10, 7, 14, 55)]
+    assert [r.fire_at for r in await reminders_of(occ.id)] == [local(2026, 10, 7, 15, 0)]  # no "за 5 минут"
 
     [card] = bot.sent
     assert "Созвон с Олегом" in card["text"]
@@ -618,7 +618,7 @@ async def test_edit_time_applies_only_the_time(ctx, fake_ai, bot, make_items, t0
     item = await get(Item, created.item.id)
     assert (item.title, item.kind, item.status, item.lead_minutes) == ("Отчёт", "task", "open", [30])
     [occ] = [o for o in await occurrences_of(created.item.id) if o.status == "open"]
-    assert occ.due_at == local(2026, 10, 9, 18, 0)
+    assert occ.due_at == local(2026, 10, 9, 17, 30)  # "за 30 минут" before Friday 18:00
     assert bot.reactions == [(558, "👌")]
 
 

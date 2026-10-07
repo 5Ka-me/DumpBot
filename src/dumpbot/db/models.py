@@ -135,7 +135,9 @@ class Item(Base):
     status: Mapped[str] = mapped_column(String(16), server_default="open", default="open")
 
     when_spec: Mapped[dict[str, Any] | None] = mapped_column(JSONB)  # the LLM's When, as returned
-    lead_minutes: Mapped[list[int] | None] = mapped_column(ARRAY(Integer))  # per-item override
+    # Explicit leads still in effect ("за день и за час" -> [1440, 60]): the item's time (its notification time) is
+    # the stated time minus the largest, the others notify later; NULL: no lead; [] = reminders off (🔕).
+    lead_minutes: Mapped[list[int] | None] = mapped_column(ARRAY(Integer))
 
     # Recurrence (RFC 5545 RRULE without DTSTART, expanded in local wall time of rec_tz)
     rrule: Mapped[str | None] = mapped_column(Text)
@@ -218,7 +220,7 @@ class Reminder(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     occurrence_id: Mapped[int] = mapped_column(ForeignKey("occurrences.id", ondelete="CASCADE"))
     fire_at: Mapped[datetime] = mapped_column(TZ)
-    lead_minutes: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+    lead_minutes: Mapped[int] = mapped_column(Integer, server_default="0", default=0)  # before due (0: at or after)
     auto: Mapped[bool] = mapped_column(Boolean, server_default=sa_text("false"), default=False)  # obeys quiet hours
     # pending | sending | sent | missed | cancelled | failed
     status: Mapped[str] = mapped_column(String(16), server_default="pending", default="pending")

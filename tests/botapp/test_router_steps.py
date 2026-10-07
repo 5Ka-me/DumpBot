@@ -104,7 +104,7 @@ async def test_a_step_done_from_its_reminder_redraws_the_task_card(feed, updates
     tg.clear()
     await feed(updates.callback(OccCb(a="undone", id=occ.id), message_id=901))
     reminder, card = tg.edits
-    assert reminder.text.split("\n")[2] == "↳ шаг из «Переезд»"
+    assert reminder.text.split("\n")[1] == "↳ шаг из «Переезд»"
     assert "☐ 1. Заказать машину" in card.text and await status(seed, parent.item.id) == "open"
 
 

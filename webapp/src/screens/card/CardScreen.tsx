@@ -1,17 +1,17 @@
 /**
  * «Карточка»: everything about one item and every edit of the bot — title, details, category, tags, the time (by
- * words through the AI or from the picker, a span, «когда-нибудь»), «напомнить за», no reminders, snooze, done /
- * not done, delete / restore, stop repeating, the checklist with «🪄 Разбить на шаги», related items, the source.
+ * words through the AI or from the picker, a span, «когда-нибудь»), no reminders, snooze, done / not done, delete /
+ * restore, stop repeating, the checklist with «🪄 Разбить на шаги», related items, the source. The item's time is its
+ * notification time: the picker sets it, a snooze moves it, «за час до…» goes by words.
  * An unsaved title / details is a draft (lib/drafts): it comes back after an expired session.
  */
 import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { ApiError, api } from "../../api";
 import type { ItemDetail, ItemPatch, ItemResponse, Kind, PeriodValue, Step, StepPatch, StepResponse } from "../../api/types";
 import { AutoTextarea } from "../../components/AutoTextarea";
-import { Sheet } from "../../components/Sheet";
 import { Chip, Empty, ErrorBox, Loading, ScreenHeader, Section, Spinner } from "../../components/ui";
 import { clearDraft, useDraft } from "../../lib/drafts";
-import { fmtDateTime, fmtStamp, leadLabel } from "../../lib/format";
+import { fmtStamp } from "../../lib/format";
 import { ACTIONABLE, SOURCE_LABELS, kindInfo } from "../../lib/kinds";
 import { useMainButton } from "../../lib/mainButton";
 import { useKinds, useTz } from "../../lib/me";
@@ -26,32 +26,12 @@ import { TagsEditor } from "./TagsEditor";
 import { TimeSheet } from "./TimeSheet";
 import { useJob, useSplitPolling } from "./useJob";
 
-export const LEAD_CHOICES = [0, 5, 15, 30, 60, 1440] as const;
 export const SNOOZE_CHOICES: { label: string; minutes: number | null }[] = [
   { label: "15 мин", minutes: 15 },
   { label: "1 час", minutes: 60 },
   { label: "3 часа", minutes: 180 },
   { label: "завтра", minutes: null },
 ];
-const LEAD_MAX = 3;
-
-/** The new "напомнить за" after tapping `minutes` (null: back to the settings' default). */
-export function nextLead(current: number[] | null, minutes: number): number[] | null {
-  if (!current || current.length === 0) return [minutes];
-  if (current.includes(minutes)) {
-    const rest = current.filter((m) => m !== minutes);
-    return rest.length ? rest : null;
-  }
-  return [...current, minutes].sort((a, b) => b - a).slice(0, LEAD_MAX);
-}
-
-/** "как в настройках", "выключено", "за 1 ч, за 15 мин". */
-export function leadSummary(item: Pick<ItemDetail, "lead_minutes" | "reminders_off">): string {
-  if (item.reminders_off) return "🔕 выключено";
-  if (!item.lead_minutes?.length) return "как в настройках";
-  return item.lead_minutes.map(leadLabel).join(", ");
-}
-
 /** The item can be done / not done in the card. */
 export function canBeDone(item: ItemDetail): boolean {
   return item.status !== "deleted" && (ACTIONABLE.has(item.kind) || item.occurrence !== null);
@@ -79,7 +59,6 @@ export function CardScreen({ id }: { id: number }) {
   const [busy, setBusy] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [timeOpen, setTimeOpen] = useState(false);
-  const [leadOpen, setLeadOpen] = useState(false);
   const draftKey = `card:${id}`;
   const [draft, setDraft] = useDraft<{ title: string; details: string }>(draftKey);
   const { job, start, waitText } = useJob((jobWarnings) => {
@@ -173,14 +152,12 @@ export function CardScreen({ id }: { id: number }) {
   const done = itemDone(item);
   const locked = deleted || busy !== null;
   const occOpen = item.occurrence?.status === "open" && !item.someday;
-  const hasTime = item.occurrence !== null && !item.someday;
   const pendingReminders = item.reminders.filter((r) => r.status === "pending");
   const sourceText = item.source.text && item.source.text.trim() !== item.title.trim() ? item.source.text : null;
   const allWarnings = [...(item.needs_confirm ? ["🤔 Проверь время — я не уверен, что понял правильно."] : []), ...warnings];
 
   const setKind = (kind: Kind) => run("kind", () => api.patchItem(id, { kind }));
   const setTags = (tags: string[]) => run("tags", () => api.patchItem(id, { tags }));
-  const setLead = (lead: number[] | null) => run("lead", () => api.patchItem(id, { lead }));
   const setPeriod = async (period: PeriodValue) => {
     if (await run("time", () => api.patchItem(id, { period }))) setTimeOpen(false);
   };
@@ -286,21 +263,16 @@ export function CardScreen({ id }: { id: number }) {
           <div className="row row--static">
             <span className="when-line">{item.when_text ?? (canBeDone(item) ? "Без срока" : "Без времени")}</span>
           </div>
+          {item.reminders_off && item.occurrence !== null && !item.someday && (
+            <div className="row row--static">
+              <span className="field-hint">Напоминания выключены — новое время включит их снова.</span>
+            </div>
+          )}
           {item.repeat_text && (
             <div className="row row--static">
               <span>
                 🔁 {item.repeat_text}
                 {!item.rec_active && <span className="field-hint"> · повтор остановлен</span>}
-              </span>
-            </div>
-          )}
-          {pendingReminders.length > 1 && (
-            <div className="row row--static">
-              <span className="field-hint">
-                🔔{" "}
-                {pendingReminders
-                  .map((r) => `${fmtDateTime(r.fire_at, tz)}${r.auto ? " (авто)" : ""}`)
-                  .join(", ")}
               </span>
             </div>
           )}
@@ -323,7 +295,7 @@ export function CardScreen({ id }: { id: number }) {
           </div>
           {occOpen && (
             <div className="field-group field-group--inset">
-              <span className="field-label">⏰ Отложить</span>
+              <span className="field-label">⏰ Отложить — запись переедет на это время</span>
               <div className="chips">
                 {SNOOZE_CHOICES.map((c) => (
                   <Chip key={c.label} onClick={() => snooze(c.minutes)} disabled={locked}>
@@ -332,20 +304,6 @@ export function CardScreen({ id }: { id: number }) {
                 ))}
               </div>
             </div>
-          )}
-          {hasTime && !done && (
-            <button type="button" className="link-row" disabled={locked} onClick={() => setLeadOpen(true)}>
-              <span className="row-emoji" aria-hidden="true">
-                ⏱
-              </span>
-              <span className="link-row-text">
-                <span>Напомнить</span>
-                <span className="field-hint">{leadSummary(item)}</span>
-              </span>
-              <span className="link-row-chevron" aria-hidden="true">
-                ›
-              </span>
-            </button>
           )}
           {(pendingReminders.length > 0 || item.rec_active) && (
             <div className="button-row">
@@ -467,22 +425,6 @@ export function CardScreen({ id }: { id: number }) {
         {item.done_at ? ` · сделано ${fmtStamp(item.done_at, tz)}` : ""}
       </p>
 
-      <Sheet open={leadOpen} title="⏱ Напомнить" onClose={() => setLeadOpen(false)}>
-        <div className="field-group">
-          {item.reminders_off && <span className="field-hint">Напоминания выключены — выбери, когда напомнить, чтобы включить.</span>}
-          <div className="chips">
-            <Chip pressed={item.lead_minutes === null} onClick={() => setLead(null)} disabled={locked}>
-              как в настройках
-            </Chip>
-            {LEAD_CHOICES.map((m) => (
-              <Chip key={m} pressed={Boolean(item.lead_minutes?.includes(m))} onClick={() => setLead(nextLead(item.lead_minutes, m))} disabled={locked}>
-                {leadLabel(m)}
-              </Chip>
-            ))}
-          </div>
-          <span className="field-hint">До трёх вариантов сразу. Для даты без времени и «на этой неделе» время выбирает бот.</span>
-        </div>
-      </Sheet>
       <TimeSheet
         open={timeOpen}
         item={item}

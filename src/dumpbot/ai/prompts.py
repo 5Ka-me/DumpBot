@@ -12,6 +12,10 @@ v4: a deadline by a season / month ("к лету", "до октября") is the
 period: the code reads period + deadline as "до конца …", the end of the span.
 v5: hours 13-23 and 0 are never asked about (the code also drops such an AM/PM question); ``related`` only for the
 same specific subject, never for shared verbs, time words or the same kind.
+v6 (2026-10-07, docs/requirements.md): an item's time is its notification time. ``lead`` = notify N minutes before
+the stated time ("напомни за 30 минут до встречи в 15" → time 15:00, lead [30]: notified at 14:30) and the stated
+time stays in the title ("Встреча (15:00)"); several leads only when asked ("за день и за час"). Role remind no
+longer differs from event (both notify at the time), so the prompt no longer asks for it.
 """
 
 from __future__ import annotations
@@ -22,7 +26,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v5"
+PROMPT_VERSION = "v6"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -45,12 +49,12 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
         },
     ),
     (
-        "напомни за 30 минут до встречи в пятницу в 15",
+        "напомни за 30 минут до встречи с Олегом в пятницу в 15",
         {
             "items": [
                 {
                     "kind": "event",
-                    "title": "Встреча",
+                    "title": "Встреча с Олегом (15:00)",
                     "when": {"text": "в пятницу в 15", "day": "FR", "time": "15:00"},
                     "lead": [30],
                 }
@@ -284,10 +288,11 @@ night (ночью, перед сном, at night).
 conf low, ask with both options. Hours 13-23 and 0 ("в 17", "00:15") are 24h, never ambiguous: never ask.
 - in_min only for "через N минут/часов" (2 часа → 120); "через 3 дня" → day +3.
 - at: local YYYY-MM-DD[THH:MM] ONLY if day/time can't express it; use CAL.
-- role: remind = the time to ping ("напомни в 15"); deadline = до/к/by ("до пятницы" → day FR; a season/month \
-"к лету", "до октября" → day = its first day MM-DD: 06-01, 10-01; only "до конца недели/месяца" → period \
-this_week/this_month); else event.
-- lead, only if stated: за 30 минут → [30], за час → [60], за день → [1440].
+- The time is when the owner is notified ("встреча в 15" → 15:00), never earlier unless asked.
+- role: deadline = до/к/by ("до пятницы" → day FR; a season/month "к лету", "до октября" → day = its first day \
+MM-DD: 06-01, 10-01; only "до конца недели/месяца" → period this_week/this_month); else omit (event).
+- lead, only if asked to notify before the stated time: за 30 минут → [30], за час → [60], за день и за час → \
+[1440, 60]; when = the stated time, also kept in the title: "Встреча с Олегом (15:00)".
 - rrule only for explicit repetition (каждый, по понедельникам, every): RFC 5545 without DTSTART; time of day \
 still in when.time.
 - Past facts (звонил, был) get no when; no time mentioned → no when.
@@ -304,8 +309,9 @@ range: today|tomorrow|yesterday|this_week|next_week|last_week|this_month|last_mo
 |YYYY-MM-DD..YYYY-MM-DD
 
 edit = {{target (which item, only without REPLYING TO ITEM), action: update|done|undone|delete|no_reminder\
-|stop_recurrence|split (разбей на шаги), title, kind, tags_add, tags_remove, when (the new time; if only the time \
-changes, keep the date of due_local as day YYYY-MM-DD), rrule, lead}}
+|stop_recurrence|split (разбей на шаги), title, kind, tags_add, tags_remove, when (the new time to notify; if only \
+the time changes, keep the date of due_local as day YYYY-MM-DD), rrule, lead ("напомни за час": notify that long \
+before the item's time; with a new when: before it)}}
 
 EXAMPLES (NOW 2026-10-06T14:05 Tue)
 {_render_examples()}

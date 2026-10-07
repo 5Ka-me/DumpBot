@@ -1,7 +1,8 @@
 """Settings menu (``SetCb``, keys documented in ``bot.views``) and the typed-value dialog.
 
 Buttons change a preference at once; ``SetCb("ask", field)`` turns the menu into a prompt and the answer
-(``common.is_answer``) is validated locally (``HH:MM``, IANA timezone, minutes, dollars). After a change: save
+(``common.is_answer``) is validated locally (``HH:MM``, IANA timezone, dollars). The removed "⏱ Напоминать за"
+(``lead`` keys of old menus) answers "Кнопка устарела". After a change: save
 prefs, wake the scheduler, re-render the submenu. Raising the budget also makes jobs deferred for the budget runnable
 now. Existing reminders are not re-planned (the menus say so).
 
@@ -45,13 +46,11 @@ log = logging.getLogger(__name__)
 
 SAVED: Final = "✅ Сохранено"
 INVALID: Final = "Неверное значение"
-MAX_LEAD_MINUTES: Final = 10080  # Prefs.lead_minutes upper bound
 
 # What the user is told when a typed value does not parse (by ASK_FIELDS kind).
 ERRORS: Final[dict[str, str]] = {
     "time": "Нужно время в формате ЧЧ:ММ, например 09:30.",
     "tz": "Не знаю такой часовой пояс. Нужно название IANA, например Europe/Warsaw.",
-    "minutes": f"Нужно целое число минут от 0 до {MAX_LEAD_MINUTES}, например 15.",
     "money": "Нужна сумма в долларах (0 или больше), например 5 или 7.5.",
 }
 RETRY: Final = " Попробуй ещё раз или /cancel."
@@ -73,10 +72,6 @@ def make_router() -> Router:
 
 def _set_tz(p: Prefs, v: str) -> None:
     p.tz = v  # validated by Prefs (IANA name)
-
-
-def _set_lead(p: Prefs, v: str) -> None:
-    p.lead_minutes = int(v)
 
 
 def _toggle_quiet(p: Prefs, v: str) -> None:
@@ -108,7 +103,6 @@ def _set_budget(p: Prefs, v: str) -> None:
 
 CHANGES: Final[dict[str, Callable[[Prefs, str], None]]] = {
     "tz": _set_tz,
-    "lead": _set_lead,
     "quiet_toggle": _toggle_quiet,
     "digest_toggle": _toggle_digest,
     "stt": _set_stt,
@@ -225,16 +219,11 @@ async def _leave(message: Message, ctx: AppContext, state: FSMContext) -> NoRetu
 
 
 def parse_value(kind: str, text: str) -> Any:
-    """Typed value for an ``ASK_FIELDS`` kind (time | tz | minutes | money); ValueError when it does not parse."""
+    """Typed value for an ``ASK_FIELDS`` kind (time | tz | money); ValueError when it does not parse."""
     if kind == "time":
         return parse_time(text)
     if kind == "tz":
         return parse_tz(text)
-    if kind == "minutes":
-        minutes = int(text.strip())
-        if not 0 <= minutes <= MAX_LEAD_MINUTES:
-            raise ValueError(f"minutes out of range: {minutes}")
-        return minutes
     if kind == "money":
         return parse_money(text)
     raise ValueError(f"unknown field kind: {kind}")

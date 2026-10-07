@@ -14,7 +14,8 @@ async def test_get_settings_lists_every_preference(api) -> None:
     assert set(data["prefs"]) == set(Prefs.model_fields)
     prefs = data["prefs"]
     assert prefs["tz"] == "Europe/Warsaw" and prefs["slot_lunch"] == "13:00" and prefs["quiet_start"] == "23:00"
-    assert prefs["lead_minutes"] == 5 and prefs["budget_usd"] == 5.0 and prefs["stt_language"] == "ru"
+    assert "lead_minutes" not in prefs  # no default lead (2026-10-07)
+    assert prefs["budget_usd"] == 5.0 and prefs["stt_language"] == "ru"
     assert prefs["stt_mode"] == "auto" and prefs["quiet_enabled"] is True
     assert data["local_stt"] is False
 
@@ -25,7 +26,7 @@ async def test_patch_settings(api, ctx) -> None:
         "tz": "Europe/Berlin",
         "slot_lunch": "12.30",
         "task_default_time": "8:05",
-        "lead_minutes": 15,
+        "lead_minutes": 15,  # an older app still sends the retired preference: skipped, not refused
         "quiet_enabled": False,
         "budget_usd": 7.567,
         "stt_language": "en",
@@ -36,7 +37,7 @@ async def test_patch_settings(api, ctx) -> None:
     assert reply.status == 200, reply.data
     prefs = reply.data["prefs"]
     assert prefs["tz"] == "Europe/Berlin" and prefs["slot_lunch"] == "12:30" and prefs["task_default_time"] == "08:05"
-    assert prefs["lead_minutes"] == 15 and prefs["quiet_enabled"] is False and prefs["budget_usd"] == 7.57
+    assert "lead_minutes" not in prefs and prefs["quiet_enabled"] is False and prefs["budget_usd"] == 7.57
     assert prefs["stt_language"] == "en" and prefs["stt_mode"] == "local" and prefs["soon_days"] == 3
     assert ctx.scheduler_wakeup.is_set()
     assert (await api.get("/api/settings")).data["prefs"] == prefs
@@ -48,9 +49,8 @@ async def test_patch_settings_validation(api) -> None:
         ({"tz": "Mars/Base"}, "tz"),
         ({"slot_lunch": "25:00"}, "slot_lunch"),
         ({"slot_lunch": 1300}, "slot_lunch"),
-        ({"lead_minutes": 10081}, "lead_minutes"),
-        ({"lead_minutes": "5"}, "lead_minutes"),
-        ({"lead_minutes": True}, "lead_minutes"),
+        ({"soon_days": "2"}, "soon_days"),
+        ({"soon_days": True}, "soon_days"),
         ({"budget_usd": -1}, "budget_usd"),
         ({"budget_usd": "5"}, "budget_usd"),
         ({"quiet_enabled": "yes"}, "quiet_enabled"),
@@ -67,9 +67,9 @@ async def test_patch_settings_validation(api) -> None:
         assert reply.data["error"]["field"] == field, body
     assert (await api.patch("/api/settings", {})).status == 400
     # nothing half-saved
-    reply = await api.patch("/api/settings", {"lead_minutes": 30, "tz": "Mars/Base"})
+    reply = await api.patch("/api/settings", {"soon_days": 5, "tz": "Mars/Base"})
     assert reply.status == 400
-    assert (await api.get("/api/settings")).data["prefs"]["lead_minutes"] == 5
+    assert (await api.get("/api/settings")).data["prefs"]["soon_days"] == 2
 
 
 async def test_raising_the_budget_releases_deferred_jobs(api, sessionmaker, frozen, ctx) -> None:

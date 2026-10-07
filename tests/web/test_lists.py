@@ -101,7 +101,7 @@ async def test_move_not_done_to_tomorrow(api, make_items, db, ctx) -> None:
     assert due[call.item.id] == (local(7, 9), "open") and due[late.item.id] == (local(7, 12), "open")
     assert due[ahead.item.id] == (local(6, 15), "open")
     fires = await db(select(Reminder.fire_at).where(Reminder.status == "pending").order_by(Reminder.fire_at))
-    assert local(7, 8, 55) in fires and local(7, 11, 55) in fires
+    assert local(7, 9) in fires and local(7, 12) in fires
     today = (await api.get("/api/today")).data
     assert [r["title"] for r in today["open"]] == ["Созвон"] and today["overdue"] == []
 

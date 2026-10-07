@@ -26,10 +26,10 @@ def test_extraction_schema_builds():
 async def test_schema_and_prefs_roundtrip(session):
     p = await load_prefs(session, 42)
     assert p.tz == "Europe/Warsaw"
-    p.lead_minutes = 10
+    p.soon_days = 3
     await save_prefs(session, 42, p)
     await session.commit()
     p2 = await load_prefs(session, 42)
-    assert p2.lead_minutes == 10
+    assert p2.soon_days == 3
     r = await session.execute(text("select to_tsvector('russian', 'Купить наушники buying headphones')"))
     assert "наушник" in r.scalar_one()

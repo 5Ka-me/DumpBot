@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any, Final
 from aiohttp import web
 
 from dumpbot import clock
-from dumpbot.ai.schemas import MAX_LEAD_MINUTES, PERIOD_RE, EditPatch, When
+from dumpbot.ai.schemas import PERIOD_RE, EditPatch, When
 from dumpbot.bot import cards, views
 from dumpbot.db.models import Item, Occurrence
 from dumpbot.domain.fmt import fmt_dt
@@ -38,7 +38,6 @@ TITLE_MAX: Final = 200
 STEP_TITLE_MAX: Final = 120
 DETAILS_MAX: Final = 4000
 TAGS_MAX: Final = 20
-LEAD_MAX: Final = 3
 WHEN_TEXT_MAX: Final = 300
 SNOOZE_MAX: Final = 10080  # a week
 _DUE_LOCAL_RE: Final = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")  # fullmatch
@@ -144,7 +143,8 @@ async def get_item(request: web.Request) -> web.Response:
 
 
 async def patch_item(request: web.Request) -> web.Response:
-    """``{title?, details?, kind?, tags?, lead?, period?, someday?}`` — validated first, applied together."""
+    """``{title?, details?, kind?, tags?, period?, someday?}`` — validated first, applied together. The item's time is
+    its notification time: there is no "напомнить за" any more (``lead`` is refused like any unknown field)."""
     edits = _item_edits(await read_json(request))
 
     async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
@@ -153,7 +153,7 @@ async def patch_item(request: web.Request) -> web.Response:
     return await _change(request, op)
 
 
-ITEM_FIELDS: Final = ("title", "details", "tags", "kind", "lead", "period", "someday")
+ITEM_FIELDS: Final = ("title", "details", "tags", "kind", "period", "someday")
 
 
 def _item_edits(body: dict[str, Any]) -> dict[str, Any]:
@@ -176,8 +176,6 @@ def _item_edits(body: dict[str, Any]) -> dict[str, Any]:
         raise bad_request(f"Теги — список строк, не больше {TAGS_MAX}", "tags")
     if "kind" in body and body["kind"] not in KINDS:
         raise bad_request("Неизвестная категория", "kind")
-    if "lead" in body:
-        edits["lead"] = _lead(body["lead"])
     period = body.get("period", "someday")
     if not isinstance(period, str) or re.fullmatch(PERIOD_RE, period) is None:  # `$` alone lets "soon\n" through
         raise bad_request("Срок: this_week, next_week, this_month, next_month, ГГГГ-ММ, сезон, soon, someday", "period")
@@ -199,8 +197,6 @@ async def _apply_edits(
         await items.set_tags(session, item.id, edits["tags"])
     if "kind" in edits:  # apply_patch, not set_kind: a new task gets its default reminder, like the bot's menu
         warnings += (await items.apply_patch(session, item.id, EditPatch(kind=edits["kind"]), prefs, now)).warnings
-    if "lead" in edits:
-        await items.set_lead(session, item.id, edits["lead"], prefs, now)
     period = edits.get("period") or ("someday" if edits.get("someday") is True else None)
     if period is not None:
         patch = EditPatch(when=_period_when(period))
@@ -217,17 +213,6 @@ def _title(value: Any, limit: int) -> str:
     return title
 
 
-def _lead(value: Any) -> list[int]:
-    """Minutes before the time ([] or null: back to the default from the settings)."""
-    if value is None:
-        return []
-    ok = isinstance(value, list) and len(value) <= LEAD_MAX
-    ok = ok and all(isinstance(m, int) and not isinstance(m, bool) and 0 <= m <= MAX_LEAD_MINUTES for m in value)
-    if not ok:
-        raise bad_request(f"Напомнить за — до {LEAD_MAX} значений в минутах, от 0 до {MAX_LEAD_MINUTES}", "lead")
-    return list(value)
-
-
 def _role(item: Item) -> str:
     return str((item.when_spec or {}).get("role") or "event")
 
@@ -239,8 +224,9 @@ def _period_when(period: str) -> When:
 
 
 def _due_when(item: Item, value: Any) -> When:
-    """``due_local`` from a date / time picker: "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" (local time), no AI. Years
-    outside ``DUE_YEARS`` are refused: 0001-01-01 00:00 local would not fit a datetime once moved to UTC."""
+    """``due_local`` from a date / time picker: "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" (local time), no AI — the item's
+    new notification time (its leads go). Years outside ``DUE_YEARS`` are refused: 0001-01-01 00:00 local would not
+    fit a datetime once moved to UTC."""
     match = _DUE_LOCAL_RE.fullmatch(value) if isinstance(value, str) else None
     try:
         if match is None or not DUE_YEARS[0] <= datetime.fromisoformat(value).year <= DUE_YEARS[1]:
@@ -378,7 +364,8 @@ async def stop_recurrence(request: web.Request) -> web.Response:
 
 
 async def snooze(request: web.Request) -> web.Response:
-    """``{minutes}`` (1…10080) or ``{tomorrow: true}``: one more reminder of the current open occurrence."""
+    """``{minutes}`` (1…10080) or ``{tomorrow: true}``: the current open occurrence moves to that time (one reminder
+    then), like the reminder's buttons (``items.snooze``)."""
     body = await read_json(request)
     minutes, tomorrow = body.get("minutes"), body.get("tomorrow") is True
     valid_minutes = isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= SNOOZE_MAX

@@ -123,6 +123,22 @@ describe("with the mock API", () => {
     await waitFor(() => expect(screen.queryByRole("textbox", { name: "Название" })).toBeNull());
   });
 
+  it("shows the item's notification time, no «напомнить за», and a snooze moves the time", async () => {
+    const { api } = useMockApi();
+    render(<App outside={false} />);
+    await screen.findByText("Позвонить в банк");
+    fireEvent.click(screen.getByRole("button", { name: "Задачи" }));
+    // "стоматолог завтра в 10:30, напомни за час и за 15 минут": notified at 09:30 and 10:15
+    fireEvent.click(await screen.findByText("Стоматолог (10:30)"));
+    expect(await screen.findByText("🔔 завтра 09:30 · завтра 10:15")).toBeInTheDocument();
+    expect(screen.queryByText("Напомнить")).toBeNull();
+    expect(screen.queryByText(/как в настройках/)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "завтра" })); // tomorrow at its time of day: one notification
+    expect(await screen.findByText("⏰ Напомню завтра 09:30")).toBeInTheDocument();
+    expect(await screen.findByText("🔔 завтра 09:30")).toBeInTheDocument();
+    expect(api.db.get(2)!.later).toEqual([]);
+  });
+
   it("renames an item with the main button", async () => {
     const { api } = useMockApi();
     render(<App outside={false} />);

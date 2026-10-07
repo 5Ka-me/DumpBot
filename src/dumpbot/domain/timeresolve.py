@@ -3,6 +3,11 @@
 The LLM only describes time; everything here is deterministic and uses the user's prefs (slots, default times,
 timezone). ``now`` is converted to ``prefs.zone``; dates are computed on the local calendar, then stored in UTC.
 
+An item's time is its notification time (docs/requirements.md, 2026-10-07): "встреча в 15" is due — and notifies —
+at 15:00, with no default lead. An explicit lead moves it: "напомни за 30 минут до встречи в 15" is due at 14:30
+(``notify_due``); several ("за день и за час") give the occurrence several notifications, the first of them is its
+due. A deadline keeps its own time and reminds the evening before too.
+
 Fuzzy spans (docs/features/iteration-2.md §A): ``When.period`` names a calendar week / month / season, "на днях"
 (soon) or "когда-нибудь" (someday). A period is due at its reminder (2) (last working day at ``task_default_time``)
 and also reminds on the morning of its first day when it has not started yet; deadlines (role ``deadline``) remind
@@ -12,7 +17,7 @@ the evening before as well.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from typing import TYPE_CHECKING, Final
@@ -37,13 +42,18 @@ __all__ = [
     "WARN_PAST_DATE",
     "ReminderPlan",
     "Resolution",
-    "lead_applies",
+    "effective_leads",
+    "lead_shift",
     "localize",
+    "next_series_due",
+    "notify_due",
     "period_bounds",
     "plan_reminders",
     "resolve_item",
     "resolve_range",
     "resolve_when",
+    "shift_back",
+    "shift_forward",
     "tomorrow",
     "when_period",
 ]
@@ -65,7 +75,11 @@ _RANGE_N_RE = re.compile(r"^(past|next):(\d{1,3})$")
 _EARLY_HOUR_OK_RE = re.compile(r"утр|ноч|(?<![a-z])a\.?\s?m\b\.?", re.IGNORECASE)
 # Sources whose dates are often someone else's (screenshots, forwarded posts) -> always confirm.
 _CONFIRM_SOURCES: Final[frozenset[str]] = frozenset({"photo", "forward"})
-_LEAD_PRECISIONS: Final[frozenset[str]] = frozenset({"exact", "slot"})
+# A time the user gave: any explicit lead moves its notification (an automatic date takes whole days only).
+_LEAD_PRECISIONS: Final[frozenset[str]] = frozenset({"exact", "slot", "relative"})
+_DATE_PRECISIONS: Final[frozenset[str]] = frozenset({"date", "fallback"})
+# A series instance whose notification (its time minus the lead) has passed is skipped: at most this many in a row.
+_MAX_SKIPPED: Final = 400
 _AUTO_PRECISIONS: Final[frozenset[str]] = frozenset({"date", "default", "fallback", "period", "soon"})
 # A deadline with one of these also reminds the evening before (task_default_time of the previous day).
 _DEADLINE_PRECISIONS: Final[frozenset[str]] = frozenset({"exact", "slot", "date", "fallback"})
@@ -128,9 +142,13 @@ def resolve_item(item: ExtractedItem, now: datetime, prefs: Prefs, *, source: So
         period_kind = start = end = None
 
     reminders: tuple[ReminderPlan, ...] = ()
+    leads: tuple[int, ...] | None = None
+    stated: datetime | None = None
     if due is not None:
         span = (start, end) if start is not None and end is not None else None
-        reminders = plan_reminders(due, precision, role, item.lead, prefs, now_utc, period=span)
+        notify, leads = notify_due(due, precision, role, item.lead, prefs, now_utc)
+        stated, due = (due if notify != due else None), notify
+        reminders = plan_reminders(due, precision, role, list(leads or ()), prefs, now_utc, period=span)
     return Resolution(
         due_at=due,
         precision=precision,
@@ -140,6 +158,8 @@ def resolve_item(item: ExtractedItem, now: datetime, prefs: Prefs, *, source: So
         period_kind=period_kind,
         period_start=start,
         period_end=end,
+        leads=leads,
+        stated_at=stated,
     )
 
 
@@ -185,59 +205,121 @@ def plan_reminders(
 ) -> tuple[ReminderPlan, ...]:
     """Reminder plan for one occurrence (sorted, unique ``fire_at``; empty if ``due_at <= now``).
 
-    - exact/slot + role event/deadline: ``lead`` minutes before (default ``[prefs.lead_minutes]``), auto=False;
-    - exact/slot + role remind, and relative: at due unless ``lead`` is given explicitly, auto=False;
-    - default, soon: exactly at due, auto=True;
-    - date/fallback (time chosen automatically): at due, auto=True; whole-day leads (multiples of 1440, e.g.
-      "за день") are honoured, other lead values collapse to "at due";
-    - period (``period`` = its local [start, end]): (2) at due and (1) on the morning of the first day
-      (``bare_date_time``) if the span starts after today, both auto=True;
-    - role deadline with exact/slot/date/fallback: also the evening before (``task_default_time`` of the previous
-      day), auto=True.
-    ``lead`` is only ever explicit (the message, the ⏱ menu or an edit). Leads that are multiples of 1440 are
-    subtracted in local wall-clock days, others in UTC. A lead reminder already in the past fires now, while the
-    extra (1) / evening-before moments are skipped once past; auto reminders are moved out of quiet hours.
+    ``due_at`` is the occurrence's time, which is its notification time — there is no default lead:
+    - a notification exactly at ``due_at``: auto=True (moved out of quiet hours) for a time the bot chose (date,
+      fallback, default, period, soon), auto=False for a time the user gave (exact, slot, relative);
+    - several explicit leads (``lead`` = the item's ``lead_minutes``, e.g. [1440, 60] for "за день и за час"):
+      ``due_at`` is the stated time minus the largest (``notify_due``), the smaller ones notify again later — at the
+      stated time (``due_at`` + 1440) minus 60;
+    - a deadline (role ``deadline`` with exact/slot/date/fallback) keeps its own time: a notification at ``due_at``
+      — at its explicit leads before it instead, a date deadline keeping its own morning too — and the evening
+      before (``task_default_time`` of the previous day);
+    - a period (``period`` = its local [start, end]): (2) at due and (1) on the morning of the first day
+      (``bare_date_time``) if the span starts after today, both auto=True.
+    Leads apply as ``effective_leads`` says. Moments already past are skipped (a deadline whose every lead moment
+    has passed notifies at its own time). Leads that are multiples of 1440 are wall-clock days, others UTC minutes.
     """
     due = _as_utc(due_at)
     now_utc = _as_utc(now)
     if precision in _NO_DUE_PRECISIONS or due <= now_utc:
         return ()
+    tz = prefs.zone
     plans: dict[datetime, ReminderPlan] = {}
 
-    def add(fire: datetime, minutes: int, auto: bool) -> None:
+    def add(fire: datetime, auto: bool) -> None:
         if auto:
             fire = quiet.shift_out_of_quiet(fire, prefs)
-        # Equal fire times collapse; the smallest lead wins (it is the closest to the real distance to due).
+        minutes = max(0, int((due - fire).total_seconds() // 60))  # how long before the occurrence's time
         plans.setdefault(fire, ReminderPlan(fire_at=fire, lead_minutes=minutes, auto=auto))
 
     auto = precision in _AUTO_PRECISIONS
-    for minutes in _leads(precision, role, lead, prefs):
-        add(max(_minus_lead(due, minutes, prefs.zone), now_utc), minutes, auto)
+    leads = effective_leads(precision, lead)
+    if role == "deadline" and precision in _DEADLINE_PRECISIONS:
+        moments = [m for m in (shift_back(due, minutes, tz) for minutes in leads) if m > now_utc]
+        if not moments or precision in _DATE_PRECISIONS:  # the deadline's own moment
+            moments.append(due)
+    else:
+        stated = shift_forward(due, leads[0], tz) if leads else due
+        moments = [due, *(m for m in (shift_back(stated, minutes, tz) for minutes in leads[1:]) if m > due)]
+    for fire in sorted(moments):
+        add(fire, auto)
     for fire in _extra_fires(due, precision, role, period, prefs, now_utc):
         if fire > now_utc and quiet.shift_out_of_quiet(fire, prefs) < due:
-            add(fire, int((due - fire).total_seconds() // 60), True)
+            add(fire, True)
     return tuple(sorted(plans.values(), key=lambda p: p.fire_at))
 
 
-def _leads(precision: str, role: str, lead: list[int] | None, prefs: Prefs) -> list[int]:
-    """Minutes before due of the lead-based reminders, ascending."""
-    if precision in _LEAD_PRECISIONS and role != "remind":
-        leads = lead or [prefs.lead_minutes]
-    elif precision in ("date", "fallback"):
-        leads = [m if m % 1440 == 0 else 0 for m in lead or [0]]
-        if role == "deadline":  # the deadline's own morning stays, whatever "за день" adds
-            leads.append(0)
-    elif precision in ("default", "period", "soon"):
-        leads = [0]
-    else:  # role remind, relative: the moment itself, unless the user asked for a lead ("напомни за 30 минут")
-        leads = lead or [0]
-    return sorted(set(leads))
+def effective_leads(precision: str, lead: Sequence[int] | None) -> list[int]:
+    """The explicit leads ("за 30 минут", "за день") that apply to an occurrence of this precision, unique, largest
+    first: any of them for a time the user gave (exact, slot, relative), whole days only for an automatic date (date,
+    fallback: "за день", not "за 30 минут" before a 10:00 the bot chose), none for a time the bot chose (default, a
+    span, "на днях"). 0 ("в момент") is no lead."""
+    values = {int(m) for m in lead or () if int(m) > 0}
+    if precision in _DATE_PRECISIONS:
+        values = {m for m in values if m % 1440 == 0}
+    elif precision not in _LEAD_PRECISIONS:
+        values = set()
+    return sorted(values, reverse=True)
+
+
+def lead_shift(precision: str, role: str, lead: Sequence[int] | None) -> int:
+    """Minutes the notification of such an occurrence is before the time the owner stated: the largest effective
+    lead; 0 for a deadline (it keeps its own time) and without leads."""
+    if role == "deadline":
+        return 0
+    leads = effective_leads(precision, lead)
+    return leads[0] if leads else 0
+
+
+def notify_due(
+    stated: datetime, precision: str, role: str, lead: Sequence[int] | None, prefs: Prefs, now: datetime
+) -> tuple[datetime, tuple[int, ...] | None]:
+    """(due, leads kept) of an occurrence the owner stated for ``stated``: its time is when it notifies.
+
+    Without explicit leads that is ``stated`` itself. "Напомни за 30 минут до встречи в 15" is due at 14:30; "за день
+    и за час" at the earlier of the two moments still ahead, and the leads of the moments ahead are kept (the item's
+    ``lead_minutes``: the later ones notify too, ``plan_reminders``). Lead moments already past are dropped; with none
+    left the occurrence is due at ``stated``. A deadline keeps its own time (its leads move only its reminders).
+    """
+    stated_utc = _as_utc(stated)
+    leads = effective_leads(precision, lead)
+    if role == "deadline":
+        return stated_utc, tuple(leads) or None
+    now_utc = _as_utc(now)
+    ahead = tuple(m for m in leads if shift_back(stated_utc, m, prefs.zone) > now_utc)
+    if not ahead:
+        return stated_utc, None
+    return shift_back(stated_utc, ahead[0], prefs.zone), ahead
+
+
+def next_series_due(
+    rule: str,
+    dtstart_local: datetime,
+    tz: ZoneInfo,
+    after: datetime,
+    *,
+    inclusive: bool = False,
+    shift: int = 0,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Due of the next instance of a series after ``after`` (``recurrence.next_occurrence`` of the stated times): the
+    instance's time minus ``shift`` lead minutes (``lead_shift``). With a shift, an instance whose due is not after
+    ``now`` is skipped. None: the rule is exhausted."""
+    t = recurrence.next_occurrence(rule, dtstart_local, tz, after, inclusive=inclusive)
+    for _ in range(_MAX_SKIPPED):
+        if t is None:
+            return None
+        due = shift_back(t, shift, tz)
+        if not shift or now is None or due > _as_utc(now):
+            return due
+        t = recurrence.next_occurrence(rule, dtstart_local, tz, t)
+    return None
 
 
 def _extra_fires(
     due: datetime, precision: str, role: str, period: tuple[date, date] | None, prefs: Prefs, now_utc: datetime
 ) -> list[datetime]:
-    """Automatic reminders besides the lead ones: (1) of a period that has not started, the evening before a
+    """Automatic reminders before the occurrence's time: (1) of a period that has not started, the evening before a
     deadline. Moments in the past are dropped by the caller."""
     tz = prefs.zone
     if precision == "period":
@@ -248,16 +330,6 @@ def _extra_fires(
         eve = due.astimezone(tz).date() - timedelta(days=1)
         return [localize(eve, prefs.task_default_time, tz).astimezone(UTC)]
     return []
-
-
-def lead_applies(precision: str, minutes: int) -> bool:
-    """Whether an explicit "remind ``minutes`` before" changes the plan of an occurrence with this precision
-    (see ``plan_reminders``): any lead for a time the user gave, only whole days for an automatic date."""
-    if precision in _LEAD_PRECISIONS or precision == "relative":
-        return True
-    if precision in ("date", "fallback"):
-        return minutes % 1440 == 0
-    return minutes == 0
 
 
 def tomorrow(now: datetime, prefs: Prefs) -> date:
@@ -369,7 +441,11 @@ def _resolve_recurring(
         # COUNT is counted from DTSTART: today's instance, already past, must not use one up
         # ("каждый день в 9, 2 раза" sent at 10:00 means tomorrow and the day after).
         dtstart_local += timedelta(days=1)
-    due = recurrence.next_occurrence(rule, dtstart_local, tz, now_utc, inclusive=True)
+    # "каждый понедельник в 10, напомни за 15 минут": the series keeps the stated times, each instance is due (and
+    # notifies) its lead earlier; an instance whose notification has already passed is skipped.
+    leads = tuple(effective_leads(precision, item.lead))
+    shift = lead_shift(precision, role, item.lead)
+    due = next_series_due(rule, dtstart_local, tz, now_utc, inclusive=True, shift=shift, now=now_utc)
     if due is None:
         return None
     confirm = source in _CONFIRM_SOURCES or (
@@ -378,11 +454,13 @@ def _resolve_recurring(
     return Resolution(
         due_at=due,
         precision=precision,
-        reminders=plan_reminders(due, precision, role, item.lead, prefs, now_utc),
+        reminders=plan_reminders(due, precision, role, list(leads), prefs, now_utc),
         rrule=rule,
         rec_time_local=t,
         rec_dtstart_local=dtstart_local,
         needs_confirm=confirm,
+        leads=leads or None,
+        stated_at=shift_forward(due, shift, tz) if shift else None,
     )
 
 
@@ -611,12 +689,23 @@ def _default_due(now_utc: datetime, prefs: Prefs) -> datetime:
 # --- reminders / ranges ---------------------------------------------------------------------------------------
 
 
-def _minus_lead(due: datetime, minutes: int, tz: ZoneInfo) -> datetime:
-    """Whole days are wall-clock days ("за день" before 19:00 is 19:00 even across DST); the rest is UTC."""
+def shift_back(t: datetime, minutes: int, tz: ZoneInfo) -> datetime:
+    """``minutes`` before ``t`` (aware UTC): whole days are wall-clock days ("за день" before 19:00 is 19:00 even
+    across DST), the rest is UTC."""
+    t = _as_utc(t)
     if minutes and minutes % 1440 == 0:
-        local = due.astimezone(tz)
+        local = t.astimezone(tz)
         return localize(local.date() - timedelta(days=minutes // 1440), local.time(), tz).astimezone(UTC)
-    return due - timedelta(minutes=minutes)
+    return t - timedelta(minutes=minutes)
+
+
+def shift_forward(t: datetime, minutes: int, tz: ZoneInfo) -> datetime:
+    """``minutes`` after ``t`` (aware UTC), the inverse of ``shift_back``: whole days in wall clock, the rest in UTC."""
+    t = _as_utc(t)
+    if minutes and minutes % 1440 == 0:
+        local = t.astimezone(tz)
+        return localize(local.date() + timedelta(days=minutes // 1440), local.time(), tz).astimezone(UTC)
+    return t + timedelta(minutes=minutes)
 
 
 def _range_days(spec: str, today: date, tmr: date) -> tuple[date, date]:

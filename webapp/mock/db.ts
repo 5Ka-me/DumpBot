@@ -1,6 +1,7 @@
 /**
  * In-memory data of the mock API (npm run dev): items with occurrences, reminders, checklists, related items and
- * pictures, built relative to "now" so Today / the week / overdue always have something to show.
+ * pictures, built relative to "now" so Today / the week / overdue always have something to show. As in the bot, an
+ * item's time is its notification time (no "напомнить за" by default; "за день и за час" = `due` + `later`).
  */
 import type {
   Forward,
@@ -22,7 +23,6 @@ import {
   MONTHS_IN,
   addDays,
   daysBetween,
-  fmtClock,
   fmtDate,
   fmtDateTime,
   localDateTime,
@@ -57,7 +57,10 @@ export interface MItem {
   deletedAt: number | null;
   urls: string[];
   linkTitles: Record<string, string>;
-  lead: number[] | null;
+  /** 🔕 */
+  remindersOff: boolean;
+  /** Later notifications of the same time ("за день и за час до 10:30": due = the day before, later = [10:15]). */
+  later: number[];
   rrule: string | null;
   recActive: boolean;
   repeatText: string | null;
@@ -79,7 +82,6 @@ export interface MItem {
   rawId: number | null;
   fromApp: boolean;
   images: MockImage[];
-  snoozes: number[];
 }
 
 export const DEFAULT_PREFS: Prefs = {
@@ -93,7 +95,6 @@ export const DEFAULT_PREFS: Prefs = {
   weekend_time: "11:00",
   bare_date_time: "10:00",
   task_default_time: "19:00",
-  lead_minutes: 5,
   soon_days: 2,
   quiet_enabled: true,
   quiet_start: "23:00",
@@ -179,7 +180,8 @@ export class MockDb {
       deletedAt: null,
       urls: [],
       linkTitles: {},
-      lead: null,
+      remindersOff: false,
+      later: [],
       rrule: null,
       recActive: false,
       repeatText: null,
@@ -201,7 +203,6 @@ export class MockDb {
       rawId: null,
       fromApp: false,
       images: [],
-      snoozes: [],
       ...partial,
     };
     if (item.due !== null && item.occId === null) {
@@ -222,14 +223,23 @@ export class MockDb {
       .sort((a, b) => (a.position ?? 0) - (b.position ?? 0));
   }
 
-  /** Give an item a time (a new open occurrence). */
+  /** Give an item a time (a new open occurrence): it notifies then, and only then (reminders on again). */
   setDue(item: MItem, due: number | null, precision: Precision): void {
     item.due = due;
     item.precision = due === null ? "none" : precision;
     item.occId = due === null ? null : this.nextOcc++;
     item.occStatus = due === null ? null : "open";
     item.occDoneAt = null;
-    item.snoozes = [];
+    item.later = [];
+    item.remindersOff = false;
+  }
+
+  /** «⏰ Отложить»: the item's time moves to `fire` (the same occurrence), one notification there. */
+  snooze(item: MItem, fire: number): void {
+    item.due = fire;
+    if (!["exact", "slot", "relative", "date", "fallback"].includes(item.precision)) item.precision = "exact";
+    item.period = null;
+    item.later = [];
   }
 
   // --- views -----------------------------------------------------------------------------------------------------
@@ -243,30 +253,41 @@ export class MockDb {
     return item.role === "deadline" ? `до ${when}` : when;
   }
 
+  /** The pending notifications: the item's time itself, its later ones, a deadline's evening before. */
   reminders(item: MItem, now: number): Reminder[] {
-    if (item.due === null || item.occStatus !== "open" || item.someday || item.lead?.length === 0) return [];
-    const leads = DATE_ONLY.has(item.precision) || item.precision === "period" || item.precision === "soon" || item.precision === "default"
-      ? [0]
-      : (item.lead ?? [this.prefs.lead_minutes]);
-    const auto = leads.length === 1 && leads[0] === 0 && item.precision !== "exact";
-    const times = [...leads.map((m) => ({ fire: item.due! - m * MIN, lead: m, auto })), ...item.snoozes.map((s) => ({ fire: s, lead: 0, auto: false }))];
+    if (item.due === null || item.occStatus !== "open" || item.someday || item.remindersOff) return [];
+    const auto = !["exact", "slot", "relative"].includes(item.precision);
+    const times = [item.due, ...item.later].map((fire) => ({ fire, lead: 0, auto }));
+    if (item.role === "deadline") {
+      const eve = addDays(zoned(item.due, this.prefs.tz).date, -1);
+      const fire = zonedToUtc(`${eve}T${this.prefs.task_default_time}`, this.prefs.tz).getTime();
+      times.push({ fire, lead: Math.round((item.due - fire) / MIN), auto: true });
+    }
     return times
       .filter((t) => t.fire > now)
       .sort((a, b) => a.fire - b.fire)
       .map((t, i) => ({ id: item.id * 100 + i, fire_at: iso(t.fire)!, lead_minutes: t.lead, auto: t.auto, status: "pending" }));
   }
 
+  /** The card's time line, as the bot's: "🔔 завтра 13:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00". */
   cardWhen(item: MItem, now: number): string | null {
     if (item.someday) return "🌙 когда-нибудь";
+    const tz = this.prefs.tz;
+    const today = this.today(now);
     const reminders = this.reminders(item, now);
-    const next = reminders[0] ? ` · напомню ${fmtDateTime(reminders[0].fire_at, this.prefs.tz, now)}` : "";
-    if (item.period) return `🗓 ${item.period.label} (до ${fmtDate(item.period.end, this.today(now))})${next}`;
+    const byDay = reminders.map((r) => {
+      const z = zoned(r.fire_at, tz);
+      const delta = daysBetween(today, z.date);
+      const day = delta === 0 ? "сегодня" : delta === 1 ? "завтра" : delta < 7 ? fmtDate(z.date).split(" ")[0] : fmtDate(z.date, today, false);
+      return `${day} ${z.time}`;
+    });
+    if (item.period) return `🗓 ${item.period.label} (до ${fmtDate(item.period.end, today, false)})${byDay.length ? ` · 🔔 ${byDay.join(", ")}` : ""}`;
     if (item.due === null) return null;
-    const head = item.role === "deadline" ? "⏳" : "⏰";
-    const when = this.rowWhen(item, now);
-    const sameDay = reminders[0] && zoned(reminders[0].fire_at, this.prefs.tz).date === zoned(item.due, this.prefs.tz).date;
-    const remind = reminders[0] ? (sameDay ? ` · напомню в ${fmtClock(reminders[0].fire_at, this.prefs.tz)}` : next) : "";
-    return `${head} ${when}${remind}`;
+    if (item.role === "deadline") return `⏳ до ${this.rowWhen(item, now)?.replace(/^до /, "")}${byDay.length ? ` · 🔔 ${byDay.join(", ")}` : ""}`;
+    if (item.occStatus === "done") return `⏰ ${this.rowWhen(item, now)}`;
+    if (reminders.length) return `🔔 ${reminders.map((r) => fmtDateTime(r.fire_at, tz, now)).join(" · ")}`;
+    if (item.due <= now) return `⏰ ${fmtDateTime(item.due, tz, now)} · просрочено`;
+    return `🔕 ${fmtDateTime(item.due, tz, now)}`;
   }
 
   row(item: MItem, now: number): Row {
@@ -327,8 +348,7 @@ export class MockDb {
       deleted_at: iso(item.deletedAt),
       urls: item.urls,
       link_titles: item.linkTitles,
-      lead_minutes: item.lead,
-      reminders_off: item.lead?.length === 0,
+      reminders_off: item.remindersOff,
       rrule: item.rrule,
       rec_active: item.recActive,
       repeat_text: item.repeatText,
@@ -467,7 +487,20 @@ function seed(db: MockDb, now: number): void {
   const ago = (days: number, hours = 0) => now - days * DAY - hours * 3_600_000;
 
   db.add({ id: 1, kind: "task", title: "Позвонить в банк", tags: ["финансы"], due: at(today, "15:00"), precision: "exact", created: ago(1, 3) }, now);
-  db.add({ id: 2, kind: "event", title: "Стоматолог", details: "Кабинет 12, взять полис", due: at(day(1), "10:30"), precision: "exact", lead: [60, 15], created: ago(3) }, now);
+  // "напомни за час и за 15 минут": notified at 09:30 and 10:15, the 10:30 itself is in the title
+  db.add(
+    {
+      id: 2,
+      kind: "event",
+      title: "Стоматолог (10:30)",
+      details: "Кабинет 12, взять полис",
+      due: at(day(1), "09:30"),
+      later: [at(day(1), "10:15")],
+      precision: "exact",
+      created: ago(3),
+    },
+    now,
+  );
   db.add(
     {
       id: 3,

@@ -72,7 +72,7 @@ def test_card_of_the_live_example(make_item, make_occ, make_reminder, at, now, c
     item = week_item(make_item)
     occ = make_occ(at(2026, 10, 9, 19, 0), precision="period")
     text, _ = check_view(views.item_card(item, occ, [auto_reminder(make_reminder, occ, occ.due_at)], PREFS, now))
-    assert "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00" in text.splitlines()
+    assert "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00" in text.splitlines()
 
 
 def test_card_of_next_week_lists_both_reminders(make_item, make_occ, make_reminder, at, now, check_view):
@@ -83,7 +83,7 @@ def test_card_of_next_week_lists_both_reminders(make_item, make_occ, make_remind
         auto_reminder(make_reminder, occ, occ.due_at, 2),
     ]
     text, _ = check_view(views.item_card(item, occ, rems, PREFS, now))
-    assert "🗓 на следующей неделе (до вс 18 окт) · напомню пн в 10:00 и пт 16 окт в 19:00" in text
+    assert "🗓 на следующей неделе (до вс 18 окт) · 🔔 пн 10:00, пт 16 окт 19:00" in text
 
 
 def test_card_of_a_season_in_another_year(make_item, make_occ, make_reminder, at, now, check_view):
@@ -94,7 +94,7 @@ def test_card_of_a_season_in_another_year(make_item, make_occ, make_reminder, at
         auto_reminder(make_reminder, occ, occ.due_at, 2),
     ]
     text, _ = check_view(views.item_card(item, occ, rems, PREFS, now))
-    assert "🗓 летом 2027 (до 31 авг 2027) · напомню 1 июн 2027 в 10:00 и 31 авг 2027 в 19:00" in text
+    assert "🗓 летом 2027 (до 31 авг 2027) · 🔔 1 июн 2027 10:00, 31 авг 2027 19:00" in text
 
 
 def test_card_of_a_done_period_item(make_item, make_occ, at, now, check_view, buttons):
@@ -111,7 +111,7 @@ def test_card_of_a_period_item_without_reminders(make_item, make_occ, at, check_
     occ = make_occ(at(2026, 10, 11, 19, 0), precision="period")
     sunday_night = at(2026, 10, 11, 20, 0)
     text, _ = check_view(views.item_card(item, occ, [], PREFS, sunday_night))
-    assert "🗓 на этой неделе (до вс 11 окт) · без напоминания" in text  # the week is not over yet
+    assert "🗓 на этой неделе (до вс 11 окт) · 🔕 без напоминания" in text  # the week is not over yet
     text, _ = check_view(views.item_card(item, occ, [], PREFS, at(2026, 10, 12, 9, 0)))
     assert "🗓 на неделе с 5 окт (до вс 11 окт) · просрочено" in text
 
@@ -124,15 +124,15 @@ def test_card_of_a_date_deadline(make_item, make_occ, make_reminder, at, now, ch
         auto_reminder(make_reminder, occ, occ.due_at, 2),
     ]
     text, _ = check_view(views.item_card(item, occ, rems, PREFS, now))
-    assert "⏳ до пт 9 окт · напомню чт в 19:00 и пт в 10:00" in text
+    assert "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00" in text
 
 
 def test_card_of_a_deadline_with_a_time(make_item, make_occ, make_reminder, at, now, check_view):
     item = make_item(when_spec={"text": "до пятницы 15:00", "day": "FR", "time": "15:00", "role": "deadline"})
     occ = make_occ(at(2026, 10, 9, 15, 0), precision="exact")
-    rems = [auto_reminder(make_reminder, occ, at(2026, 10, 8, 19, 0), 1), make_reminder(occ, lead=5)]
+    rems = [auto_reminder(make_reminder, occ, at(2026, 10, 8, 19, 0), 1), make_reminder(occ)]
     text, _ = check_view(views.item_card(item, occ, rems, PREFS, now))
-    assert "⏳ до пт 9 окт 15:00 · напомню чт в 19:00 и пт в 14:55" in text
+    assert "⏳ до пт 9 окт 15:00 · 🔔 чт 19:00, пт 15:00" in text
 
 
 def test_card_of_a_deadline_tomorrow_and_a_missed_one(make_item, make_occ, make_reminder, at, now, check_view):
@@ -143,7 +143,7 @@ def test_card_of_a_deadline_tomorrow_and_a_missed_one(make_item, make_occ, make_
         auto_reminder(make_reminder, occ, occ.due_at, 2),
     ]
     text, _ = check_view(views.item_card(item, occ, rems, PREFS, now))
-    assert "⏳ до ср 7 окт · напомню сегодня в 19:00 и завтра в 10:00" in text
+    assert "⏳ до ср 7 окт · 🔔 сегодня 19:00, завтра 10:00" in text
     missed = make_occ(at(2026, 10, 5, 10, 0), precision="date", status="missed")
     text, _ = check_view(views.item_card(item, missed, [], PREFS, now))
     assert "⏳ до пн 5 окт" in text.splitlines()
@@ -153,7 +153,7 @@ def test_card_of_a_soon_item(make_item, make_occ, make_reminder, at, now, check_
     item = make_item(period_kind="soon", period_start=date(2026, 10, 6), period_end=date(2026, 10, 8))
     occ = make_occ(at(2026, 10, 8, 19, 0), precision="soon")
     text, _ = check_view(views.item_card(item, occ, [auto_reminder(make_reminder, occ, occ.due_at)], PREFS, now))
-    assert "🗓 на днях · напомню чт в 19:00" in text
+    assert "🗓 на днях · 🔔 чт 19:00" in text
 
 
 def test_card_of_a_someday_item(make_item, make_occ, at, now, check_view, buttons):
@@ -168,11 +168,11 @@ def test_card_of_a_someday_item(make_item, make_occ, at, now, check_view, button
     assert [t for t, _ in buttons(kb)] == ["✏️ Изменить", "🗑 Удалить"]
 
 
-def test_plain_event_lines_are_unchanged(make_item, make_occ, make_reminder, at, now, check_view):
+def test_plain_event_line_is_its_notification_time(make_item, make_occ, make_reminder, at, now, check_view):
     item = make_item(when_spec={"text": "в пятницу в 15", "day": "FR", "time": "15:00", "role": "event"})
     occ = make_occ(at(2026, 10, 9, 15, 0))
-    text, _ = check_view(views.item_card(item, occ, [make_reminder(occ, lead=5)], PREFS, now))
-    assert "⏰ пт 9 окт 15:00 · напомню в 14:55" in text
+    text, _ = check_view(views.item_card(item, occ, [make_reminder(occ)], PREFS, now))
+    assert "🔔 пт 9 окт 15:00" in text.splitlines()
 
 
 # --- reminder messages -----------------------------------------------------------------------------------------
@@ -199,7 +199,7 @@ def test_reminder_of_a_deadline_says_when_it_is_due(make_item, make_occ, make_re
     assert text.splitlines()[1] == "⏳ срок: сегодня"
     timed = make_occ(at(2026, 10, 9, 15, 0), precision="exact")
     text, _ = check_view(views.reminder_message(item, timed, None, PREFS, at(2026, 10, 9, 14, 55)))
-    assert text.splitlines()[1] == "⏳ срок: сегодня в 15:00 · через 5 мин"
+    assert text.splitlines()[1] == "⏳ срок: сегодня в 15:00"
 
 
 # --- digests, lists, /today ---------------------------------------------------------------------------------------

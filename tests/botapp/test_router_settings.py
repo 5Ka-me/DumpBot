@@ -45,7 +45,6 @@ async def test_menu_navigation_and_close(feed, updates, tg, get_buttons) -> None
     ("key", "value", "check"),
     [
         ("tz", "Europe/Kyiv", lambda p: p.tz == "Europe/Kyiv"),
-        ("lead", "15", lambda p: p.lead_minutes == 15),
         ("quiet_toggle", "", lambda p: p.quiet_enabled is False),
         ("digest_toggle", "evening", lambda p: p.digest_evening_enabled is False and p.digest_morning_enabled),
         ("stt", "ru", lambda p: p.stt_language == "ru"),
@@ -70,8 +69,6 @@ async def test_one_tap_changes(feed, updates, seed, tg, ctx, key, value, check) 
     ("key", "value"),
     [
         ("tz", "Mars/Olympus"),
-        ("lead", "abc"),
-        ("lead", "99999"),
         ("digest_toggle", "noon"),
         ("stt", "de"),
         ("stt_mode", "cloud"),
@@ -112,6 +109,19 @@ async def test_unknown_key_is_stale(feed, updates, tg) -> None:
     assert tg.toasts == ["Кнопка устарела"]
 
 
+async def test_old_lead_setting_buttons_are_harmless(feed, updates, seed, tg, dp, bot) -> None:
+    """ "⏱ Напоминать за" was removed (2026-10-07): its buttons in an old menu change nothing."""
+    await feed(updates.callback(SetCb(key="lead", v="15"), message_id=938))
+    await feed(updates.callback(SetCb(key="ask", v="lead_minutes"), message_id=938))
+    await feed(updates.callback(SetCb(key="menu", v="lead"), message_id=938))
+
+    assert tg.toasts == ["Кнопка устарела", "Кнопка устарела", None]
+    [menu] = tg.edits  # the old submenu falls back to the main menu
+    assert "Настройки" in menu.text and "Напоминать" not in menu.text
+    assert await _prefs(seed) == Prefs()
+    assert await _state(dp, bot) is None
+
+
 async def test_ask_flow_saves_a_typed_time(feed, updates, seed, tg, dp, bot, ctx) -> None:
     await feed(updates.callback(SetCb(key="ask", v="slot_morning"), message_id=932))
 
@@ -136,7 +146,7 @@ async def test_ask_flow_saves_a_typed_time(feed, updates, seed, tg, dp, bot, ctx
     [
         ("quiet_start", "25:00", "22:30", time(22, 30)),
         ("tz", "Europe/Atlantis", "Asia/Tbilisi", "Asia/Tbilisi"),
-        ("lead_minutes", "-5", "45", 45),
+        ("bare_date_time", "10", "10:30", time(10, 30)),
         ("budget_usd", "дорого", "7,5", 7.5),
     ],
 )
@@ -174,36 +184,36 @@ async def test_a_second_bad_value_is_saved_as_a_note(feed, updates, seed, tg, dp
 
 @pytest.mark.parametrize("kind", ["forward", "reply", "question", "photo", "late"])
 async def test_what_is_not_a_value_is_captured(feed, updates, seed, dp, bot, frozen, kind) -> None:
-    await feed(updates.callback(SetCb(key="ask", v="lead_minutes"), message_id=935))
+    await feed(updates.callback(SetCb(key="ask", v="slot_lunch"), message_id=935))
     if kind == "forward":
         origin = MessageOriginChannel(date=frozen.now, chat=Chat(id=-1001, type="channel", title="Хабр"), message_id=7)
-        message = updates.message("15", forward_origin=origin)
+        message = updates.message("12:30", forward_origin=origin)
     elif kind == "reply":
         created = await seed.item()
         await seed.bot_message(960, item_id=created.item.id)
-        message = updates.message("15", reply_to=960)
+        message = updates.message("12:30", reply_to=960)
     elif kind == "question":
-        message = updates.message("? 15")
+        message = updates.message("? 12:30")
     elif kind == "photo":
-        message = updates.message(photo=True, caption="15")
+        message = updates.message(photo=True, caption="12:30")
     else:
         frozen.advance(minutes=6)
-        message = updates.message("15")
+        message = updates.message("12:30")
 
     await feed(message)
 
-    assert (await _prefs(seed)).lead_minutes == Prefs().lead_minutes
+    assert (await _prefs(seed)).slot_lunch == Prefs().slot_lunch
     assert len(await seed.raws()) == 1
     assert await _state(dp, bot) is None
 
 
 async def test_a_late_reply_to_the_prompt_is_still_the_value(feed, updates, seed, dp, bot, frozen) -> None:
-    await feed(updates.callback(SetCb(key="ask", v="lead_minutes"), message_id=936))
+    await feed(updates.callback(SetCb(key="ask", v="slot_lunch"), message_id=936))
     frozen.advance(minutes=10)
 
-    await feed(updates.message("15", reply_to=936))
+    await feed(updates.message("12:30", reply_to=936))
 
-    assert (await _prefs(seed)).lead_minutes == 15
+    assert (await _prefs(seed)).slot_lunch == time(12, 30)
     assert await seed.raws() == []
 
 
@@ -322,8 +332,7 @@ def test_parsers() -> None:
     for bad in ("-1", "nan", "inf", "пять"):
         with pytest.raises(ValueError):
             parse_money(bad)
-    assert parse_value("minutes", "30") == 30
-    with pytest.raises(ValueError):
-        parse_value("minutes", "10081")
+    with pytest.raises(ValueError):  # the only "minutes" field was the retired lead_minutes
+        parse_value("minutes", "30")
     with pytest.raises(ValueError):
         parse_value("color", "red")

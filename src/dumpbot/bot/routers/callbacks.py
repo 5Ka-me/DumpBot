@@ -38,7 +38,6 @@ from dumpbot.bot.cbdata import (
     DigestCb,
     ItemCb,
     KindCb,
-    LeadCb,
     OccCb,
     PickCb,
     SubCb,
@@ -46,8 +45,7 @@ from dumpbot.bot.cbdata import (
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
 from dumpbot.db.models import Occurrence, RawMessage
-from dumpbot.domain import timeresolve
-from dumpbot.domain.fmt import fmt_date, fmt_dt, fmt_duration
+from dumpbot.domain.fmt import fmt_date, fmt_dt
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
 from dumpbot.services import digest, items, processor, query
 from dumpbot.workers import jobs
@@ -58,11 +56,9 @@ if TYPE_CHECKING:
     from dumpbot.context import AppContext
     from dumpbot.db.models import Item
     from dumpbot.domain.prefs import Prefs
-    from dumpbot.dto import PatchResult
 
 log = logging.getLogger(__name__)
 
-MAX_LEAD: Final = 43200  # same cap as the AI schema / items service
 MAX_ASK_OPTIONS: Final = 8
 SPLITTING: Final = "Уже разбиваю на шаги…"
 # Digest buttons sent before the digest day was part of the callback data ("d:tmr").
@@ -89,13 +85,13 @@ def make_router() -> Router:
     router.callback_query.register(on_occ, OccCb.filter())
     router.callback_query.register(on_item, ItemCb.filter())
     router.callback_query.register(on_kind, KindCb.filter())
-    router.callback_query.register(on_lead, LeadCb.filter())
     router.callback_query.register(on_ask, AskCb.filter())
     router.callback_query.register(on_pick, PickCb.filter())
     router.callback_query.register(on_step, SubCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
-    router.callback_query.register(on_stale)  # buttons of an older version, garbage data
+    # Buttons of an older version (the removed "⏱ Напомнить за…" menu: ItemCb "lead", "l:…"), garbage data.
+    router.callback_query.register(on_stale)
     return router
 
 
@@ -194,8 +190,8 @@ async def _snooze(
     minutes = SNOOZE_MINUTES[action]
     reminder = await items.snooze(session, occ.id, minutes=minutes, tomorrow=minutes is None, prefs=prefs, now=now)
     toast = f"⏰ Напомню {fmt_dt(reminder.fire_at, prefs.zone, now=now)}"
-    # No buttons on the snoozed message: the snoozed reminder (of tomorrow's instance, if a series instance was merged
-    # into it) comes again with its own.
+    # The item's time moved there. No buttons on the snoozed message: the snoozed reminder (of tomorrow's instance,
+    # if a series instance was merged into it) comes again with its own.
     return Outcome(views.reminder_snoozed(item, reminder, prefs, now), toast, wake_scheduler=True)
 
 
@@ -219,10 +215,6 @@ async def _edit_menu(c: ItemCall) -> Outcome:
 
 async def _kind_menu(c: ItemCall) -> Outcome:
     return Outcome(views.kind_menu(c.item))
-
-
-async def _lead_menu(c: ItemCall) -> Outcome:
-    return Outcome(views.lead_menu(c.item))
 
 
 async def _back(c: ItemCall) -> Outcome:
@@ -303,7 +295,6 @@ async def _related(c: ItemCall) -> Outcome:
 ITEM_ACTIONS: Final[dict[str, Callable[[ItemCall], Awaitable[Outcome]]]] = {
     "edit": _edit_menu,
     "kind": _kind_menu,
-    "lead": _lead_menu,
     "back": _back,
     "del": _delete,
     "undel": _restore,
@@ -350,34 +341,6 @@ async def on_kind(callback: CallbackQuery, callback_data: KindCb, ctx: AppContex
         return Outcome(view, f"🏷 {KIND_LABELS[kind]}", wake_scheduler=True)
 
     await run(callback, ctx, op)
-
-
-async def on_lead(callback: CallbackQuery, callback_data: LeadCb, ctx: AppContext) -> None:
-    minutes = callback_data.m
-    if not 0 <= minutes <= MAX_LEAD:
-        await common.answer(callback, common.STALE)
-        return
-
-    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
-        item = await common.get_item(session, callback_data.id)
-        if item.status == "deleted":
-            return Outcome(views.deleted_card(item), common.DELETED)
-        result = await items.set_lead(session, item.id, [minutes], prefs, now)
-        view = await cards.patch_card(session, result, prefs, now)
-        return Outcome(view, _lead_toast(result, minutes, prefs, now), wake_scheduler=True)
-
-    await run(callback, ctx, op)
-
-
-def _lead_toast(result: PatchResult, minutes: int, prefs: Prefs, now: datetime) -> str:
-    """What the reminder will really do: a time the bot chose itself ("завтра" = 10:00, a task without a time)
-    takes only whole-day leads, so "за 30 мин" is stored for later but does not move today's reminder."""
-    occ = result.occurrence
-    if occ is not None and occ.status == "open" and not timeresolve.lead_applies(occ.precision, minutes):
-        if not result.reminders:
-            return "⏱ У записи нет точного времени — напомню в срок"
-        return f"⏱ У записи нет точного времени — напомню {fmt_dt(result.reminders[0].fire_at, prefs.zone, now=now)}"
-    return "⏱ Напомню в момент события" if minutes == 0 else f"⏱ Напомню за {fmt_duration(minutes)}"
 
 
 # --- checklists ---------------------------------------------------------------------------------------------------

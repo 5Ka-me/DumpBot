@@ -4,6 +4,9 @@
 Исследования (версии, API chutes, Telegram, разбор времени): [research/](research/).
 Итерация 2 (размытые сроки, локальный Whisper, связи и подзадачи, Mini App): [features/iteration-2.md](features/iteration-2.md)
 — там изменения и дополнения к контрактам ниже; сделанное оттуда (A, B, C, D) кратко отмечено в этом документе.
+**2026-10-07: время записи — это время уведомления** ([requirements.md](requirements.md), последний раздел): без
+«за 5 минут» по умолчанию, явный «за N» сдвигает само время записи, «⏰ / 📅» переносят запись. Контракты ниже уже
+описаны в этой модели.
 Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
 
 ## 1. Общая схема
@@ -70,7 +73,7 @@ Mini App ([iteration-2.md, D](features/iteration-2.md), [miniapp-api.md](feature
 | Structured output | `response_format={"type":"json_schema","json_schema":{"name":..,"schema":..,"strict":true}}`; ответ **всегда** валидируется Pydantic (слишком длинные строки/списки обрезаются, а не отвергаются); при ошибке — 1 повтор с текстом ошибки, затем запасная модель; ответ, обрезанный по max_tokens, — 1 повтор с большим лимитом. Если API отверг json_schema (400) — повтор с `{"type":"json_object"}`. Thinking выключаем: `chat_template_kwargs={"enable_thinking": false}`; `<think>…</think>` вырезаем из ответа на всякий случай. |
 | Голос | Community-chute AudioDojo: `POST https://vonkaiser-audiodojo.chutes.ai/stt/whisper`, JSON `{"audio_b64", "language"?, "return_timestamps": false}` → `{"text"}`. URL в конфиге. Опционально ffmpeg → WAV (`STT_CONVERT_WAV`). Недоступен → retry-очередь. Итерация 2: локальный Whisper (`LOCAL_STT_URL`) — запасной или основной по `Prefs.stt_mode` (`auto`/`local`/`chutes`), бесплатный. |
 | Картинки | Отправляются в vision-модель **в том же вызове**, что и разбор: модель возвращает `image.text` (OCR) + `image.description` + items. |
-| Время | LLM описывает время (`When`), Python вычисляет (`domain.timeresolve`). `now` = `message.date` (а не время обработки). Хранение в UTC, повторы — RRULE в локальном времени `rec_tz`. |
+| Время | LLM описывает время (`When`), Python вычисляет (`domain.timeresolve`). `now` = `message.date` (а не время обработки). Хранение в UTC, повторы — RRULE в локальном времени `rec_tz`. Время записи (`Occurrence.due_at`) — это время уведомления: «в 15» → 15:00; «за 30 минут до встречи в 15» → 14:30. |
 | Очередь | Таблица `jobs`, без Redis. Ошибки ИИ → экспоненциальный backoff `min(2**attempts мин, 6 ч)`. |
 | Планировщик | Свой цикл с опросом БД, без APScheduler. At-least-once доставка, восстановление `sending` → `pending` через 2 мин. |
 | Поиск | Postgres FTS (`to_tsvector('russian', …)` — смешанные RU/EN), `websearch_to_tsquery('russian', q)` + фильтры. Без векторов. |
@@ -119,7 +122,8 @@ src/dumpbot/
     routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
   web/                     Mini App: server.py (aiohttp, статика, WebServer) auth.py (initData) http.py  [web]
                            api_lists.py api_items.py api_inbox.py files.py (превью, LRU) serialize.py
-migrations/  alembic (0001 initial, 0002 item periods, 0003 subtasks + item_links, 0004 mini app)   [infra]
+migrations/  alembic (0001 initial, 0002 item periods, 0003 subtasks + item_links, 0004 mini app,      [infra]
+             0005 notification time: данные — «за 5 минут» → само время, явные «за …» → время записи)
 whisper/     app.py Dockerfile requirements.txt — локальный Whisper (compose profile whisper)        [infra]
 tailscale/   serve.json — Funnel для Mini App (compose profile miniapp)                              [infra]
 webapp/      фронтенд Mini App: src/ (api, lib, screens, components) mock/ (мок-API для dev и тестов)   [webapp]
@@ -152,12 +156,12 @@ ORM-модели (`db/models.py`), `AppContext` (`context.py`), `utcnow()` (`clo
 @dataclass(frozen=True)
 class ReminderPlan:
     fire_at: datetime          # aware UTC
-    lead_minutes: int          # 0 = ровно в момент
+    lead_minutes: int          # за сколько до времени повторения (ранние напоминания срока); 0 = в него или позже
     auto: bool                 # True → время выбрано автоматически → сдвигается из тихих часов
 
 @dataclass(frozen=True)
 class Resolution:
-    due_at: datetime | None    # aware UTC; None → у записи нет времени и напоминаний
+    due_at: datetime | None    # aware UTC; время записи = время уведомления; None → нет времени и напоминаний
     precision: Precision       # exact|slot|date|default|relative|fallback|period|soon|someday|none
     reminders: tuple[ReminderPlan, ...]
     rrule: str | None          # нормализованный RRULE (без DTSTART) или None
@@ -168,6 +172,8 @@ class Resolution:
     period_kind: str | None    # week|month|season|soon|someday (итерация 2)
     period_start: date | None  # локальные даты срока, включительно (None у someday)
     period_end: date | None
+    leads: tuple[int, ...] | None   # явные «за N» в силе, по убыванию (то, что хранит Item.lead_minutes)
+    stated_at: datetime | None      # названное время, если «за N» сдвинул уведомление раньше («(15:00)» в названии)
 
 def localize(d: date, t: time, tz: ZoneInfo) -> datetime
     """DST-safe: aware datetime в tz. Несуществующее время (весенний переход) → сдвиг вперёд;
@@ -178,6 +184,19 @@ def resolve_when(when: When, now: datetime, prefs: Prefs) -> tuple[datetime | No
     """(due_at UTC | None, precision, warnings, needs_confirm) — без напоминаний; используется и для правок."""
 def plan_reminders(due_at: datetime, precision: Precision, role: str, lead: list[int] | None,
                    prefs: Prefs, now: datetime, *, period: tuple[date, date] | None = None) -> tuple[ReminderPlan, ...]
+def notify_due(stated: datetime, precision: str, role: str, lead: Sequence[int] | None, prefs: Prefs,
+               now: datetime) -> tuple[datetime, tuple[int, ...] | None]
+    """(due, leads) записи, названной на stated: без «за N» — stated; «за 30 минут» — на 30 минут раньше; «за день и
+    за час» — самый ранний ещё не прошедший момент, остальные leads — более поздние уведомления. Прошедшие моменты
+    отбрасываются; если не осталось ни одного — stated. Дедлайн сохраняет своё время (leads двигают только его
+    напоминания)."""
+def effective_leads(precision: str, lead) -> list[int]   # exact/slot/relative — любые; date/fallback — кратные 1440;
+                                                          # default/period/soon — никаких; 0 — не lead
+def lead_shift(precision: str, role: str, lead) -> int     # насколько уведомление раньше названного (0 у дедлайна)
+def shift_back(t, minutes, tz) / shift_forward(t, minutes, tz)   # кратное 1440 — дни по местным часам, иначе UTC
+def next_series_due(rule, dtstart_local, tz, after, *, inclusive=False, shift=0, now=None) -> datetime | None
+    """Следующее повторение серии (названные времена правила) минус shift; с shift пропускает повторения, чьё
+    уведомление уже не после now."""
 def period_bounds(period: str, now: datetime, prefs: Prefs) -> tuple[date, date]
     """When.period → локальные [start, end]: неделя пн–вс, месяц (YYYY-MM: прошедший → следующий год), ближайший
     незакончившийся сезон (зима дек–фев), soon = сегодня…+soon_days. someday → ValueError."""
@@ -191,9 +210,6 @@ def resolve_range(spec_range: str, now: datetime, prefs: Prefs) -> tuple[datetim
 def tomorrow(now: datetime, prefs: Prefs) -> date
     """Дата, которую значит «завтра» в момент now: до night_cutoff — текущая календарная, иначе следующая.
     Общая для `+1`, resolve_range("tomorrow"), items.snooze(tomorrow) и items.move_to_tomorrow."""
-def lead_applies(precision: str, minutes: int) -> bool
-    """Меняет ли явный lead план напоминаний (см. plan_reminders): exact/slot/relative — любой;
-    date/fallback — только кратный 1440; default — только 0. Для тоста кнопки «⏱»."""
 ```
 
 Правила (все времена — из `prefs`; `now` переводится в `prefs.zone`):
@@ -215,30 +231,36 @@ def lead_applies(precision: str, minutes: int) -> bool
 | `YYYY-MM-DD` в прошлом | due_at = эта дата (время по правилам), **без напоминаний**, needs_confirm, warning «дата в прошлом». Сегодняшняя дата без времени — не в прошлом. |
 | `+0`/сегодня + **явное** время уже прошло | перенос на завтра, warning «время уже прошло — перенёс на завтра», needs_confirm. Без времени — см. «`day` без `time`». |
 | `weekend` | ближайшая суббота (сегодня, если суббота и время не прошло). |
-| `at` | локальное время, needs_confirm. С временем (`…THH:MM`) — это время пользователя: precision `exact` (lead, без сдвига из тихих часов). Только дата → `bare_date_time` (сегодня — как «`day` без `time`»), precision `fallback`. |
+| `at` | локальное время, needs_confirm. С временем (`…THH:MM`) — это время пользователя: precision `exact` (без сдвига из тихих часов). Только дата → `bare_date_time` (сегодня — как «`day` без `time`»), precision `fallback`. |
 | Нет `when`, kind ∈ ACTIONABLE, нет rrule | `due` = ближайшее `task_default_time` (сегодня, если ещё не прошло, иначе завтра), precision `default`, одно напоминание в `due`, **auto=True**. |
 | Нет `when`, kind не actionable | `due_at=None`, precision `none`, напоминаний нет. |
 | Час 0–6 при precision `exact` без «утра/ночи/am/a.m.» в `when.text` | needs_confirm (не меняем время). |
 | `conf == "low"` или source ∈ {photo, forward} и есть время | needs_confirm. |
 
-Напоминания (`plan_reminders`; `lead` всегда явный — из сообщения, меню «⏱» или правки):
-- precision `exact`/`slot` и role `event`/`deadline` → за `lead` минут (lead = `item.lead` или `[prefs.lead_minutes]`), auto=False.
-- role `remind` и precision `relative` → ровно в `due`, если lead не задан явно («через 2 часа, напомни за 30 минут» → за 30), auto=False.
-- precision `date`/`fallback` → в `due`, **auto=True**; из явного lead учитываются только целые дни («за день»).
-- precision `default` → ровно в `due` (lead 0), **auto=True**.
-- lead кратный 1440 вычитается в днях по локальным часам (wall clock), остальные — в UTC.
-- Если `fire_at ≤ now` но `due > now` → `fire_at = now` (сразу). Если `due ≤ now` → напоминаний нет.
-- auto=True → `quiet.shift_out_of_quiet(fire_at, prefs)`.
-- Дубликаты `fire_at` схлопнуть; сортировка по времени.
-- Итерация 2: precision `period` → (2) в due и (1) утром первого дня срока (`bare_date_time`), если срок начинается
-  после сегодняшнего дня; `soon` → ровно в due; role `deadline` с exact/slot/date/fallback → ещё накануне в
-  `task_default_time`. Все они auto; прошедшие (1) и «накануне» пропускаются.
+Время записи — время уведомления (2026-10-07). `resolve_item` берёт названное время из `resolve_when` и переводит его
+в `due` через `notify_due` с явными «за N» (`item.lead`, только из сообщения или правки): «напомни за 30 минут до
+встречи в 15» → due 14:30, `Resolution.leads=(30,)`, `stated_at` 15:00 (`items.create_items` дописывает «(15:00)» в
+название, если модель его не оставила). Роль `remind` больше не отличается от `event`.
+
+Напоминания (`plan_reminders`; `due_at` — время записи, `lead` — её `Item.lead_minutes`):
+- одно уведомление ровно в `due`: auto=False для времени пользователя (exact/slot/relative), **auto=True** для
+  выбранного ботом (date/fallback/default/period/soon). **Никаких «за 5 минут» по умолчанию.**
+- несколько явных leads («за день и за час» = [1440, 60]): due = названное − наибольший; остальные — позже:
+  (due + наибольший) − lead. Какие leads действуют — `effective_leads` (date/fallback — только целые дни).
+- role `deadline` с exact/slot/date/fallback: время записи — сам срок; уведомление в него, а с явными leads — за
+  них до срока (у даты-срока утро самого дня остаётся); плюс накануне в `task_default_time`.
+- precision `period` → (2) в due и (1) утром первого дня срока (`bare_date_time`), если срок начинается после
+  сегодняшнего дня; `soon` → ровно в due.
+- lead кратный 1440 считается в днях по локальным часам (wall clock), остальные — в UTC.
+- Если `due ≤ now` → напоминаний нет; прошедшие моменты («за …», (1), «накануне») пропускаются.
+- auto=True → `quiet.shift_out_of_quiet(fire_at, prefs)`. Дубликаты `fire_at` схлопнуть; сортировка по времени.
 
 Повторы (`item.rrule` есть): `normalize_rrule`; время суток = `time` из When (слот/HH:MM) или `task_default_time`;
 `rec_dtstart_local` = дата из `day` («с понедельника», «начиная со следующей пятницы» — от неё отсчитываются INTERVAL и
 голый FREQ=WEEKLY/YEARLY), а если `day` нет, он в прошлом или непонятен — сегодня (локально), в это время (naive);
-`due_at` = `recurrence.next_occurrence(…, after=now, inclusive=True)`;
-precision `slot`/`exact`/`default`; напоминания для этого повторения — как обычно. Невалидный RRULE → запись без повтора +
+`due_at` = `recurrence.next_occurrence(…, after=now, inclusive=True)` минус явный lead (`next_series_due`: правило
+хранит названное время, «каждый пн в 10, напомни за 15 минут» → повторения на 09:45, повторение с уже прошедшим
+уведомлением пропускается); precision `slot`/`exact`/`default`; напоминания для этого повторения — как обычно. Невалидный RRULE → запись без повтора +
 warning «не понял правило повтора», needs_confirm.
 
 ### 4.2 domain/recurrence.py  [domain]
@@ -347,8 +369,9 @@ class RoutedSTT:                           # ctx.stt
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v5" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
-                     # v5: часы 13–23 и 0 не переспрашивать, related — только тот же конкретный предмет)
+PROMPT_VERSION: str  # "v6" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
+                     # v5: часы 13–23 и 0 не переспрашивать, related — только тот же конкретный предмет;
+                     # v6: время — момент уведомления, lead = «за N до названного», названное время — в title)
 
 @dataclass
 class ExtractInput:
@@ -476,7 +499,8 @@ async def replace_items_for_raw(session, raw_id: int, ...same kwargs...) -> list
     """Для уточнения (Ask): мягко удалить записи этого raw (status=deleted, напоминания cancelled) и создать заново."""
 async def get_item(session, item_id: int) -> Item | None
 async def item_snapshot(session, item_id: int, prefs: Prefs, now: datetime) -> dict
-    """Для промпта правки: {id, kind, title, details, tags, due_local:"YYYY-MM-DD HH:MM"|None, rrule, lead, status}."""
+    """Для промпта правки: {id, kind, title, details, tags, due_local:"YYYY-MM-DD HH:MM"|None (время уведомления),
+    rrule, lead, status}."""
 async def current_occurrence(session, item_id: int) -> Occurrence | None     # ближайшее open (иначе последнее)
 async def pending_reminders(session, occurrence_id: int) -> list[Reminder]
 async def mark_done(session, occurrence_id: int, now: datetime, prefs: Prefs) -> Occurrence
@@ -485,11 +509,14 @@ async def mark_done(session, occurrence_id: int, now: datetime, prefs: Prefs) ->
 async def mark_undone(session, occurrence_id: int) -> Occurrence   # обратно open; item.status=open
 async def snooze(session, occurrence_id: int, *, minutes: int | None = None, tomorrow: bool = False,
                  prefs: Prefs, now: datetime) -> Reminder
-    """Создаёт напоминание (auto=False): now+minutes, либо «завтра» (`timeresolve.tomorrow`: до night_cutoff — уже
-    начавшийся день; если этот момент прошёл — день спустя) в то же локальное время суток, что и due_at.
-    pending-напоминания occurrence, которые сработали бы до него (включительно), → cancelled; более поздние
-    («за 30 минут» после «за день») остаются. Повторение активной серии, отложенное за свой due, переносится на это
-    время (`_move`: в ежедневной серии сливается с уже созданным завтрашним) — иначе его через 12 ч пометили бы missed.
+    """[⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра] ПЕРЕНОСЯТ время записи (2026-10-07): now+minutes, либо «завтра»
+    (`timeresolve.tomorrow`: до night_cutoff — уже начавшийся день; если этот момент прошёл — день спустя) в то же
+    локальное время суток, что и due_at. Occurrence получает этот due (`/today`, дайджесты, Mini App показывают новое
+    время; `_move`: в ежедневной серии сливается с уже созданным завтрашним), все его pending → cancelled, остаётся
+    ровно одно напоминание (auto=False) в это время; у разовой записи явные leads сбрасываются, срок
+    (period/soon) и время, выбранное ботом (default), становятся этим точным временем (precision exact).
+    Исключение — дедлайн или срок (они напоминают и раньше своего времени), отложенные на момент до него: время не
+    меняется, напоминания до этого момента → cancelled, добавляется одно, поздние остаются.
     Возвращённое напоминание указывает на occurrence, к которому оно теперь относится."""
 async def delete_item(session, item_id: int, now: datetime) -> None     # soft: status=deleted, deleted_at, rec_active=False, cancel
 async def restore_item(session, item_id: int, now: datetime, prefs: Prefs) -> Item   # undo; будущие напоминания вернуть в pending
@@ -497,12 +524,13 @@ async def remove_reminders(session, item_id: int) -> int                # cancel
 async def set_kind(session, item_id: int, kind: str) -> Item
 async def set_title(session, item_id: int, title: str) -> Item
 async def set_tags(session, item_id: int, tags: list[str]) -> Item
-async def set_lead(session, item_id: int, lead: list[int], prefs: Prefs, now: datetime) -> PatchResult  # перепланировать
 async def apply_patch(session, item_id: int, patch: EditPatch, prefs: Prefs, now: datetime) -> PatchResult
     """action: done/undone (текущее occurrence), delete, no_reminder, stop_recurrence, update:
-    title/kind/tags_add/tags_remove; when → resolve_when → перенос текущего open occurrence (или создание нового),
-    перепланировать напоминания (lead из patch.lead, иначе item.lead_minutes, иначе prefs); rrule → включить/заменить повтор;
-    lead без when → перепланировать текущие. kind стал ACTIONABLE без времени → напоминание по умолчанию (19:00);
+    title/kind/tags_add/tags_remove; when → resolve_when → перенос текущего open occurrence (или создание нового)
+    на это время уведомления (только patch.lead этой же правки сдвигает его раньше; прежние leads разовой записи
+    сбрасываются, серия хранит свои для следующих повторений); rrule → включить/заменить повтор (правило хранит
+    названное время: due предыдущего + его lead); lead без when → уведомление на lead раньше названного времени
+    (`_shift_by_lead`, «напомни за час»). kind стал ACTIONABLE без времени → напоминание по умолчанию (19:00);
     kind перестал быть ACTIONABLE (задача → идея) без when/rrule и вне активного повтора → open occurrences с
     precision `default` → cancelled вместе с pending-напоминаниями (время, заданное владельцем, остаётся)."""
 async def stop_recurrence(session, item_id: int, now: datetime | None = None) -> Item
@@ -833,6 +861,10 @@ ForceReply).
 Все функции чистые (без I/O), возвращают `(text_html, markup | None)`.
 
 ```python
+# 2026-10-07: строка времени — моменты уведомлений: «🔔 сегодня 13:00», «🔔 вс 11 окт 10:00 · пн 12 окт 09:00»,
+# «⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00», «🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00»; без напоминаний —
+# «🔕 завтра 13:00» (у времени по умолчанию «🔕 без напоминания»), прошедшее — «⏰ вчера 18:00 · просрочено»,
+# сделанное — «⏰ сегодня 13:00».
 # Итерация 2, C: item_card(..., *, extras: CardExtras | None = None) — «↳ шаг из «Переезд»», чек-лист «📋 Шаги: 1/4»,
 # «☑ 1. Упаковать вещи», «☐ 2. Заказать машину · чт 8 окт 15:00» с кнопками [☐ N]/[☑ N] (SubCb), «🔗 похоже на: «…»
 # (12 сен)» (2 названия + «и ещё N») и [🔗 Похожее]; [🪄 Разбить на шаги] — открытая задача без шагов, не повтор, не шаг
@@ -840,20 +872,20 @@ ForceReply).
 # Строки списков: «📌 Заказать машину (из «Переезд»)», «📌 Переезд (2/5)».
 def item_card(item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime,
               warnings: Sequence[str] = ()) -> tuple[str, InlineKeyboardMarkup | None]
-    # "📌 <b>Купить наушники</b>\n⏰ сегодня 13:00 · напомню в 12:55\n🔁 каждый пн\n🏷 Покупка · #электроника\n⚠️ …"
+    # "📌 <b>Купить наушники</b>\n🔔 сегодня 13:00\n🔁 каждый пн\n🏷 Покупка · #электроника\n⚠️ …"
     # кнопки: [✏️ Изменить] [🔕 Без напоминания] [🗑 Удалить] (+ [⏹ Стоп повтор] если rec_active); [✅ Готово] — не в карточке, а в edit_menu (ACTIONABLE) и в напоминании
 def deleted_card(item: Item) -> tuple[str, InlineKeyboardMarkup]          # "🗑 Удалено: …" [↩️ Вернуть]
 def edit_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # [🕒 Время] [🏷 Категория] [#️⃣ Теги]
-                                                                          # [✏️ Название] [⏱ Напомнить за…] [← Назад]
+                                                                          # [✏️ Название] [← Назад] («⏱ Напомнить за…»
+                                                                          # убрано 2026-10-07)
 def kind_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 9 категорий
-def lead_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 0/5/15/30/60/1440 мин; lead_minutes=[] →
-                                                                          # «Сейчас: напоминания выключены»
 def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime)
-    # "🔔 <b>Купить наушники</b>\nчерез 5 мин · сегодня 13:00"  [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
+    # "🔔 <b>Купить наушники</b>" (+ «🗓 на этой неделе (до вс 11 окт)» / «⏳ срок: завтра»; без «через 5 мин»)
+    # [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
 def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
 def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> tuple[str, None]
     # после [⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра]: "🔔 <b>…</b>\n💤 отложено · напомню сегодня в 13:15" без кнопок
-    # (отложенное напоминание придёт заново со своими)
+    # (отложенное напоминание придёт заново со своими; время записи уже переехало на это время)
 def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
     # + раздел «🗓 На этой неделе (до вс 11 окт)» / «🗓 В этом месяце» / «🗓 Этим летом» (period_sections)
 def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, InlineKeyboardMarkup | None]
@@ -891,13 +923,13 @@ def help_text() -> str
 (job "split", пока такой job queued/running — «Уже разбиваю на шаги…») и `rel` (карточки до 3 похожих новыми
 сообщениями). После любого коммита, закрывшего родителя последним шагом (в том числе «Готово» в напоминании шага),
 `cards.after_steps`: перерисовать последнюю карточку родителя и прислать «🎉 Все шаги выполнены — «…» закрыт».
-`callbacks` (CallbackData в `cbdata.py`): done/undone/snooze (OccCb), edit/del/undel/norem/stoprec/kind/lead/back (ItemCb),
+`callbacks` (CallbackData в `cbdata.py`): done/undone/snooze (OccCb), edit/del/undel/norem/stoprec/kind/back (ItemCb),
 выбор категории (KindCb), ответ на Ask (AskCb → job "clarify"), выбор записи для правки (PickCb → job "edit"),
 перенос невыполненного (DigestCb: день дайджеста D из данных кнопки, у старых кнопок `d:tmr` — дата сообщения;
 переносятся open-повторения дня D с due ≤ now и просроченные, на D+1 — `move_to_tomorrow(day=D+1)`; то, что ещё
 впереди вечером, не трогается), настройки (SetCb). Изменения → `edit` текущего сообщения (карточки) + `answer()` с тостом.
-Тост «⏱» после `set_lead` говорит, что будет на самом деле (`timeresolve.lead_applies`): у записи без точного времени
-минутный lead не меняет напоминание.
+Кнопки убранного «⏱ Напомнить за…» в старых сообщениях (ItemCb `lead`, `LeadCb` `l:…`, SetCb `lead`, `ask`
+`lead_minutes`) отвечают «Кнопка устарела» и ничего не меняют.
 
 `edit` (FSM): «🕒 Время» → ждём текст → job "edit_time" (голосовое → как голосовой reply на карточку, job "edit");
 «✏️ Название» → текст → `set_title`; «#️⃣ Теги» → текст (через пробел/запятую) → `set_tags`; название и теги
@@ -908,7 +940,7 @@ def help_text() -> str
 
 `settings`: меню (views.settings_menu): часовой пояс (кнопки Europe/Warsaw, Europe/Berlin, Europe/Minsk, Europe/Kyiv +
 ввод IANA), задача без времени, слоты (утро/обед/день/вечер/после работы/ночь, выходные, дата без времени),
-напоминать за (0/5/10/15/30), тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время), бюджет ($),
+тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время), бюджет ($),
 «🎙 Голос»: язык (авто/ru/en) и режим распознавания (`stt_mode`: авто/локальный/только chutes; «локальный» с пометкой
 «(не настроен)», пока пуст `LOCAL_STT_URL`). Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
 Существующие напоминания при смене настроек не перепланируются (сказать об этом в тексте меню).
@@ -945,4 +977,6 @@ class Watchdog:                                            # dumpbot/watchdog.py
   на 127.0.0.1: голос → карточка → напоминание → «Готово», запросы, правки, сбой ИИ, фото, альбом, дайджесты,
   бюджет, мёртвая задача. Время заморожено (`clock.utcnow`), планировщик вызывается через `Scheduler.tick(now)`.
   Фейк Telegram отклоняет невалидный HTML / слишком длинный текст / callback_data > 64 байт, как настоящий.
+- `tests/test_migration_0005.py` — `alembic upgrade` по-настоящему: своя временная база `<тестовая>_mig0005` на том же
+  Postgres, данные на ревизии 0004, затем 0005, `alembic check`, downgrade (no-op) и повторный upgrade.
 - Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@127.0.0.1:55432/dump_test uv run pytest`.

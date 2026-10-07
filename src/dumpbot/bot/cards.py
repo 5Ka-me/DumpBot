@@ -58,7 +58,7 @@ async def render_card(
 
 
 async def patch_card(session: AsyncSession, result: PatchResult, prefs: Prefs, now: datetime) -> View:
-    """Card after ``items.apply_patch`` / ``set_lead`` (``deleted_card`` for a deleted item)."""
+    """Card after ``items.apply_patch`` (``deleted_card`` for a deleted item)."""
     if result.deleted or result.item.status == "deleted":
         return views.deleted_card(result.item)
     return await render_card(

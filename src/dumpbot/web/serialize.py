@@ -203,7 +203,6 @@ async def item_detail(
         "deleted_at": iso(item.deleted_at),
         "urls": list(item.urls or []),
         "link_titles": _link_titles(item),
-        "lead_minutes": list(item.lead_minutes) if item.lead_minutes is not None else None,
         "reminders_off": item.lead_minutes == [],
         "rrule": item.rrule,
         "rec_active": bool(item.rec_active),

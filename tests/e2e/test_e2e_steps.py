@@ -77,7 +77,7 @@ async def test_move_checklist_to_all_steps_done(e2e: Any) -> None:
     assert len(e2e.tg.replies_to(message_id)) == 1
     assert card.text.split("\n") == [
         "📌 <b>Переезд</b>",
-        "⏰ сб 10 окт · напомню в 10:00",
+        "🔔 сб 10 окт 10:00",
         "📋 Шаги: 0/4",
         "☐ 1. Упаковать вещи",
         "☐ 2. Заказать машину · чт 8 окт 15:00",
@@ -113,17 +113,16 @@ async def test_move_checklist_to_all_steps_done(e2e: Any) -> None:
     await e2e.tick(local(2026, 10, 8, 9, 0))
     [plan] = e2e.tg.sent[sent_before:]
     assert "1. 15:00 · 📌 Заказать машину (из «Переезд»)" in plan.text
-    await e2e.tick(local(2026, 10, 8, 14, 55))
+    await e2e.tick(local(2026, 10, 8, 15, 0))
     [reminder] = e2e.tg.sent[sent_before + 1 :]
     assert reminder.text.split("\n") == [
         "🔔 <b>Заказать машину</b>",
-        "через 5 мин · сегодня 15:00",
         "↳ шаг из «Переезд»",
     ]
 
     # done from the reminder: the reminder says so and the task's card follows
     [occ] = await e2e.occurrences(steps[1].id)
-    e2e.clock.set(local(2026, 10, 8, 15, 0))
+    e2e.clock.set(local(2026, 10, 8, 15, 1))
     cards_before = len(e2e.tg.edits_of(card.message_id))
     await press(e2e, reminder, reminder.button(f"o:done:{occ.id}"))
     redrawn = await e2e.wait(lambda: e2e.tg.edits_of(card.message_id)[cards_before:], "the card redrawn")
@@ -152,7 +151,7 @@ async def test_move_checklist_to_all_steps_done(e2e: Any) -> None:
     sent_before = len(e2e.tg.sent)
     edit = await press(e2e, card, edit.button(f"c:undo:{steps[3].id}"))
     assert "✅ сделано" not in edit.text and "☐ 4. Отдать ключи" in edit.text
-    assert "⏰ сб 10 окт · напомню в 10:00" in edit.text
+    assert "🔔 сб 10 окт 10:00" in edit.text.split("\n")
     parent = await e2e.item("Переезд")
     assert parent.status == "open"
     assert [r.status for r in await e2e.reminders(parent.id)] == ["cancelled", "pending"]
@@ -258,12 +257,12 @@ async def test_related_only_between_open_items_about_the_same_thing(e2e: Any) ->
     await e2e.idle()
     eat, headphones = await e2e.item("Покушать"), await e2e.item("Купить наушники")
 
-    # 10:55 the reminder, [✅ Готово] at 11:00: «Покушать» is done
+    # 11:00 the reminder, [✅ Готово] at 11:01: «Покушать» is done
     sent_before = len(e2e.tg.sent)
-    await e2e.tick(local(2026, 10, 6, 10, 55))
+    await e2e.tick(local(2026, 10, 6, 11, 0))
     [reminder] = [c for c in e2e.tg.sent[sent_before:] if c.text.startswith("🔔 ")]  # (and the morning digest)
     assert reminder.text.startswith("🔔 <b>Покушать</b>")
-    e2e.clock.set(local(2026, 10, 6, 11, 0))
+    e2e.clock.set(local(2026, 10, 6, 11, 1))
     e2e.tg.push_callback(reminder, reminder.button("o:done:"))
     await e2e.wait(lambda: e2e.tg.edits_of(reminder.message_id), "the reminder edited")
     assert (await e2e.item("Покушать")).status == "done"
@@ -286,7 +285,7 @@ async def test_related_only_between_open_items_about_the_same_thing(e2e: Any) ->
     assert e2e.ai.extraction_requests()[-1].line("RELATED CANDIDATES") is None  # "напомни", "часов": generic
     assert card.text.split("\n")[:2] == [
         "📌 <b>Прогуглить про визу в Черногорию</b>",
-        "⏰ сегодня 17:00 · напомню в 16:55",
+        "🔔 сегодня 17:00",
     ]
     assert "🔗" not in card.text and "⚠️" not in card.text
     assert labels(card) == ["✏️ Изменить", "🔕 Без напоминания", "🗑 Удалить", "🪄 Разбить на шаги"]

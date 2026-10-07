@@ -61,7 +61,7 @@ async def test_voice_note_falls_back_to_the_local_whisper_when_chutes_stt_is_dow
     [req] = e2e.ai.extraction_requests()
     assert (req.msg, req.line("SRC ")) == ("Купить наушники в обед", "SRC voice")
     assert card.text.startswith("🛒 <b>Купить наушники</b>")
-    assert "⏰ сегодня 13:00 · напомню в 12:55" in card.text
+    assert "🔔 сегодня 13:00" in card.text.splitlines()
     assert (await e2e.raw(message_id)).transcript == "Купить наушники в обед"
 
     usage = await e2e.all(AiUsage)
@@ -105,7 +105,7 @@ async def test_local_whisper_transcript_with_a_fuzzy_period_gets_the_period_card
     assert (req.msg, req.line("SRC ")) == ("На этой неделе посмотреть Raspberry Pi", "SRC voice")
     assert card.text.split("\n")[:2] == [
         "📌 <b>Посмотреть Raspberry Pi</b>",
-        "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00",
+        "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00",
     ]
     item = await e2e.item("Посмотреть Raspberry Pi")
     assert (item.period_kind, item.period_start, item.period_end) == ("week", date(2026, 10, 5), date(2026, 10, 11))

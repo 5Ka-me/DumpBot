@@ -53,7 +53,7 @@ async def test_steps_of_an_extraction_become_child_items(session, make, now, loc
     assert await occurrences_of(steps[0].id) == [] and await occurrences_of(steps[2].id) == []
     [occ] = await occurrences_of(steps[1].id)
     assert (occ.due_at, occ.precision) == (local(2026, 10, 8, 15, 0), "exact")
-    assert await reminders_of(occ.id) == [(local(2026, 10, 8, 14, 55), "pending", 5, False)]
+    assert await reminders_of(occ.id) == [(local(2026, 10, 8, 15, 0), "pending", 0, False)]
     # the parent keeps its own time
     assert (parent.occurrence.due_at, parent.occurrence.precision) == (local(2026, 10, 10, 10, 0), "date")
 
@@ -218,7 +218,7 @@ async def test_a_parent_done_by_hand_closes_its_open_steps_and_its_undo_reopens_
     assert [(await _fresh(session, Item, s.id)).status for s in steps] == ["done", "open", "open"]
     assert (await _fresh(session, Item, parent.item.id)).status == "open"
     assert (await _fresh(session, Occurrence, timed_occ.id)).status == "open"
-    assert await reminders_of(timed_occ.id, "pending") == [(local(2026, 10, 8, 14, 55), "pending", 5, False)]
+    assert await reminders_of(timed_occ.id, "pending") == [(local(2026, 10, 8, 15, 0), "pending", 0, False)]
     events = items.take_parent_events(session)
     assert (events.closed, events.changed) == ([], {parent.item.id})
 

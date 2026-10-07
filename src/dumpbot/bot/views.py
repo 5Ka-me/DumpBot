@@ -7,14 +7,17 @@ Rules:
 - user strings are clipped *before* they are escaped and wrapped in tags, and each line keeps its tags balanced,
   so ``fit`` can drop whole lines to stay within Telegram's 4096-character limit (counted in UTF-16 units);
 - dates are rendered in Russian by ``domain.fmt`` relative to the ``now`` argument (never the wall clock);
-- fuzzy time (docs/features/iteration-2.md §A) has its own time lines: "🗓 на этой неделе (до вс 11 окт) · напомню
-  пт в 19:00", "⏳ до пт 9 окт · напомню чт в 19:00 и пт в 10:00", "🌙 когда-нибудь";
+- an item's time is its notification time (docs/requirements.md, 2026-10-07): the card's time line is the moment(s)
+  it notifies — "🔔 сегодня 13:00", "🔔 вс 11 окт 10:00 · пн 12 окт 09:00" ("за день и за час"); "🔕 сегодня 13:00"
+  with reminders off, "⏰ сегодня 13:00 · просрочено" once past, "⏰ сегодня 13:00" when done;
+- fuzzy time (docs/features/iteration-2.md §A) has its own time lines: "🗓 на этой неделе (до вс 11 окт) · 🔔 пт
+  19:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00", "🌙 когда-нибудь";
 - checklists and related items (§C): a parent's card lists its steps "☐ 1. Упаковать вещи" with a [☐ 1] / [☑ 1]
   toggle each; a step's card and reminder name the parent; list rows read "📌 Заказать машину (из «Переезд»)" and
   "📌 Переезд (2/5)"; "🔗 похоже на: «Купить наушники Sony» (12 сен)" with a [🔗 Похожее] button.
 
 Re-rendering in place (for the callbacks router):
-- card after done / undone / kind / lead / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
+- card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
   pending reminders (a done occurrence shows "✅ сделано" and [↩️ Не сделано]);
 - reminder message after ``OccCb done`` -> ``reminder_done`` (alias ``done_text``); after ``undone`` ->
   ``reminder_message(item, occ, None, ...)``; after ``s15``/``s60``/``tmr`` -> ``reminder_snoozed`` with the new
@@ -26,12 +29,10 @@ Settings callbacks (``SetCb(key, v)``) emitted by the settings menus:
 =================  =========================================  ==================================================
 key                v                                          action
 =================  =========================================  ==================================================
-``menu``           ``main`` | ``tz`` | ``lead`` | ``slots``   show that (sub)menu in place: ``settings_view(v)``
-                   | ``quiet`` | ``digest`` | ``stt``
-                   | ``budget``
+``menu``           ``main`` | ``tz`` | ``slots`` | ``quiet``  show that (sub)menu in place: ``settings_view(v)``
+                   | ``digest`` | ``stt`` | ``budget``          (an unknown one, e.g. the old ``lead``: the main menu)
 ``close``          ``""``                                     close the menu (remove the keyboard)
 ``tz``             IANA name, e.g. ``Europe/Warsaw``          set ``Prefs.tz``
-``lead``           minutes: ``0`` ``5`` ``10`` ``15`` ``30``  set ``Prefs.lead_minutes``
 ``quiet_toggle``   ``""``                                     flip ``Prefs.quiet_enabled``
 ``digest_toggle``  ``morning`` | ``evening``                  flip ``Prefs.digest_<v>_enabled``
 ``stt``            ``auto`` | ``ru`` | ``en``                 set ``Prefs.stt_language`` (``auto`` -> None)
@@ -40,13 +41,13 @@ key                v                                          action
 ``ask``            a ``Prefs`` field name from ``ASK_FIELDS``  ask the user to type a value for that field: show
                                                               ``settings_ask(v, prefs)``, wait for text (FSM),
                                                               validate it (``HH:MM`` for times, IANA name for
-                                                              ``tz``, int minutes 0..10080 for ``lead_minutes``,
-                                                              number >= 0 for ``budget_usd``), save, then show
-                                                              ``settings_view(ASK_FIELDS[v].menu)``
+                                                              ``tz``, number >= 0 for ``budget_usd``), save,
+                                                              then show ``settings_view(ASK_FIELDS[v].menu)``
 =================  =========================================  ==================================================
 
 After any change the router saves prefs, wakes the scheduler and re-renders the submenu the button came from
-(``SETTINGS_PARENT`` maps keys to it). Changes apply to new reminders only; existing ones are not re-planned.
+(``SETTINGS_PARENT`` maps keys to it). Changes apply to new reminders only; existing ones are not re-planned. Buttons
+of the removed "⏱ Напоминать за" (key ``lead``, ``ask`` ``lead_minutes``) answer "Кнопка устарела".
 """
 
 from __future__ import annotations
@@ -61,7 +62,7 @@ from zoneinfo import ZoneInfo
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import AskCb, ItemCb, KindCb, LeadCb, PickCb, SetCb
+from dumpbot.bot.cbdata import AskCb, ItemCb, KindCb, PickCb, SetCb
 from dumpbot.bot.keyboards import (
     BACK,
     back_to_card_row,
@@ -74,7 +75,7 @@ from dumpbot.bot.keyboards import (
     reminder_keyboard,
     undone_keyboard,
 )
-from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time
+from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_time
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS, KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import SLOT_LABELS, SLOT_NAMES, Prefs
 from dumpbot.domain.recurrence import describe_rrule_ru
@@ -132,7 +133,6 @@ _SEASON_WORDS: Final[dict[int, tuple[str, str]]] = {
     9: ("осенью", "этой осенью"),
     12: ("зимой", "этой зимой"),
 }
-LEAD_CHOICES: Final[tuple[int, ...]] = (0, 5, 15, 30, 60, 1440)  # item "remind before" menu
 NEEDS_CONFIRM_HINT: Final = "проверь, правильно ли я понял"
 
 # --- text helpers ------------------------------------------------------------------------------------------------
@@ -213,22 +213,6 @@ def _local(dt: datetime, tz: ZoneInfo) -> datetime:
     return dt.astimezone(tz) if dt.tzinfo is not None else dt.replace(tzinfo=UTC).astimezone(tz)
 
 
-def _rough_duration(minutes: int) -> str:
-    """Duration for relative times: "5 мин", "2 ч 30 мин"; a day or more is rounded to hours ("1 дн 2 ч")."""
-    if minutes >= 1440:
-        minutes = round(minutes / 60) * 60
-    return fmt_duration(minutes)
-
-
-def _relative(due: datetime, now: datetime) -> str:
-    minutes = round((due - now).total_seconds() / 60)
-    if minutes == 0:
-        return "сейчас"
-    if minutes > 0:
-        return f"через {_rough_duration(minutes)}"
-    return f"просрочено на {_rough_duration(-minutes)}"
-
-
 def fmt_money(usd: float) -> str:
     if 0 < usd < 0.01:
         return f"${usd:.4f}"
@@ -241,16 +225,6 @@ def _kind_emoji(kind: str | None) -> str:
 
 def _kind_label(kind: str | None) -> str:
     return KIND_LABELS.get(kind or "", kind or "Другое")
-
-
-def _lead_setting(minutes: int) -> str:
-    return "в момент события" if minutes == 0 else f"за {fmt_duration(minutes)}"
-
-
-def _join_ru(parts: Sequence[str]) -> str:
-    if len(parts) <= 1:
-        return "".join(parts)
-    return ", ".join(parts[:-1]) + " и " + parts[-1]
 
 
 # --- item card ---------------------------------------------------------------------------------------------------
@@ -266,38 +240,19 @@ def _occ_done(item: Item, occ: Occurrence | None) -> bool:
     return item.status == "done"
 
 
-def _reminder_phrase(due: datetime, pending: Sequence[Reminder], tz: ZoneInfo, now: datetime, *, with_day: bool) -> str:
-    """Reminder part of the time line: "напомню в 12:55", "напомню завтра в 10:00", "напомню за 1 дн и за 1 ч"."""
-    if not pending:
-        return "просрочено" if due <= now else "без напоминания"
-    today = _local(now, tz).date()
-    if len(pending) == 1:
-        fire = pending[0].fire_at
-        if fire <= now + timedelta(minutes=1):
-            return "напомню сейчас"
-        fire_local = _local(fire, tz)
-        if not with_day and fire_local.date() == _local(due, tz).date():
-            return f"напомню в {fmt_time(fire_local.time())}"
-        return f"напомню {fmt_date(fire_local.date(), today=today)} в {fmt_time(fire_local.time())}"
-    leads = sorted({r.lead_minutes or 0 for r in pending}, reverse=True)
-    due_time = fmt_time(_local(due, tz).time())
-    return "напомню " + _join_ru([f"за {fmt_duration(m)}" if m > 0 else f"в {due_time}" for m in leads])
+def _notify_times(pending: Sequence[Reminder], tz: ZoneInfo, now: datetime) -> str:
+    """ "🔔 сегодня 13:00", several "🔔 вс 11 окт 10:00 · пн 12 окт 09:00": when the item notifies."""
+    return "🔔 " + " · ".join(dict.fromkeys(fmt_dt(r.fire_at, tz, now=now) for r in pending))
 
 
-def _fires_phrase(pending: Sequence[Reminder], tz: ZoneInfo, now: datetime) -> str:
-    """Reminder moments by day: "напомню пт в 19:00", "напомню чт в 19:00 и пт в 10:00", "напомню сейчас"."""
+def _notify_days(pending: Sequence[Reminder], tz: ZoneInfo, now: datetime) -> str:
+    """Notifications of a span or a deadline by day: "🔔 пт 19:00", "🔔 чт 19:00, пт 10:00"."""
     today = _local(now, tz).date()
-    parts: list[str] = []
-    for r in pending:
-        local = _local(r.fire_at, tz)
-        part = (
-            "сейчас"
-            if r.fire_at <= now + timedelta(minutes=1)
-            else f"{fmt_day(local.date(), today=today)} в {fmt_time(local.time())}"
-        )
-        if part not in parts:
-            parts.append(part)
-    return "напомню " + _join_ru(parts)
+    parts = (
+        f"{fmt_day(_local(r.fire_at, tz).date(), today=today)} {fmt_time(_local(r.fire_at, tz).time())}"
+        for r in pending
+    )
+    return "🔔 " + ", ".join(dict.fromkeys(parts))
 
 
 def period_label(kind: str | None, start: date, end: date, today: date) -> str:
@@ -366,9 +321,9 @@ def _fuzzy_time_line(
         return head
     pending = _pending(reminders)
     if pending:
-        return f"{head} · {_fires_phrase(pending, tz, now)}"
+        return f"{head} · {_notify_days(pending, tz, now)}"
     running = item.period_end is not None and item.period_end >= today and occ.precision == "period"
-    return f"{head} · {'без напоминания' if running or occ.due_at > now else 'просрочено'}"
+    return f"{head} · {'🔕 без напоминания' if running or occ.due_at > now else 'просрочено'}"
 
 
 def _time_line(
@@ -383,25 +338,28 @@ def _time_line(
         return fuzzy
     tz = prefs.zone
     done = _occ_done(item, occ)
-    if occ.precision == "default":
-        if done or occ.status == "cancelled":  # a time the bot chose, no longer planned: nothing to show
-            return None
-        head = "без срока"
-    elif occ.precision == "date":
-        head = fmt_date(_local(occ.due_at, tz).date(), today=_local(now, tz).date())
-    else:
-        head = fmt_dt(occ.due_at, tz, now=now)
+    if occ.precision == "default" and (done or occ.status == "cancelled"):
+        return None  # a time the bot chose, no longer planned: nothing to show
     if done or occ.status in ("missed", "cancelled"):
-        return f"⏰ {head}"
-    phrase = _reminder_phrase(occ.due_at, _pending(reminders), tz, now, with_day=occ.precision == "default")
-    return f"⏰ {head} · {phrase}"
+        if occ.precision in ("date", "default"):
+            return f"⏰ {fmt_date(_local(occ.due_at, tz).date(), today=_local(now, tz).date())}"
+        return f"⏰ {fmt_dt(occ.due_at, tz, now=now)}"
+    pending = _pending(reminders)
+    if pending:
+        return _notify_times(pending, tz, now)
+    if occ.due_at <= now:
+        return f"⏰ {fmt_dt(occ.due_at, tz, now=now)} · просрочено"
+    if occ.precision == "default":  # reminders off, and the time was only the bot's choice
+        return "🔕 без напоминания"
+    return f"🔕 {fmt_dt(occ.due_at, tz, now=now)}"
 
 
 def time_text(
     item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime
 ) -> str | None:
-    """The card's time line as plain text, for the Mini App: "⏰ сегодня 13:00 · напомню в 12:55",
-    "🗓 на этой неделе (до вс 11 окт) · напомню пт в 19:00", "🌙 когда-нибудь"."""
+    """The card's time line as plain text, for the Mini App: "🔔 сегодня 13:00", "🔔 вс 11 окт 10:00 · пн 12 окт
+    09:00", "🗓 на этой неделе (до вс 11 окт) · 🔔 пт 19:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00",
+    "🌙 когда-нибудь"."""
     if item.someday:
         occ = None
     line = _time_line(item, occ, reminders, prefs, now)
@@ -653,7 +611,8 @@ def edit_menu(item: Item) -> MenuView:
     text = (
         f"✏️ <b>{q(item.title)}</b>\n"
         "Что изменить?\n"
-        "<i>Можно просто ответить на карточку текстом, например «перенеси на завтра 15:00» или «это идея».</i>"
+        "<i>Можно просто ответить на карточку текстом, например «перенеси на завтра 15:00», «напомни за час»"
+        " или «это идея».</i>"
     )
     done_row = (
         [button("✅ Готово", ItemCb(a="done", id=item.id), style="success")]
@@ -664,7 +623,7 @@ def edit_menu(item: Item) -> MenuView:
         done_row,
         [button("🕒 Время", ItemCb(a="time", id=item.id)), button("🏷 Категория", ItemCb(a="kind", id=item.id))],
         [button("#️⃣ Теги", ItemCb(a="tags", id=item.id)), button("✏️ Название", ItemCb(a="title", id=item.id))],
-        [button("⏱ Напомнить за…", ItemCb(a="lead", id=item.id)), *back_to_card_row(item.id)],
+        back_to_card_row(item.id),
     )
     return text, kb
 
@@ -677,22 +636,6 @@ def kind_menu(item: Item) -> MenuView:
     ]
     text = f"🏷 Категория для <b>{q(item.title)}</b>:"
     return text, markup(*chunked(buttons, 3), back_to_card_row(item.id))
-
-
-def lead_menu(item: Item) -> MenuView:
-    """0/5/15/30/60/1440 minutes before (the item's own override marked ✓; ``[]`` = switched off by 🔕)."""
-    current = set(item.lead_minutes or [])
-    buttons = [
-        button(f"{'✓ ' if m in current else ''}{'В момент' if m == 0 else fmt_duration(m)}", LeadCb(id=item.id, m=m))
-        for m in LEAD_CHOICES
-    ]
-    now_text = _join_ru([_lead_setting(m) for m in sorted(current, reverse=True)])
-    lines = [f"⏱ За сколько напомнить о <b>{q(item.title)}</b>?"]
-    if item.lead_minutes == []:
-        lines.append("Сейчас: напоминания выключены")
-    else:
-        lines.append(f"Сейчас: {now_text}" if current else "Сейчас: как в настройках")
-    return "\n".join(lines), markup(*chunked(buttons, 3), back_to_card_row(item.id))
 
 
 # --- reminders ---------------------------------------------------------------------------------------------------
@@ -711,19 +654,29 @@ def reminder_message(
     *,
     parent_title: str | None = None,
 ) -> MenuView:
-    """Reminder: "🔔 <b>Купить наушники</b>", "через 5 мин · сегодня 13:00", then [✅ Готово] / [⏰ 15 мин]
-    [⏰ 1 час] [📅 Завтра]. A step of a checklist names its parent (``parent_title``): "↳ шаг из «Переезд»".
+    """Reminder: "🔔 <b>Купить наушники</b>" (the item's time is this notification, so no time line), then for a span
+    "🗓 на этой неделе (до вс 11 окт)", for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00"; then
+    [✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]. A step of a checklist names its parent (``parent_title``):
+    "↳ шаг из «Переезд»".
 
     ``reminder`` is accepted for the contract; the text depends only on the occurrence and ``now``.
     """
-    lines = [f"🔔 <b>{q(item.title)}</b>", _reminder_when(item, occ, prefs, now)]
-    lines += filter(None, [_parent_line(parent_title), _recurrence_line(item), _details_line(item)])
+    lines = [f"🔔 <b>{q(item.title)}</b>"]
+    lines += filter(
+        None,
+        [
+            _reminder_context(item, occ, prefs, now),
+            _parent_line(parent_title),
+            _recurrence_line(item),
+            _details_line(item),
+        ],
+    )
     return fit("\n".join(lines)), reminder_keyboard(occ.id)
 
 
-def _reminder_when(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> str:
-    """Second line of a reminder: "через 5 мин · сегодня 13:00"; for a span "🗓 на этой неделе (до вс 11 окт)";
-    for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00 · через 5 мин"."""
+def _reminder_context(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> str | None:
+    """What a reminder says besides the title: the span ("🗓 на этой неделе (до вс 11 окт)") or the deadline
+    ("⏳ срок: завтра", "⏳ срок: сегодня в 15:00"); None for an ordinary time."""
     tz = prefs.zone
     today = _local(now, tz).date()
     head = _period_head(item, occ, today)
@@ -734,8 +687,8 @@ def _reminder_when(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> 
         day = fmt_date(local.date(), today=today)
         if occ.precision in ("date", "fallback"):
             return f"⏳ срок: {day}"
-        return f"⏳ срок: {day} в {fmt_time(local.time())} · {_relative(occ.due_at, now)}"
-    return f"{_relative(occ.due_at, now)} · {fmt_dt(occ.due_at, tz, now=now)}"
+        return f"⏳ срок: {day} в {fmt_time(local.time())}"
+    return None
 
 
 def reminder_done(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> MenuView:
@@ -756,8 +709,8 @@ done_text = reminder_done  # contract name (architecture §4.18)
 
 
 def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> View:
-    """Reminder edited after a snooze button: "💤 отложено · напомню сегодня в 13:15", without buttons (the snoozed
-    reminder comes again with its own [✅ Готово] / [⏰ …])."""
+    """Reminder edited after a snooze button: "💤 отложено · напомню сегодня в 13:15" (the item's time moved there),
+    without buttons (the snoozed reminder comes again with its own [✅ Готово] / [⏰ …])."""
     tz = prefs.zone
     fire = _local(reminder.fire_at, tz)
     when = f"{fmt_date(fire.date(), today=_local(now, tz).date())} в {fmt_time(fire.time())}"
@@ -947,7 +900,7 @@ def help_text() -> str:
             "• текст, голосовые и аудиофайлы (до 5 мин), фото и скриншоты (можно файлом), ссылки, пересланные посты",
             "• кружочки сохраняю без распознавания (с подписью — разберу подпись)",
             "• в одном сообщении может быть несколько дел — разберу на отдельные записи",
-            "• «завтра в 15 созвон», «купить молоко», «каждый понедельник в 9 планёрка, напомни за 10 минут»",
+            "• «завтра в 15 созвон», «купить молоко», «каждый понедельник в 9 планёрка»",
             "• заметки, идеи, мемы и ссылки отмечаю реакцией 👌, задачи и события — карточкой с кнопками",
             "",
             "<b>Вопросы</b>",
@@ -955,19 +908,23 @@ def help_text() -> str:
             "• начни сообщение с «?», чтобы оно точно считалось вопросом",
             "",
             "<b>Правка</b>",
-            "• ответь (reply) на карточку текстом: «перенеси на пятницу 18:00», «это идея», «удали»",
+            "• ответь (reply) на карточку текстом: «перенеси на пятницу 18:00», «напомни за час», «это идея», «удали»",
             "• запись без карточки (заметка, идея) — ответом на своё сообщение: «это задача, напомни вечером»",
             "• или нажми «✏️ Изменить» в карточке",
             "• правка исходного сообщения в Telegram запись не меняет",
             "",
             "<b>Напоминания</b>",
-            "• о событиях со временем — заранее (по умолчанию за 5 мин), задачи без времени — вечером (19:00)",
+            "• время записи — это время напоминания: «встреча в 15» — напомню в 15:00, «в обед» — в 13:00;"
+            " задачи без времени — вечером (19:00)",
+            "• «напомни за 30 минут до встречи в 15» — напомню в 14:30, а 15:00 останется в названии;"
+            " «за день и за час» — оба раза",
             "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00 (и утром первого дня,"
             " если срок ещё не начался); такие дела каждое утро в плане, пока срок идёт",
             "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
             " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
-            "• в напоминании: ✅ Готово, ⏰ отложить на 15 мин / 1 час, 📅 на завтра",
+            "• в напоминании: ✅ Готово, ⏰ отложить на 15 мин / 1 час, 📅 на завтра — запись переезжает"
+            " на новое время (и в плане на день, и в приложении)",
             "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",
             "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
             "• в тихие часы приходят только напоминания с явно заданным временем",
@@ -1009,7 +966,6 @@ def help_text() -> str:
 # --- settings ----------------------------------------------------------------------------------------------------
 
 TZ_CHOICES: Final[tuple[str, ...]] = ("Europe/Warsaw", "Europe/Berlin", "Europe/Minsk", "Europe/Kyiv")
-SETTINGS_LEAD_CHOICES: Final[tuple[int, ...]] = (0, 5, 10, 15, 30)
 BUDGET_CHOICES: Final[tuple[int, ...]] = (1, 3, 5, 10)
 STT_CHOICES: Final[tuple[tuple[str, str], ...]] = (("auto", "Авто"), ("ru", "Русский"), ("en", "English"))
 # Prefs.stt_mode -> (short label, button text).
@@ -1024,14 +980,13 @@ SETTINGS_NOTE: Final = "<i>Изменения действуют для новы
 
 class AskField(NamedTuple):
     label: str  # shown in the prompt: «Введи … для «утро»»
-    kind: str  # time | tz | minutes | money
+    kind: str  # time | tz | money
     menu: str  # submenu to return to
 
 
 ASK_FIELDS: Final[dict[str, AskField]] = {
     "tz": AskField("часовой пояс", "tz", "tz"),
     "task_default_time": AskField("задача без времени", "time", "main"),
-    "lead_minutes": AskField("напоминать за", "minutes", "lead"),
     **{f"slot_{s}": AskField(SLOT_LABELS[s], "time", "slots") for s in SLOT_NAMES},
     "weekend_time": AskField("на выходных (суббота)", "time", "slots"),
     "bare_date_time": AskField("дата без времени", "time", "slots"),
@@ -1045,7 +1000,6 @@ ASK_FIELDS: Final[dict[str, AskField]] = {
 # SetCb key -> submenu to re-render after the change ("ask" -> ASK_FIELDS[v].menu).
 SETTINGS_PARENT: Final[dict[str, str]] = {
     "tz": "tz",
-    "lead": "lead",
     "quiet_toggle": "quiet",
     "digest_toggle": "digest",
     "stt": "stt",
@@ -1087,8 +1041,6 @@ def _ask_button(text: str, field: str) -> InlineKeyboardButton:
 
 def _field_value(prefs: Prefs, field: str) -> str:
     value = getattr(prefs, field)
-    if field == "lead_minutes":
-        return _lead_setting(value)
     if field == "budget_usd":
         return fmt_money(value)
     return fmt_time(value) if hasattr(value, "hour") else esc(value)
@@ -1102,7 +1054,6 @@ def settings_menu(prefs: Prefs) -> MenuView:
         "",
         f"🌍 Часовой пояс: {esc(prefs.tz)}",
         f"📌 Задача без времени: {fmt_time(prefs.task_default_time)}",
-        f"⏱ Напоминать: {_lead_setting(prefs.lead_minutes)}",
         f"🕘 Время суток: {slots}",
         f"   выходные — сб {fmt_time(prefs.weekend_time)}, дата без времени — {fmt_time(prefs.bare_date_time)}",
         f"🌙 Тихие часы: {fmt_time(prefs.quiet_start)}–{fmt_time(prefs.quiet_end)} ({_on_off(prefs.quiet_enabled)})",
@@ -1118,12 +1069,9 @@ def settings_menu(prefs: Prefs) -> MenuView:
             button("🌍 Часовой пояс", SetCb(key="menu", v="tz")),
             _ask_button("📌 Задача без времени", "task_default_time"),
         ],
-        [
-            button("⏱ Напоминать за", SetCb(key="menu", v="lead")),
-            button("🕘 Время суток", SetCb(key="menu", v="slots")),
-        ],
-        [button("🌙 Тихие часы", SetCb(key="menu", v="quiet")), button("📰 Дайджесты", SetCb(key="menu", v="digest"))],
-        [button("💰 Бюджет", SetCb(key="menu", v="budget")), button("🎙 Голос", SetCb(key="menu", v="stt"))],
+        [button("🕘 Время суток", SetCb(key="menu", v="slots")), button("🌙 Тихие часы", SetCb(key="menu", v="quiet"))],
+        [button("📰 Дайджесты", SetCb(key="menu", v="digest")), button("💰 Бюджет", SetCb(key="menu", v="budget"))],
+        [button("🎙 Голос", SetCb(key="menu", v="stt"))],
         [button("✖️ Закрыть", SetCb(key="close"))],
     )
     return "\n".join(lines), kb
@@ -1141,25 +1089,6 @@ def settings_tz_menu(prefs: Prefs) -> MenuView:
     )
     buttons = [button(f"{_check(tz == prefs.tz)}{tz}", SetCb(key="tz", v=tz)) for tz in TZ_CHOICES]
     return text, markup(*chunked(buttons, 2), [_ask_button("✍️ Другой…", "tz")], _back_row())
-
-
-def settings_lead_menu(prefs: Prefs) -> MenuView:
-    text = "\n".join(
-        [
-            "⏱ <b>Напоминать о событии</b>",
-            f"Сейчас: {_lead_setting(prefs.lead_minutes)}",
-            "Для событий с точным временем; в сообщении можно указать своё («напомни за 30 минут»).",
-            "",
-            SETTINGS_NOTE,
-        ]
-    )
-    buttons = [
-        button(
-            f"{_check(m == prefs.lead_minutes)}{'В момент' if m == 0 else fmt_duration(m)}", SetCb(key="lead", v=str(m))
-        )
-        for m in SETTINGS_LEAD_CHOICES
-    ]
-    return text, markup(*chunked(buttons, 3), [_ask_button("✍️ Своё значение", "lead_minutes")], _back_row())
 
 
 def settings_slots_menu(prefs: Prefs) -> MenuView:
@@ -1266,7 +1195,6 @@ def settings_budget_menu(prefs: Prefs) -> MenuView:
 SETTINGS_MENUS: Final[dict[str, Callable[[Prefs], MenuView]]] = {
     "main": settings_menu,
     "tz": settings_tz_menu,
-    "lead": settings_lead_menu,
     "slots": settings_slots_menu,
     "quiet": settings_quiet_menu,
     "digest": settings_digest_menu,
@@ -1286,7 +1214,6 @@ def settings_view(name: str, prefs: Prefs, *, local_stt: bool = False) -> MenuVi
 _ASK_HINTS: Final[dict[str, str]] = {
     "time": "в формате ЧЧ:ММ, например 09:30",
     "tz": "— название IANA, например Europe/Warsaw или Asia/Tbilisi",
-    "minutes": "— число минут от 0 до 10080, например 15",
     "money": "— сумма в долларах в месяц, например 5 или 7.5",
 }
 

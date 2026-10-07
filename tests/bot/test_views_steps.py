@@ -91,7 +91,7 @@ def test_step_card_and_reminder_name_the_parent(make_item, make_occ, prefs, now,
     assert text.split("\n")[:2] == ["📌 <b>Заказать машину</b>", "↳ шаг из «Переезд &lt;дом&gt;»"]
     occ = make_occ(at(2026, 10, 6, 15, 0))
     reminder, _ = check_view(views.reminder_message(step, occ, None, prefs, now, parent_title="Переезд"))
-    assert reminder.split("\n") == ["🔔 <b>Заказать машину</b>", "через 55 мин · сегодня 15:00", "↳ шаг из «Переезд»"]
+    assert reminder.split("\n") == ["🔔 <b>Заказать машину</b>", "↳ шаг из «Переезд»"]
 
 
 def test_rows_name_the_parent_or_count_the_steps(make_row, prefs, now, at, check_view):
