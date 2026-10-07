@@ -438,6 +438,12 @@ curl -i https://dump.tail1234.ts.net/api/me                      # 401 {"error":
 данных. Первый HTTPS-запрос может идти до минуты (Tailscale выпускает сертификат), а новое имя в публичном DNS
 появляется в течение 10 минут.
 
+Если кнопка в чате осталась «Menu»: проверьте `docker compose logs bot | grep WEBAPP_URL` — адрес должен быть полным,
+`https://dump.<tailnet>.ts.net` (не просто `<tailnet>.ts.net`); после правки `.env` — `docker compose up -d`.
+Если адрес не открывается: `nslookup dump.<tailnet>.ts.net` — публичная DNS-запись иногда появляется дольше обещанных
+10 минут (у нас — около 25). Помогает `docker compose restart tailscale` (Funnel регистрируется заново) и ожидание;
+после появления записи DNS провайдера может ещё ~5 минут помнить её отсутствие.
+
 Если не работает: `docker compose --profile miniapp logs tailscale` (ключ просрочен или уже использован — создайте
 новый, очистите том: `docker compose --profile miniapp rm -sf tailscale` и `docker volume rm dumpbot_tailscale-state`,
 запустите снова); `funnel status` пустой — проверьте шаги 2–3. Приложение пишет «Сессия устарела» — закройте его и
