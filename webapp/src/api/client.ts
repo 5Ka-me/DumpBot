@@ -19,7 +19,10 @@ import type {
   JobAccepted,
   JobStatus,
   Me,
+  MoveRequest,
+  MoveResult,
   NewStep,
+  OccurrenceRequest,
   RowsResponse,
   SettingsPatch,
   SettingsResponse,
@@ -72,6 +75,8 @@ export interface ApiOptions {
 export interface CallOptions {
   signal?: AbortSignal;
   timeoutMs?: number;
+  /** The browser's HTTP cache (default "no-store": API answers are never reused; pictures may be). */
+  cache?: RequestCache;
 }
 
 const DEFAULT_TIMEOUT_MS = 20_000;
@@ -163,7 +168,7 @@ export function createApi(options: ApiOptions) {
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: limit.signal,
         credentials: "same-origin",
-        cache: "no-store",
+        cache: call.cache ?? "no-store",
       });
     } catch (e) {
       if (limit.timedOut()) throw new ApiError(0, "timeout", TIMEOUT_TEXT);
@@ -211,6 +216,11 @@ export function createApi(options: ApiOptions) {
     whenAt: (id: number, dueLocal: string) =>
       post<ItemResponse>(`/api/items/${id}/when`, { due_local: dueLocal } satisfies WhenRequest),
     action: (id: number, action: Exclude<ItemAction, "snooze">) => post<ItemResponse>(`/api/items/${id}/${action}`),
+    /** ☐ / ☑ of a list row: done / not done of exactly its occurrence (a series' missed morning, Thursday's row). */
+    occurrenceAction: (id: number, action: "done" | "undone", occurrenceId: number) =>
+      post<ItemResponse>(`/api/items/${id}/${action}`, { occurrence_id: occurrenceId } satisfies OccurrenceRequest),
+    /** «📅 Перенести невыполненное на завтра» of `day` (default: today). */
+    moveToTomorrow: (day?: string) => post<MoveResult>("/api/today/move", (day ? { day } : {}) satisfies MoveRequest),
     snooze: (id: number, body: SnoozeRequest) => post<ItemResponse>(`/api/items/${id}/snooze`, body),
     split: (id: number) => post<JobAccepted>(`/api/items/${id}/split`),
     addStep: (id: number, body: NewStep) => post<StepResponse>(`/api/items/${id}/steps`, body),
@@ -232,8 +242,12 @@ export function createApi(options: ApiOptions) {
     patchSettings: (body: SettingsPatch) => patch<SettingsResponse>("/api/settings", body),
     usage: (call?: CallOptions) => get<Usage>("/api/usage", call),
 
-    /** A picture preview (`ImageRef.url`, `/api/files/{id}/{n}`) as a Blob, with the same authorization. */
-    image: async (path: string, call?: CallOptions): Promise<Blob> => (await send("GET", path, undefined, call)).blob(),
+    /**
+     * A picture preview (`ImageRef.url`, `/api/files/{id}/{n}[?size=thumb]`) as a Blob, with the same authorization.
+     * The browser's cache may answer it: the server allows a day (`private, max-age=86400`).
+     */
+    image: async (path: string, call?: CallOptions): Promise<Blob> =>
+      (await send("GET", path, undefined, { cache: "default", ...call })).blob(),
   };
 }
 

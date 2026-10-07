@@ -1535,7 +1535,7 @@ async def _patch_result(
 async def _owner_prefs(session: AsyncSession) -> Prefs:
     """Prefs of the (single) owner, for callers that do not pass them."""
     row = await session.scalar(select(UserSettings).order_by(UserSettings.owner_id).limit(1))
-    return Prefs.model_validate(row.prefs or {}) if row is not None else Prefs()
+    return Prefs.from_stored(row.prefs) if row is not None else Prefs()
 
 
 def _role(item: Item) -> str:

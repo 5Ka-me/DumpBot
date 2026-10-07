@@ -2,19 +2,21 @@
  * «Карточка»: everything about one item and every edit of the bot — title, details, category, tags, the time (by
  * words through the AI or from the picker, a span, «когда-нибудь»), «напомнить за», no reminders, snooze, done /
  * not done, delete / restore, stop repeating, the checklist with «🪄 Разбить на шаги», related items, the source.
+ * An unsaved title / details is a draft (lib/drafts): it comes back after an expired session.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useContext, useEffect, useRef, useState } from "react";
 import { ApiError, api } from "../../api";
 import type { ItemDetail, ItemPatch, ItemResponse, Kind, PeriodValue, Step, StepPatch, StepResponse } from "../../api/types";
 import { AutoTextarea } from "../../components/AutoTextarea";
 import { Sheet } from "../../components/Sheet";
 import { Chip, Empty, ErrorBox, Loading, ScreenHeader, Section, Spinner } from "../../components/ui";
+import { clearDraft, useDraft } from "../../lib/drafts";
 import { fmtDateTime, fmtStamp, leadLabel } from "../../lib/format";
 import { ACTIONABLE, SOURCE_LABELS, kindInfo } from "../../lib/kinds";
 import { useMainButton } from "../../lib/mainButton";
 import { useKinds, useTz } from "../../lib/me";
 import { useBackHandler, useNav } from "../../lib/nav";
-import { itemsChanged, setCached, useResource } from "../../lib/store";
+import { ScreenActive, itemsChanged, setCached, useResource } from "../../lib/store";
 import { toast, toastError } from "../../lib/toast";
 import { confirmDialog, haptic, openExternal, setClosingConfirmation } from "../../telegram";
 import { Gallery } from "./Gallery";
@@ -22,7 +24,7 @@ import { KindPicker } from "./KindPicker";
 import { Steps } from "./Steps";
 import { TagsEditor } from "./TagsEditor";
 import { TimeSheet } from "./TimeSheet";
-import { useJob } from "./useJob";
+import { useJob, useSplitPolling } from "./useJob";
 
 export const LEAD_CHOICES = [0, 5, 15, 30, 60, 1440] as const;
 export const SNOOZE_CHOICES: { label: string; minutes: number | null }[] = [
@@ -78,7 +80,8 @@ export function CardScreen({ id }: { id: number }) {
   const [warnings, setWarnings] = useState<string[]>([]);
   const [timeOpen, setTimeOpen] = useState(false);
   const [leadOpen, setLeadOpen] = useState(false);
-  const [draft, setDraft] = useState<{ title: string; details: string } | null>(null);
+  const draftKey = `card:${id}`;
+  const [draft, setDraft] = useDraft<{ title: string; details: string }>(draftKey);
   const { job, start, waitText } = useJob((jobWarnings) => {
     setWarnings(jobWarnings);
     return res.reload();
@@ -110,31 +113,36 @@ export function CardScreen({ id }: { id: number }) {
     [apply, reload],
   );
 
-  // «🪄 Разбить» started elsewhere (the chat): refresh until it ends.
-  const splitPending = Boolean(item?.split_pending) && !job;
-  useEffect(() => {
-    if (!splitPending) return;
-    const timer = setInterval(() => void reload(), 2500);
-    return () => clearInterval(timer);
-  }, [splitPending, reload]);
+  // «🪄 Разбить» started elsewhere (the chat): refresh until it ends, while this card is on top.
+  const active = useContext(ScreenActive);
+  useSplitPolling(Boolean(item?.split_pending) && !job && active, reload);
 
   const title = draft?.title ?? item?.title ?? "";
   const details = draft?.details ?? item?.details ?? "";
   const dirty = Boolean(item && draft && (draft.title.trim() !== item.title || draft.details.trim() !== (item.details ?? "")));
+  const same = Boolean(item && draft && draft.title === item.title && draft.details === (item.details ?? ""));
+  useEffect(() => {
+    if (same) setDraft(undefined); // typed back to exactly what is saved: nothing to keep
+  }, [same, setDraft]);
+  const keep = useRef(dirty);
+  useEffect(() => {
+    keep.current = dirty || !item; // not loaded yet: a restored draft is not known to be clean
+  });
+  useEffect(() => () => void (keep.current || clearDraft(draftKey)), [draftKey]); // only unsaved changes outlive the card
 
   const save = async () => {
     if (!item) return;
     const patch: ItemPatch = {};
     if (title.trim() !== item.title) patch.title = title.trim();
     if (details.trim() !== (item.details ?? "")) patch.details = details.trim() || null;
-    if (await run("save", () => api.patchItem(id, patch))) setDraft(null);
+    if (await run("save", () => api.patchItem(id, patch))) setDraft(undefined);
   };
 
   useMainButton(dirty ? { text: "Сохранить", onClick: () => void save(), progress: busy === "save", disabled: !title.trim() } : null);
   useBackHandler(dirty, () => {
     void confirmDialog("Изменения не сохранены. Выйти без сохранения?").then((leave) => {
       if (!leave) return;
-      setDraft(null);
+      setDraft(undefined);
       nav.pop();
     });
   });
@@ -257,7 +265,7 @@ export function CardScreen({ id }: { id: number }) {
         />
         {dirty && (
           <div className="row row--action draft-actions">
-            <button type="button" className="text-button" onClick={() => setDraft(null)}>
+            <button type="button" className="text-button" onClick={() => setDraft(undefined)}>
               Отменить
             </button>
             <span className="field-hint">Сохранить — кнопкой внизу</span>

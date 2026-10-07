@@ -27,7 +27,7 @@ async def load_prefs(
             .on_conflict_do_nothing(index_elements=[UserSettings.owner_id])
         )
         return prefs
-    return Prefs.model_validate(row.prefs or {})
+    return Prefs.from_stored(row.prefs)
 
 
 async def save_prefs(session: AsyncSession, owner_id: int, prefs: Prefs) -> None:

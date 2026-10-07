@@ -1,5 +1,5 @@
 /** «🕒 Время»: by words (the AI, like the bot's button), from the date / time picker, or a span without a date. */
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ItemDetail, PeriodValue } from "../../api/types";
 import { Sheet } from "../../components/Sheet";
 import { Chip } from "../../components/ui";
@@ -52,14 +52,21 @@ export function TimeSheet({
   const [date, setDate] = useState("");
   const [time, setTime] = useState("");
   const today = todayIn(tz);
+  // The fields start from the item when the sheet opens, and only then: a refetch of the card while it is open (back
+  // from the background, a list change elsewhere, a split being waited for) must not wipe what is being typed.
+  const start = useRef({ occurrence: item.occurrence, today });
+  useEffect(() => {
+    start.current = { occurrence: item.occurrence, today };
+  });
   useEffect(() => {
     if (!open) return;
-    const local = item.occurrence?.due_local;
-    const precise = item.occurrence && !["date", "fallback", "period", "soon", "someday", "none"].includes(item.occurrence.precision);
+    const { occurrence, today: day } = start.current;
+    const local = occurrence?.due_local;
+    const precise = occurrence && !["date", "fallback", "period", "soon", "someday", "none"].includes(occurrence.precision);
     setText("");
-    setDate(local ? local.slice(0, 10) : today);
+    setDate(local ? local.slice(0, 10) : day);
     setTime(local && precise ? local.slice(11, 16) : "");
-  }, [open, item.occurrence, today]);
+  }, [open]);
   const later = laterMonth(today);
   return (
     <Sheet open={open} title="🕒 Время" onClose={onClose}>

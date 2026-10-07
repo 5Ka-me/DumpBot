@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time, timedelta
 from typing import Literal, cast
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from dumpbot.db.models import Occurrence
+from dumpbot.domain import timeresolve
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import DigestData
-from dumpbot.services import query
+from dumpbot.services import items, query
 
-__all__ = ["DigestData", "build_digest"]
+__all__ = ["DigestData", "build_digest", "day_moment", "move_not_done"]
 
 DigestKind = Literal["morning", "evening"]
 
@@ -34,3 +36,23 @@ async def build_digest(session: AsyncSession, kind: str, prefs: Prefs, now: date
         return None
     recurring_today = sum(1 for row in (*agenda.open, *agenda.done) if row.rrule)
     return DigestData(kind=cast(DigestKind, kind), agenda=agenda, recurring_today=recurring_today)
+
+
+def day_moment(day: date, prefs: Prefs) -> datetime:
+    """A moment of the local ``day`` (its noon): ``query.agenda`` of that day."""
+    return timeresolve.localize(day, time(12, 0), prefs.zone)
+
+
+async def move_not_done(session: AsyncSession, day: date, prefs: Prefs, now: datetime) -> list[Occurrence]:
+    """[📅 Перенести невыполненное на завтра] of the evening digest (and of the Mini App's «Сегодня»): what is already
+    due and not done on the local ``day`` (open or missed, plus the overdue) goes to ``day`` + 1 at its time of day
+    (``items.move_to_tomorrow``). Items still ahead keep their time and reminder. Returns the moved occurrences."""
+    agenda = await query.agenda(session, prefs, day_moment(day, prefs))
+    ids = [
+        r.occurrence_id
+        for r in (*agenda.open, *agenda.overdue)
+        if r.occurrence_id is not None and r.due_at is not None and r.due_at <= now
+    ]
+    if not ids:
+        return []
+    return await items.move_to_tomorrow(session, ids, prefs, now, day=day + timedelta(days=1))

@@ -5,16 +5,20 @@ Adding a field with a default needs no DB migration: old rows simply get the def
 
 from __future__ import annotations
 
+import logging
 from datetime import time
-from typing import Literal, get_args
+from typing import Any, Literal, get_args
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+log = logging.getLogger(__name__)
 
 SlotName = Literal["morning", "lunch", "afternoon", "evening", "after_work", "night"]
 SttMode = Literal["auto", "local", "chutes"]
 STT_MODES: tuple[str, ...] = get_args(SttMode)
 SLOT_NAMES: tuple[str, ...] = ("morning", "lunch", "afternoon", "evening", "after_work", "night")
+MISSED_GRACE_MAX = 1_000_000  # minutes (~2 years), as the Mini App's settings form allows
 
 SLOT_LABELS: dict[str, str] = {
     "morning": "утро",
@@ -62,7 +66,8 @@ class Prefs(BaseModel):
     # Without LOCAL_STT_URL every mode works as "chutes".
     stt_mode: SttMode = "auto"
 
-    missed_grace_minutes: int = Field(360, ge=1)  # older due reminders are marked missed, not sent
+    # Older due reminders are marked missed, not sent. Bounded: the scheduler adds it to every due time as a timedelta.
+    missed_grace_minutes: int = Field(360, ge=1, le=MISSED_GRACE_MAX)
 
     @field_validator("tz")
     @classmethod
@@ -72,6 +77,20 @@ class Prefs(BaseModel):
         except (ZoneInfoNotFoundError, ValueError) as e:
             raise ValueError(f"unknown timezone: {v}") from e
         return v
+
+    @classmethod
+    def from_stored(cls, data: dict[str, Any] | None) -> Prefs:
+        """Prefs from their stored JSON; a value that no longer validates (saved before a bound existed) falls back to
+        the field's default instead of breaking every load."""
+        values = dict(data or {})
+        try:
+            return cls.model_validate(values)
+        except ValidationError as e:
+            bad = {str(err["loc"][0]) for err in e.errors() if err.get("loc")} & values.keys()
+            if not bad:
+                raise
+        log.warning("stored prefs: invalid %s, using the default", ", ".join(sorted(bad)))
+        return cls.model_validate({name: value for name, value in values.items() if name not in bad})
 
     @property
     def zone(self) -> ZoneInfo:

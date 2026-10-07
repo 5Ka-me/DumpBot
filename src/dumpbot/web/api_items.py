@@ -20,7 +20,7 @@ from aiohttp import web
 from dumpbot import clock
 from dumpbot.ai.schemas import MAX_LEAD_MINUTES, PERIOD_RE, EditPatch, When
 from dumpbot.bot import cards, views
-from dumpbot.db.models import Item
+from dumpbot.db.models import Item, Occurrence
 from dumpbot.domain.fmt import fmt_dt
 from dumpbot.domain.kinds import KINDS
 from dumpbot.services import items, query
@@ -41,13 +41,16 @@ TAGS_MAX: Final = 20
 LEAD_MAX: Final = 3
 WHEN_TEXT_MAX: Final = 300
 SNOOZE_MAX: Final = 10080  # a week
-_DUE_LOCAL_RE: Final = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?$")
+_DUE_LOCAL_RE: Final = re.compile(r"(\d{4}-\d{2}-\d{2})(?:T(\d{2}:\d{2}))?")  # fullmatch
+DUE_YEARS: Final = (1970, 9998)  # a local time in these years converts to UTC and back in any zone
+DB_INT_MAX: Final = 2**63 - 1
 
 DELETED: Final = "🗑 Запись удалена — сначала верни её."
 NOT_A_STEP: Final = "Это не шаг чек-листа"
 NO_STEPS_HERE: Final = "К этой записи нельзя добавить шаги: она сама шаг или повторяется."
 CHECKLIST_FULL: Final = f"В чек-листе уже {items.MAX_CHECKLIST} шагов."
 NOTHING_TO_SNOOZE: Final = "Нечего откладывать: у записи нет открытого срока."
+NO_OCCURRENCE: Final = "Этого срока у записи нет — обнови список."
 
 
 @dataclass
@@ -176,7 +179,7 @@ def _item_edits(body: dict[str, Any]) -> dict[str, Any]:
     if "lead" in body:
         edits["lead"] = _lead(body["lead"])
     period = body.get("period", "someday")
-    if not isinstance(period, str) or re.match(PERIOD_RE, period) is None:
+    if not isinstance(period, str) or re.fullmatch(PERIOD_RE, period) is None:  # `$` alone lets "soon\n" through
         raise bad_request("Срок: this_week, next_week, this_month, next_month, ГГГГ-ММ, сезон, soon, someday", "period")
     if "someday" in body and not isinstance(body["someday"], bool):
         raise bad_request("someday — true или false", "someday")
@@ -236,12 +239,12 @@ def _period_when(period: str) -> When:
 
 
 def _due_when(item: Item, value: Any) -> When:
-    """``due_local`` from a date / time picker: "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" (local time), no AI."""
-    match = _DUE_LOCAL_RE.match(value) if isinstance(value, str) else None
+    """``due_local`` from a date / time picker: "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM" (local time), no AI. Years
+    outside ``DUE_YEARS`` are refused: 0001-01-01 00:00 local would not fit a datetime once moved to UTC."""
+    match = _DUE_LOCAL_RE.fullmatch(value) if isinstance(value, str) else None
     try:
-        if match is None:
+        if match is None or not DUE_YEARS[0] <= datetime.fromisoformat(value).year <= DUE_YEARS[1]:
             raise ValueError("bad due_local")
-        datetime.fromisoformat(value)
         return When(text=value, day=match.group(1), time=match.group(2), role=_role(item))  # type: ignore[arg-type]
     except ValueError:
         raise bad_request("Время — ГГГГ-ММ-ДД или ГГГГ-ММ-ДДTЧЧ:ММ", "due_local") from None
@@ -285,14 +288,22 @@ async def _enqueue(request: web.Request, kind: str, payload: dict[str, Any]) -> 
 
 
 async def done(request: web.Request) -> web.Response:
-    """Close the current occurrence (or the item without one); a series moves on to its next time."""
+    """``{occurrence_id?}``: close that occurrence of the item (a list row: this morning's instance of a series, even
+    when it is already missed, or Thursday's row of the week), like the bot's buttons under a card or a reminder.
+    Without it (the card's button) the current occurrence, or the item without one. A series moves on to its next
+    time."""
+    occ_id = _occurrence_id(await read_json(request))
 
     async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
-        await items.apply_patch(session, item.id, EditPatch(action="done"), prefs, now)
+        closed: Occurrence | None = None
+        if occ_id is not None:
+            closed = await items.mark_done(session, (await _occurrence_of(session, item, occ_id)).id, now, prefs)
+        else:
+            await items.apply_patch(session, item.id, EditPatch(action="done"), prefs, now)
         message = "✅ Готово"
         if item.rec_active and item.rrule:
             nxt = await items.current_occurrence(session, item.id)
-            if nxt is not None and nxt.status == "open":
+            if nxt is not None and nxt.status == "open" and (closed is None or nxt.id != closed.id):
                 message += f" · следующий раз {fmt_dt(nxt.due_at, prefs.zone, now=now)}"
         return Change(message=message)
 
@@ -300,11 +311,38 @@ async def done(request: web.Request) -> web.Response:
 
 
 async def undone(request: web.Request) -> web.Response:
+    """``{occurrence_id?}``: that done occurrence back to open (a row of «Сделано»), else the latest done one."""
+    occ_id = _occurrence_id(await read_json(request))
+
     async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
-        await items.apply_patch(session, item.id, EditPatch(action="undone"), prefs, now)
+        if occ_id is not None:
+            await items.mark_undone(session, (await _occurrence_of(session, item, occ_id)).id, prefs=prefs, now=now)
+        else:
+            await items.apply_patch(session, item.id, EditPatch(action="undone"), prefs, now)
         return Change(message="↩️ Не сделано")
 
     return await _change(request, op)
+
+
+def _occurrence_id(body: dict[str, Any]) -> int | None:
+    """The optional ``occurrence_id`` of done / undone (400 for anything but a positive integer)."""
+    unknown = [key for key in body if key != "occurrence_id"]
+    if unknown:
+        raise bad_request("Можно передать только occurrence_id", unknown[0])
+    value = body.get("occurrence_id")
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or not 0 < value <= DB_INT_MAX:
+        raise bad_request("occurrence_id — номер повторения", "occurrence_id")
+    return value
+
+
+async def _occurrence_of(session: AsyncSession, item: Item, occ_id: int) -> Occurrence:
+    """The item's occurrence ``occ_id``; 404 when it is another item's (or gone)."""
+    occ = await session.get(Occurrence, occ_id)
+    if occ is None or occ.item_id != item.id:
+        raise ApiError(404, "not_found", NO_OCCURRENCE)
+    return occ
 
 
 async def no_reminders(request: web.Request) -> web.Response:

@@ -48,13 +48,17 @@ Mini App ([iteration-2.md, D](features/iteration-2.md), [miniapp-api.md](feature
 ставит кнопку меню «📱 Свалка» (`WEBAPP_URL`); при остановке сервер закрывается первым. «Закинуть в свалку» —
 `RawMessage.source="app"` с синтетическим отрицательным `message_id` через обычный конвейер, но без карточек и реакций
 в чате (итог — в `raw_json["_app"]`); «🕒 Время» текстом и «🪄 Разбить» из приложения — задачи `edit_time` / `split`
-с `app: true`, их итог — в `jobs.result` (обработчик возвращает dict).
+с `app: true`, их итог — в `jobs.result` (обработчик возвращает dict). ☐ строки списка — `done`/`undone` с
+`occurrence_id` (`items.mark_done` / `mark_undone` этого повторения, как `OccCb`); «📅 Перенести невыполненное на
+завтра» — `digest.move_not_done`, общий для `DigestCb` и `POST /api/today/move`; миниатюры строк —
+`?size=thumb` (меньший размер фото / миниатюра файла из `raw_json`).
 
 Фронтенд Mini App (`webapp/`, React + TypeScript + Vite, без UI-библиотек): `src/api/` — типы контракта и клиент
 (`Authorization: tma <initData>` на каждом запросе, ошибки → `ApiError`), `src/telegram.ts` — ready/expand, тема из
 `themeParams`, BackButton/MainButton, haptics; `src/lib/` — кэш чтений (stale-while-revalidate, `markStale` после
 правок), навигация стеком экранов (нижние вкладки), «закинуть в свалку» с опросом статуса, превью картинок через
-`fetch` → blob URL; `src/screens/` — экраны. `npm run dev` отвечает на `/api/*` мок-API в памяти (`webapp/mock/`),
+`fetch` → blob URL (кэш ограничен числом и байтами), черновики (`lib/drafts`: текст «Добавить», правки карточки и
+настроек в localStorage до сохранения — переживают смену вкладки и устаревшую сессию); `src/screens/` — экраны. `npm run dev` отвечает на `/api/*` мок-API в памяти (`webapp/mock/`),
 им же пользуются тесты vitest. Dockerfile собирает `dist/` в стадии `node:lts-slim` и кладёт в `/app/webapp`
 (`WEBAPP_STATIC_DIR`); в собранном `index.html` — CSP (свои файлы, скрипт Telegram, `blob:` для картинок).
 

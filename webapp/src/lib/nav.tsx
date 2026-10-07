@@ -167,6 +167,15 @@ export function NavProvider({ children, initialTab }: { children: ReactNode; ini
     else app.BackButton.hide();
   }, [canGoBack]);
 
+  useEffect(
+    () => () => {
+      // The screens give way to the "session expired" gate: Telegram's Back would stay visible with no handler.
+      const app = webApp();
+      if (app && nativeBackButton()) app.BackButton.hide();
+    },
+    [],
+  );
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && canGoBack) back();

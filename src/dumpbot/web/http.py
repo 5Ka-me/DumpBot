@@ -25,6 +25,7 @@ API_PREFIX: Final = "/api/"
 
 NOT_FOUND: Final = "Запись не найдена"
 INTERNAL: Final = "😢 Что-то пошло не так — попробуй ещё раз."
+NUL_TEXT: Final = "В тексте недопустимый символ (NUL)"
 _HTTP_CODES: Final[dict[int, tuple[str, str]]] = {
     404: ("not_found", "Нет такого адреса"),
     405: ("method_not_allowed", "Этот метод здесь не поддерживается"),
@@ -73,7 +74,8 @@ def ctx_of(request: web.Request) -> AppContext:
 
 
 async def read_json(request: web.Request) -> dict[str, Any]:
-    """The JSON object of the request body ({} without a body); 400 for anything else."""
+    """The JSON object of the request body ({} without a body); 400 for anything else, and for a NUL character in
+    any of its strings (the field: the top-level key)."""
     if not request.can_read_body:
         return {}
     try:
@@ -82,7 +84,21 @@ async def read_json(request: web.Request) -> dict[str, Any]:
         raise bad_request("Тело запроса — не JSON") from None
     if not isinstance(data, dict):
         raise bad_request("Тело запроса должно быть JSON-объектом")
+    for key, value in data.items():
+        if has_nul(key) or has_nul(value):
+            raise bad_request(NUL_TEXT, key)
     return data
+
+
+def has_nul(value: Any) -> bool:
+    """A string (or one inside a list / object) with U+0000, which Postgres text columns refuse."""
+    if isinstance(value, str):
+        return "\x00" in value
+    if isinstance(value, list):
+        return any(has_nul(v) for v in value)
+    if isinstance(value, dict):
+        return any(has_nul(k) or has_nul(v) for k, v in value.items())
+    return False
 
 
 def path_id(request: web.Request, name: str = "id") -> int:

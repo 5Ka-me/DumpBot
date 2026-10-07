@@ -1,14 +1,20 @@
-/** «Сегодня»: today's agenda (overdue, today, the running week / month / season, done) or the next seven days. */
-import { useState } from "react";
+/**
+ * «Сегодня»: today's agenda (overdue, today, the running week / month / season, done) with the evening digest's
+ * «📅 Перенести невыполненное на завтра», or the next seven days.
+ */
+import { useState, type ReactNode } from "react";
 import { api } from "../api";
 import type { Agenda, Row } from "../api/types";
 import { RowList } from "../components/RowItem";
-import { Empty, ErrorBox, Loading, RefreshButton, ScreenHeader, Section, Segmented } from "../components/ui";
+import { Empty, ErrorBox, Loading, RefreshButton, ScreenHeader, Section, Segmented, Spinner } from "../components/ui";
 import { useOpenItem, useRowToggle } from "../lib/actions";
 import { count, fmtDate, fmtDayHeader, fmtLongDate, todayIn } from "../lib/format";
+import { isDone } from "../lib/kinds";
 import { useTz } from "../lib/me";
 import { useNav } from "../lib/nav";
-import { markStale, useResource } from "../lib/store";
+import { itemsChanged, markStale, useResource } from "../lib/store";
+import { toast, toastError } from "../lib/toast";
+import { haptic } from "../telegram";
 
 type Mode = "today" | "week";
 
@@ -30,7 +36,41 @@ function agendaSize(a: Agenda): number {
   return a.open.length + a.overdue.length + a.done.length + a.period_items.length;
 }
 
-function DayAgenda({ agenda, listKey, today }: { agenda: Agenda; listKey: string; today: string }) {
+/** Rows «📅 Перенести невыполненное на завтра» would move: overdue and today's not done whose time has come. */
+export function movableRows(a: Agenda, now: number = Date.now()): Row[] {
+  return [...a.overdue, ...a.open].filter(
+    (r) => r.occurrence_id !== null && r.due_at !== null && Date.parse(r.due_at) <= now && !isDone(r),
+  );
+}
+
+/** The evening digest's button: what is due and not done today (and the overdue) goes to tomorrow, same time. */
+function MoveToTomorrow({ day }: { day: string }) {
+  const [busy, setBusy] = useState(false);
+  const move = async () => {
+    setBusy(true);
+    try {
+      const res = await api.moveToTomorrow(day);
+      haptic.success();
+      toast(res.message, res.moved ? "success" : "info");
+      itemsChanged();
+    } catch (error) {
+      toastError(error);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Section footer="Просроченное и то, что сегодня уже должно было быть сделано, — на завтра, на то же время.">
+      <div className="row row--action">
+        <button type="button" className="button button--secondary button--wide" disabled={busy} onClick={() => void move()}>
+          {busy ? <Spinner small /> : "📅 Перенести невыполненное на завтра"}
+        </button>
+      </div>
+    </Section>
+  );
+}
+
+function DayAgenda({ agenda, listKey, today, after }: { agenda: Agenda; listKey: string; today: string; after?: ReactNode }) {
   const open = useOpenItem();
   const toggle = useRowToggle(listKey);
   const [showDone, setShowDone] = useState(false);
@@ -46,6 +86,7 @@ function DayAgenda({ agenda, listKey, today }: { agenda: Agenda; listKey: string
           <RowList rows={agenda.open} onOpen={open} onToggle={toggle} />
         </Section>
       )}
+      {after}
       {periodGroups(agenda.period_items).map((g) => (
         <Section
           key={`${g.title}|${g.end}`}
@@ -91,7 +132,12 @@ function TodayView({ today }: { today: string }) {
           }
         />
       ) : (
-        <DayAgenda agenda={agenda} listKey="today" today={today} />
+        <DayAgenda
+          agenda={agenda}
+          listKey="today"
+          today={today}
+          after={movableRows(agenda).length > 0 ? <MoveToTomorrow day={agenda.day} /> : undefined}
+        />
       )}
     </>
   );

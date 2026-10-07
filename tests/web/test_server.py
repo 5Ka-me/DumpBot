@@ -79,6 +79,65 @@ async def test_a_step_has_no_pictures_of_its_own(api, album) -> None:
     assert step["images"] == []
 
 
+def _size(file_id: str, width: int, height: int, file_size: int) -> dict:
+    return {
+        "file_id": file_id,
+        "file_unique_id": f"u-{file_id}",
+        "width": width,
+        "height": height,
+        "file_size": file_size,
+    }
+
+
+async def test_list_thumbnails_are_small_sizes_telegram_already_has(api, bot, add_raw, make_items) -> None:
+    """``?size=thumb`` (a 52 px row thumbnail): the smallest photo size with a side of at least 160 px, the thumbnail
+    Telegram made for a picture sent as a file, the picture itself when there is none."""
+    sizes = [_size("ph-s", 90, 68, 1_000), _size("ph-m", 320, 240, 9_000), _size("ph", 1280, 960, 150_000)]
+    first = await add_raw(
+        message_id=70,
+        content_type="photo",
+        file_id="ph",
+        file_unique_id="u-ph",
+        media_group_id="t",
+        width=1280,
+        height=960,
+        raw_json={"photo": sizes},
+    )
+    await add_raw(
+        message_id=71,
+        content_type="image_document",
+        file_id="png",
+        file_unique_id="u-png",
+        mime_type="image/png",
+        media_group_id="t",
+        raw_json={"document": {"file_id": "png", "thumbnail": _size("png-t", 320, 180, 7_000)}},
+    )
+    await add_raw(
+        message_id=72,
+        content_type="image_document",
+        file_id="gif",
+        file_unique_id="u-gif",
+        mime_type="image/gif",
+        media_group_id="t",
+        raw_json={"document": {"file_id": "gif"}},
+    )
+    [created] = await make_items({"kind": "meme", "title": "Скриншоты"}, raw_id=first.id)
+    bot.files = {"ph": b"big", "ph-m": b"m", "png": b"png", "png-t": b"png-thumb", "gif": b"gif"}
+    path = f"/api/files/{created.item.id}"
+
+    photo = await api.get(f"{path}/0?size=thumb")
+    assert (photo.status, photo.data, photo.headers["Content-Type"]) == (200, b"m", "image/jpeg")
+    assert photo.headers["Cache-Control"] == "private, max-age=86400"
+    file_thumb = await api.get(f"{path}/1?size=thumb")
+    assert (file_thumb.data, file_thumb.headers["Content-Type"]) == (b"png-thumb", "image/jpeg")
+    no_thumb = await api.get(f"{path}/2?size=thumb")
+    assert (no_thumb.data, no_thumb.headers["Content-Type"]) == (b"gif", "image/gif")
+    assert (await api.get(f"{path}/0")).data == b"big"  # the card's preview stays the full picture
+    assert [c["file"] for c in bot.calls_of("download")] == ["ph-m", "png-t", "gif", "ph"]
+    reply = await api.get(f"{path}/0?size=huge")
+    assert (reply.status, reply.data["error"]["field"]) == (400, "size")
+
+
 def test_image_cache_drops_the_least_recently_used() -> None:
     cache = ImageCache(max_bytes=10, item_max_bytes=6)
     cache.put("a", b"aaaa", "image/png")

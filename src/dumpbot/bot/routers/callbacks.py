@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime
 from typing import TYPE_CHECKING, Final
 
 from aiogram import F, Router
@@ -476,16 +476,9 @@ async def on_digest(callback: CallbackQuery, callback_data: DigestCb, ctx: AppCo
 
     async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
         day = _digest_day(callback_data.d) or (sent_at or now).astimezone(prefs.zone).date()
-        day_of = timeresolve.localize(day, time(12, 0), prefs.zone)  # a moment of that local day
-        agenda = await query.agenda(session, prefs, day_of)
-        ids = [
-            r.occurrence_id
-            for r in (*agenda.open, *agenda.overdue)
-            if r.occurrence_id is not None and r.due_at is not None and r.due_at <= now
-        ]
-        moved = await items.move_to_tomorrow(session, ids, prefs, now, day=day + timedelta(days=1)) if ids else []
+        moved = await digest.move_not_done(session, day, prefs, now)
         await session.flush()
-        view = await _evening_after_move(session, prefs, day_of, now, len(moved))
+        view = await _evening_after_move(session, prefs, digest.day_moment(day, prefs), now, len(moved))
         toast = f"📅 Перенёс на завтра: {len(moved)}" if moved else "Нечего переносить"
         return Outcome(view, toast, wake_scheduler=bool(moved))
 

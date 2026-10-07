@@ -4,6 +4,7 @@ import { ApiError, api, onAuthError } from "./api";
 import type { Me } from "./api/types";
 import { MainButtonBar, TabBar, Toaster } from "./components/Chrome";
 import { ErrorBox, Spinner } from "./components/ui";
+import { hasDrafts } from "./lib/drafts";
 import { MeContext } from "./lib/me";
 import { NavProvider, useNav, type Route } from "./lib/nav";
 import { ScreenActive, markStale } from "./lib/store";
@@ -17,6 +18,8 @@ import { TasksScreen } from "./screens/Tasks";
 import { TodayScreen } from "./screens/Today";
 import { UsageScreen } from "./screens/Usage";
 import { closeApp, insideTelegram } from "./telegram";
+
+export const DRAFTS_KEPT_TEXT = "Несохранённый текст не пропадёт: он вернётся, когда откроешь приложение снова.";
 
 /** Back after this long in the background: everything is refreshed. */
 const REFRESH_AFTER_MS = 60_000;
@@ -133,12 +136,13 @@ export function App({ outside = !insideTelegram() && !import.meta.env.DEV }: { o
     );
   }
   if (authError) {
+    // The screens unmount; their unsaved input stays in lib/drafts (localStorage) for the reopened app.
     const expired = authError.code === "expired";
     return (
       <Gate
         emoji={expired ? "⏳" : "🔒"}
         title={expired ? "Сессия устарела" : "Нет доступа"}
-        text={authError.message}
+        text={expired && hasDrafts() ? `${authError.message} ${DRAFTS_KEPT_TEXT}` : authError.message}
         action={
           insideTelegram() ? (
             <button type="button" className="button" onClick={closeApp}>

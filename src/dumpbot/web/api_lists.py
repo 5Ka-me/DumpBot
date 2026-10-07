@@ -1,5 +1,6 @@
-"""Read-mostly endpoints of the Mini App API: who am I, the feed, today / tasks / someday / recurring / week, a
-question to the base, settings, AI spend, the state of a background job (docs/features/miniapp-api.md).
+"""Read-mostly endpoints of the Mini App API: who am I, the feed, today / tasks / someday / recurring / week (and
+«📅 Перенести невыполненное на завтра» of a day), a question to the base, settings, AI spend, the state of a background
+job (docs/features/miniapp-api.md).
 
 Each is a thin layer over ``services.query`` / ``services.processor`` / the settings dialog's validation; the first
 read of the prefs creates their row, so read sessions commit too.
@@ -11,7 +12,7 @@ import base64
 import binascii
 import math
 from collections.abc import Awaitable, Callable
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final
 
 from aiohttp import web
@@ -24,10 +25,10 @@ from dumpbot.bot.routers.settings import parse_money, parse_time, parse_tz, save
 from dumpbot.db.models import Job
 from dumpbot.domain.kinds import KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import Prefs
-from dumpbot.services import processor, query
+from dumpbot.services import digest, processor, query
 from dumpbot.web import serialize
 from dumpbot.web.auth import USER
-from dumpbot.web.http import ApiError, bad_request, ctx_of, json_response, path_id, read_json
+from dumpbot.web.http import NUL_TEXT, ApiError, bad_request, ctx_of, has_nul, json_response, path_id, read_json
 from dumpbot.workers.jobs import BUDGET_REASON, RetryLater
 
 if TYPE_CHECKING:
@@ -41,6 +42,7 @@ WEEK_DAYS: Final = 7
 QUESTION_MAX: Final = 1000
 SEARCH_MAX: Final = 200
 TAGS_MAX: Final = 10
+CURSOR_ID_DIGITS: Final = 18  # ids are bigint: more digits may not fit
 
 BUDGET_TEXT: Final = "⛔ Бюджет на ИИ исчерпан — увеличь его в настройках или подожди следующего месяца."
 AI_UNAVAILABLE_TEXT: Final = "✍ ИИ сейчас недоступен — попробуй чуть позже."
@@ -55,6 +57,7 @@ def routes() -> list[web.RouteDef]:
         web.get("/api/me", me),
         web.get("/api/feed", feed),
         web.get("/api/today", today),
+        web.post("/api/today/move", move_today),
         web.get("/api/tasks", tasks),
         web.get("/api/someday", someday),
         web.get("/api/recurring", recurring),
@@ -110,6 +113,9 @@ async def me(request: web.Request) -> web.Response:
 async def feed(request: web.Request) -> web.Response:
     """Items newest first, filtered (q, kinds, tags, status, from, to), one page per ``cursor``."""
     params = request.query
+    for name, value in params.items():
+        if has_nul(value):
+            raise bad_request(NUL_TEXT, name)
     text = params.get("q", "").strip()
     if len(text) > SEARCH_MAX:
         raise bad_request(f"Поиск — не длиннее {SEARCH_MAX} символов", "q")
@@ -184,10 +190,10 @@ def _cursor(value: str) -> tuple[datetime, int] | None:
         raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
         at, _, item_id = raw.partition("|")
         moment = datetime.fromisoformat(at)
-        if moment.tzinfo is None or not item_id.isdecimal():
+        if moment.tzinfo is None or not item_id.isdecimal() or len(item_id) > CURSOR_ID_DIGITS:
             raise ValueError("bad cursor")
-        return moment, int(item_id)
-    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return moment.astimezone(UTC), int(item_id)
+    except (ValueError, OverflowError, UnicodeDecodeError, binascii.Error):  # OverflowError: year 1 at UTC+14
         raise bad_request("Неверный курсор", "cursor") from None
 
 
@@ -198,6 +204,39 @@ async def today(request: web.Request) -> web.Response:
         return await serialize.agenda(session, await query.agenda(session, prefs, now), prefs, now)
 
     return await _read(request, load)
+
+
+async def move_today(request: web.Request) -> web.Response:
+    """``{day?: "YYYY-MM-DD"}`` (default: today; yesterday too, for a list opened before midnight): what is already due
+    and not done that day, and the overdue, goes to the next day — the evening digest's «📅 Перенести невыполненное на
+    завтра». → ``{moved, message}``."""
+    body = await read_json(request)
+    unknown = [key for key in body if key != "day"]
+    if unknown:
+        raise bad_request("Можно передать только day", unknown[0])
+    ctx = ctx_of(request)
+    now = clock.utcnow()
+    async with ctx.sessionmaker() as session:
+        prefs = await ctx.prefs(session)
+        day = _move_day(body.get("day"), now.astimezone(prefs.zone).date())
+        moved = await digest.move_not_done(session, day, prefs, now)
+        await session.commit()
+    if moved:
+        ctx.scheduler_wakeup.set()
+    message = f"📅 Перенёс на завтра: {len(moved)}" if moved else "Нечего переносить"
+    return json_response({"moved": len(moved), "message": message})
+
+
+def _move_day(value: Any, today: date) -> date:
+    if value is None:
+        return today
+    try:
+        day = date.fromisoformat(value) if isinstance(value, str) and len(value) == 10 else None
+    except ValueError:
+        day = None
+    if day is None or not today - timedelta(days=1) <= day <= today:
+        raise bad_request("День — сегодня или вчера, ГГГГ-ММ-ДД", "day")
+    return day
 
 
 async def week(request: web.Request) -> web.Response:
@@ -341,7 +380,7 @@ def _pref_value(prefs: Prefs, name: str, value: Any) -> Any:
             if not isinstance(value, int) or isinstance(value, bool):
                 raise ValueError("not an integer")
             return value
-    except ValueError:
+    except (ValueError, OverflowError):
         raise bad_request(_PREF_ERRORS.get(_pref_kind(name, current), "Недопустимое значение"), name) from None
     return value  # Literal fields (stt_language, stt_mode): Prefs checks them
 
@@ -353,7 +392,12 @@ def _text(value: Any) -> str:
 
 
 def _number(value: Any) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an integer too big for a float
+        return False
 
 
 def _pref_kind(name: str, current: Any) -> str:

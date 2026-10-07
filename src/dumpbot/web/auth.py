@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -31,6 +32,7 @@ MAX_AGE: Final = timedelta(hours=24)
 FUTURE_SKEW: Final = timedelta(minutes=5)  # a phone's clock may be a little ahead
 MAX_INIT_DATA: Final = 8192  # bytes of the header value; real initData is well under 2 KB
 SCHEME: Final = "tma"
+_HASH_RE: Final = re.compile(r"[0-9a-fA-F]{64}")  # hex HMAC-SHA256 (fullmatch)
 
 UNAUTHORIZED: Final = "Открой приложение кнопкой «📱 Свалка» в чате с ботом."
 EXPIRED: Final = "Сессия устарела — закрой приложение и открой его снова."
@@ -85,16 +87,22 @@ def validate_init_data(init_data: str, bot_token: str, *, now: datetime, max_age
             raise InitDataError("duplicate field")
         fields[key] = value
     received = fields.pop("hash", "")
-    if not received or not hmac.compare_digest(sign(fields, bot_token), received.lower()):
+    # Only 64 hex digits are compared, as bytes: compare_digest() raises TypeError for a str with non-ASCII characters.
+    if _HASH_RE.fullmatch(received) is None or not hmac.compare_digest(
+        sign(fields, bot_token).encode(), received.lower().encode()
+    ):
         raise InitDataError("bad signature")
     _check_age(fields.get("auth_date", ""), now, max_age)
     return _user(fields.get("user", ""))
 
 
 def _check_age(auth_date: str, now: datetime, max_age: timedelta) -> None:
-    if not auth_date.isdecimal():
+    if not auth_date.isascii() or not auth_date.isdecimal():
         raise InitDataError("no auth_date")
-    signed_at = datetime.fromtimestamp(int(auth_date), UTC)
+    try:
+        signed_at = datetime.fromtimestamp(int(auth_date), UTC)
+    except (OverflowError, ValueError, OSError):  # beyond year 9999
+        raise InitDataError("bad auth_date") from None
     if now - signed_at > max_age:
         raise InitDataError("expired", expired=True)
     if signed_at - now > FUTURE_SKEW:

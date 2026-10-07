@@ -1,4 +1,7 @@
-/** «Добавить»: a text into the dump (the same AI pipeline as a message to the bot) and what came of it. */
+/**
+ * «Добавить»: a text into the dump (the same AI pipeline as a message to the bot) and what came of it. The typed text
+ * is a draft (lib/drafts): it survives another tab and an expired session until it is sent.
+ */
 import { useEffect, useRef, useState } from "react";
 import type { InboxStatus, Row } from "../api/types";
 import { AutoTextarea } from "../components/AutoTextarea";
@@ -18,11 +21,13 @@ import {
 } from "../lib/inbox";
 import { jobWaitText } from "../lib/jobs";
 import { useMainButton } from "../lib/mainButton";
+import { clearDraft, getDraft, useDraft } from "../lib/drafts";
 import { useTz } from "../lib/me";
 import { toastError } from "../lib/toast";
 import { setClosingConfirmation } from "../telegram";
 
 export const INBOX_MAX = 4096;
+export const ADD_DRAFT = "add";
 
 /** The one-line state of a sent text. */
 export function inboxStateText(status: InboxStatus): string {
@@ -133,7 +138,9 @@ function EntryCard({ entry }: { entry: InboxEntry }) {
 
 export function AddScreen() {
   const entries = useInbox();
-  const [text, setText] = useState("");
+  const [draft, setDraft] = useDraft<string>(ADD_DRAFT);
+  const text = draft ?? "";
+  const setText = (value: string) => setDraft(value || undefined);
   const [sending, setSending] = useState(false);
   const restored = useRef(false);
 
@@ -154,7 +161,7 @@ export function AddScreen() {
     setSending(true);
     try {
       await sendToInbox(value);
-      setText("");
+      if ((getDraft<string>(ADD_DRAFT) ?? "").trim() === value) clearDraft(ADD_DRAFT); // not what was typed meanwhile
     } catch (error) {
       toastError(error);
     } finally {

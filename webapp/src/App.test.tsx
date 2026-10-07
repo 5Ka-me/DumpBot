@@ -1,7 +1,8 @@
 /** The whole app against the dev mock API (mock/api.ts) in place of the bot. */
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App } from "./App";
+import { App, DRAFTS_KEPT_TEXT } from "./App";
+import { getDraft, resetDrafts } from "./lib/drafts";
 import { resetInbox } from "./lib/inbox";
 import { resetStore } from "./lib/store";
 import { resetToasts } from "./lib/toast";
@@ -11,7 +12,17 @@ beforeEach(() => {
   resetStore();
   resetInbox();
   resetToasts();
+  resetDrafts();
 });
+
+function expiredFetch() {
+  vi.stubGlobal("fetch", async () =>
+    new Response(JSON.stringify({ error: { code: "expired", message: "Сессия устарела — закрой приложение и открой его снова." } }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    }),
+  );
+}
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -60,7 +71,46 @@ describe("with the mock API", () => {
     fireEvent.click(box);
     expect(box).toHaveAttribute("aria-checked", "true"); // before the answer
     expect(await screen.findByText("✅ Готово")).toBeInTheDocument();
-    expect(calls.some((c) => c.method === "POST" && c.path === "/api/items/1/done")).toBe(true);
+    const done = calls.find((c) => c.method === "POST" && c.path === "/api/items/1/done");
+    expect(done?.body).toEqual({ occurrence_id: expect.any(Number) }); // exactly this row's occurrence
+  });
+
+  it("moves what is left of today to tomorrow, like the evening digest's button", async () => {
+    const { calls } = useMockApi();
+    render(<App outside={false} />);
+    expect(await screen.findByText("Оплатить интернет")).toBeInTheDocument(); // overdue since yesterday
+    fireEvent.click(screen.getByRole("button", { name: "📅 Перенести невыполненное на завтра" }));
+    expect(await screen.findByText(/^📅 Перенёс на завтра: \d+$/)).toBeInTheDocument();
+    const move = calls.find((c) => c.path === "/api/today/move");
+    expect(move?.method).toBe("POST");
+    expect(move?.body).toEqual({ day: expect.stringMatching(/^\d{4}-\d{2}-\d{2}$/) });
+    await waitFor(() => expect(screen.queryByText("Оплатить интернет")).toBeNull());
+    expect(screen.queryByRole("button", { name: "📅 Перенести невыполненное на завтра" })).toBeNull();
+  });
+
+  it("keeps the text being added when another tab is opened", async () => {
+    useMockApi();
+    render(<App outside={false} />);
+    await screen.findByText("Позвонить в банк");
+    fireEvent.click(screen.getByRole("button", { name: "Добавить" }));
+    fireEvent.change(await screen.findByRole("textbox", { name: "Что закинуть" }), { target: { value: "длинная заметка про отпуск" } });
+    fireEvent.click(screen.getByRole("button", { name: "Задачи" }));
+    await waitFor(() => expect(screen.queryByRole("textbox", { name: "Что закинуть" })).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: "Добавить" }));
+    expect(await screen.findByRole("textbox", { name: "Что закинуть" })).toHaveValue("длинная заметка про отпуск");
+  });
+
+  it("keeps unsaved text for the reopened app when the session expires", async () => {
+    useMockApi();
+    render(<App outside={false} />);
+    await screen.findByText("Позвонить в банк");
+    fireEvent.click(await screen.findByText("Купить наушники Sony"));
+    fireEvent.change(await screen.findByRole("textbox", { name: "Подробности" }), { target: { value: "XM5, чёрные" } });
+    expiredFetch();
+    fireEvent.click(screen.getByRole("button", { name: "✅ Готово" })); // a request in the expired session
+    expect(await screen.findByRole("heading", { name: "Сессия устарела" })).toBeInTheDocument();
+    expect(screen.getByText(new RegExp(DRAFTS_KEPT_TEXT))).toBeInTheDocument();
+    expect(getDraft("card:3")).toEqual({ title: "Купить наушники Sony", details: "XM5, чёрные" });
   });
 
   it("opens a card from a list and goes back", async () => {

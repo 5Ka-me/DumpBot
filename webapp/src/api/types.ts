@@ -358,6 +358,22 @@ export type SnoozeRequest = { minutes: number } | { tomorrow: true };
 
 export type ItemAction = "done" | "undone" | "norem" | "delete" | "restore" | "stoprec" | "snooze";
 
+/** POST /api/items/{id}/done|undone: that occurrence of a list row (without it: the current one). */
+export interface OccurrenceRequest {
+  occurrence_id?: number;
+}
+
+/** POST /api/today/move: «📅 Перенести невыполненное на завтра» of a day (default: today). */
+export interface MoveRequest {
+  day?: LocalDate;
+}
+
+export interface MoveResult {
+  moved: number;
+  /** "📅 Перенёс на завтра: 3" or "Нечего переносить". */
+  message: string;
+}
+
 /** POST /api/items/{id}/steps */
 export interface NewStep {
   title: string;

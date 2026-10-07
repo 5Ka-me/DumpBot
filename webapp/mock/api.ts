@@ -6,7 +6,7 @@
  * "tma stranger" → 403).
  */
 import type { InboxStatus, ItemPatch, JobStatus, Kind, Prefs, Row } from "../src/api/types.ts";
-import { addDays, parseClock, zonedToUtc } from "../src/lib/format.ts";
+import { addDays, parseClock, zoned, zonedToUtc } from "../src/lib/format.ts";
 import { MockDb, periodOf, type MItem } from "./db.ts";
 
 export interface MockRequest {
@@ -130,6 +130,7 @@ export class MockApi {
     }
     if (method === "GET" && path === "/api/feed") return ok(this.feed(req.query, now));
     if (method === "GET" && path === "/api/today") return ok(this.db.agenda(now));
+    if (method === "POST" && path === "/api/today/move") return ok(this.moveToTomorrow(body, now));
     if (method === "GET" && path === "/api/week") return ok({ days: Array.from({ length: 7 }, (_, i) => this.db.agenda(now, i)) });
     if (method === "GET" && path === "/api/tasks") return ok({ rows: this.db.tasks(now) });
     if (method === "GET" && path === "/api/someday") return ok({ rows: this.db.someday(now) });
@@ -144,7 +145,11 @@ export class MockApi {
       return ok(this.inboxReply(Number(match[1]), match[2] as "answer" | "pick", body, now), 202);
     }
     if ((match = m(/^\/api\/jobs\/(\d+)$/)) && method === "GET") return ok(this.job(Number(match[1]), now));
-    if ((match = m(/^\/api\/files\/(\d+)\/(\d+)$/)) && method === "GET") return this.file(Number(match[1]), Number(match[2]));
+    if ((match = m(/^\/api\/files\/(\d+)\/(\d+)$/)) && method === "GET") {
+      const size = req.query.get("size") ?? "";
+      if (size !== "" && size !== "thumb") throw bad("size — только thumb", "size");
+      return this.file(Number(match[1]), Number(match[2]));
+    }
     if ((match = m(/^\/api\/items\/(\d+)$/))) {
       const item = this.item(Number(match[1]));
       if (method === "GET") return ok(this.db.detail(item, now));
@@ -222,6 +227,34 @@ export class MockApi {
     return { due: zonedToUtc(`${m[1]}T${time}`, this.db.prefs.tz).getTime(), precision: m[2] ? "exact" : "date" };
   }
 
+  /** `{occurrence_id?}` of done / undone: the item's own occurrence (the mock keeps one per item). */
+  private occurrenceOf(item: MItem, body: Record<string, unknown>): void {
+    const extra = Object.keys(body).find((k) => k !== "occurrence_id");
+    if (extra) throw bad("Можно передать только occurrence_id", extra);
+    const id = body.occurrence_id;
+    if (id === undefined || id === null) return;
+    if (typeof id !== "number" || !Number.isInteger(id) || id <= 0) throw bad("occurrence_id — номер повторения", "occurrence_id");
+    if (id !== item.occId) throw new HttpError(404, "not_found", "Этого срока у записи нет — обнови список.");
+  }
+
+  /** «📅 Перенести невыполненное на завтра»: what is due and not done today (and the overdue) -> tomorrow, same time. */
+  private moveToTomorrow(body: Record<string, unknown>, now: number): { moved: number; message: string } {
+    const today = this.db.today(now);
+    const day = body.day === undefined ? today : body.day;
+    if (day !== today && day !== addDays(today, -1)) throw bad("День — сегодня или вчера, ГГГГ-ММ-ДД", "day");
+    const agenda = this.db.agenda(now);
+    const ids = [...agenda.overdue, ...agenda.open]
+      .filter((r) => r.occ_status === "open" && r.due_at !== null && Date.parse(r.due_at) <= now)
+      .map((r) => r.id);
+    for (const id of ids) {
+      const item = this.db.get(id)!;
+      const time = zoned(item.due!, this.db.prefs.tz).time;
+      item.period = null;
+      this.db.setDue(item, zonedToUtc(`${addDays(String(day), 1)}T${time}`, this.db.prefs.tz).getTime(), item.precision);
+    }
+    return { moved: ids.length, message: ids.length ? `📅 Перенёс на завтра: ${ids.length}` : "Нечего переносить" };
+  }
+
   private itemAction(item: MItem, action: string, body: Record<string, unknown>, now: number): MockResponse {
     if (action === "restore") {
       item.status = item.doneAt ? "done" : "open";
@@ -245,6 +278,7 @@ export class MockApi {
         return this.answer(item, "🕒 Время изменено", now, due < now ? ["⚠️ Это время уже прошло"] : []);
       }
       case "done": {
+        this.occurrenceOf(item, body);
         if (item.recActive && item.due !== null) {
           this.db.setDue(item, item.due + 7 * 86_400_000, item.precision);
           return this.answer(item, `✅ Готово · следующий раз ${new Date(item.due).toLocaleDateString("ru")}`, now);
@@ -259,6 +293,7 @@ export class MockApi {
         return this.answer(item, "✅ Готово", now);
       }
       case "undone":
+        this.occurrenceOf(item, body);
         item.status = "open";
         item.doneAt = null;
         if (item.occId !== null) {

@@ -24,6 +24,17 @@ export interface StepsProps {
   onSplit: () => void;
 }
 
+/**
+ * The step's own time differs from the sheet's `wanted` ("YYYY-MM-DD[THH:MM]", null: none). A date alone matches only
+ * a step that has that date without a time of day: clearing the time of «чт 15:00» is a change.
+ */
+export function stepTimeChanged(step: Pick<Step, "due_at" | "precision">, wanted: string | null, tz: string): boolean {
+  const was = step.due_at ? localDateTime(step.due_at, tz) : null;
+  if (wanted === null || was === null) return wanted !== was;
+  if (wanted.length > 10) return !(was === wanted && !DATE_ONLY.has(step.precision ?? ""));
+  return !(was.slice(0, 10) === wanted && DATE_ONLY.has(step.precision ?? ""));
+}
+
 function StepSheet({
   step,
   tz,
@@ -56,9 +67,7 @@ function StepSheet({
     const patch: StepPatch = {};
     if (title.trim() && title.trim() !== step.title) patch.title = title.trim();
     const wanted = date ? dueLocal(date, time) : null;
-    const was = step.due_at ? localDateTime(step.due_at, tz) : null;
-    if (wanted === null && was !== null) patch.due_local = null;
-    else if (wanted !== null && (!was || !was.startsWith(wanted))) patch.due_local = wanted;
+    if (stepTimeChanged(step, wanted, tz)) patch.due_local = wanted;
     if (!Object.keys(patch).length || (await onSave(step, patch))) onClose();
   };
   return (

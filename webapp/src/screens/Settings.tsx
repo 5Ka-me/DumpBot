@@ -1,8 +1,12 @@
-/** «Настройки»: every preference of the bot (as /settings), checked and saved together by the MainButton. */
+/**
+ * «Настройки»: every preference of the bot (as /settings), checked and saved together by the MainButton. Unsaved
+ * changes are a draft (lib/drafts): they come back after an expired session.
+ */
 import { useContext, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../api";
 import type { Prefs, SettingsPatch, SettingsResponse } from "../api/types";
 import { Chip, ErrorBox, Loading, ScreenHeader, Section, Segmented, Switch } from "../components/ui";
+import { clearDraft, getDraft, setDraft as keepDraft } from "../lib/drafts";
 import { fmtDuration, parseClock } from "../lib/format";
 import { useMainButton } from "../lib/mainButton";
 import { MeContext } from "../lib/me";
@@ -37,6 +41,7 @@ const TIME_KEYS = [
   "digest_evening_time",
 ] as const satisfies readonly (keyof Prefs)[];
 const SETTINGS_LEAD_CHOICES = [0, 5, 10, 15, 30];
+const SETTINGS_DRAFT = "settings";
 const TZ_FALLBACK = ["Europe/Warsaw", "Europe/Berlin", "Europe/Minsk", "Europe/Kyiv", "Europe/Moscow", "Europe/London"];
 
 export function toDraft(prefs: Prefs): Draft {
@@ -47,6 +52,12 @@ export function toDraft(prefs: Prefs): Draft {
     missed_grace_minutes: String(prefs.missed_grace_minutes),
     budget_usd: String(prefs.budget_usd),
   };
+}
+
+/** The fields of `draft` that differ from `prefs` as typed (what an unsaved form keeps). */
+export function changedFields(prefs: Prefs, draft: Draft): Partial<Draft> {
+  const saved = toDraft(prefs);
+  return Object.fromEntries(Object.entries(draft).filter(([key, value]) => saved[key as keyof Draft] !== value));
 }
 
 /** The changed preferences of `draft` against `prefs`, or the errors of fields that do not parse. */
@@ -183,7 +194,7 @@ function NumberField({
 
 function SettingsForm({ data, onSaved }: { data: SettingsResponse; onSaved: (next: SettingsResponse) => void }) {
   const nav = useNav();
-  const [draft, setDraft] = useState<Draft>(() => toDraft(data.prefs));
+  const [draft, setDraft] = useState<Draft>(() => ({ ...toDraft(data.prefs), ...getDraft<Partial<Draft>>(SETTINGS_DRAFT) }));
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const zones = useMemo(timeZones, []);
@@ -204,6 +215,10 @@ function SettingsForm({ data, onSaved }: { data: SettingsResponse; onSaved: (nex
     setClosingConfirmation(dirty);
     return () => setClosingConfirmation(false);
   }, [dirty]);
+  useEffect(() => {
+    const changed = changedFields(data.prefs, draft);
+    keepDraft(SETTINGS_DRAFT, Object.keys(changed).length ? changed : undefined);
+  }, [data.prefs, draft]);
 
   const set = <K extends keyof Draft>(key: K, value: Draft[K]) => {
     setDraft((d) => ({ ...d, [key]: value }));
@@ -241,7 +256,11 @@ function SettingsForm({ data, onSaved }: { data: SettingsResponse; onSaved: (nex
 
   useMainButton(dirty ? { text: "Сохранить", onClick: () => void save(), progress: saving } : null);
   useBackHandler(dirty, () => {
-    void confirmDialog("Настройки не сохранены. Выйти без сохранения?").then((leave) => leave && nav.pop());
+    void confirmDialog("Настройки не сохранены. Выйти без сохранения?").then((leave) => {
+      if (!leave) return;
+      clearDraft(SETTINGS_DRAFT);
+      nav.pop();
+    });
   });
 
   const time = (key: (typeof TIME_KEYS)[number], label: string, hint?: string, disabled?: boolean) => (

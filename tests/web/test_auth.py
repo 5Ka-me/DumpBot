@@ -162,3 +162,41 @@ async def test_setup_mode_owner_zero_lets_nobody_in(ctx, static_dir, frozen) -> 
             assert response.status == 403
     finally:
         await client.close()
+
+
+@pytest.mark.parametrize(
+    "bad_hash",
+    ["é", "а" * 64, "g" * 64, "0" * 63, "0" * 65, " " + "0" * 63],
+    ids=["non-ascii", "cyrillic-64", "not-hex", "short", "long", "space"],
+)
+def test_a_hash_that_is_not_64_hex_digits_is_a_bad_signature(bad_hash: str) -> None:
+    data = dict(parse_qsl(make()))
+    data["hash"] = bad_hash
+    with pytest.raises(auth.InitDataError, match="bad signature"):
+        auth.validate_init_data(urlencode(data), TOKEN, now=NOW)
+
+
+def test_the_hash_may_be_upper_case() -> None:
+    data = dict(parse_qsl(make()))
+    data["hash"] = data["hash"].upper()
+    assert auth.validate_init_data(urlencode(data), TOKEN, now=NOW).id == OWNER
+
+
+@pytest.mark.parametrize("auth_date", ["9" * 20, "٣" * 10], ids=["year-overflow", "arabic-digits"])
+def test_an_impossible_auth_date_is_rejected(auth_date: str) -> None:
+    fields = {"user": json.dumps({"id": OWNER}), "auth_date": auth_date}
+    with pytest.raises(auth.InitDataError, match="auth_date"):
+        auth.validate_init_data(urlencode({**fields, "hash": auth.sign(fields, TOKEN)}), TOKEN, now=NOW)
+
+
+@pytest.mark.parametrize(
+    "header",
+    ["tma hash=%C3%A9", "tma auth_date=1&hash=%D0%B0", f"tma hash={'%D0%B0' * 64}"],
+    ids=["e-acute", "cyrillic", "cyrillic-64"],
+)
+async def test_a_non_ascii_hash_is_401_without_an_error_log(api, caplog, header: str) -> None:
+    with caplog.at_level(logging.INFO):
+        reply = await api.get("/api/me", auth_header=header)
+    assert (reply.status, reply.data["error"]["code"]) == (401, "unauthorized")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert "Traceback" not in caplog.text

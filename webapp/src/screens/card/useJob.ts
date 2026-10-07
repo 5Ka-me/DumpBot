@@ -32,6 +32,30 @@ export function jobOutcome(kind: JobKind, status: JobStatus): { ok: boolean; tex
   return { ok: true, text: "🕒 Время изменено", warnings: Array.isArray(result.warnings) ? result.warnings : [] };
 }
 
+export const SPLIT_POLL_MS = 2500;
+export const SPLIT_POLL_SLOW_MS = 30_000;
+/** Polled every SPLIT_POLL_MS for this long, then every SPLIT_POLL_SLOW_MS (a split may wait hours for the budget). */
+export const SPLIT_POLL_FAST_FOR_MS = 60_000;
+
+/** While `on` (a split started elsewhere runs and the card is on top): `reload` the card, often, then rarely. */
+export function useSplitPolling(on: boolean, reload: () => Promise<void>): void {
+  useEffect(() => {
+    if (!on) return;
+    const started = Date.now();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let stopped = false;
+    const next = () => {
+      const delay = Date.now() - started < SPLIT_POLL_FAST_FOR_MS ? SPLIT_POLL_MS : SPLIT_POLL_SLOW_MS;
+      timer = setTimeout(() => void reload().finally(() => !stopped && next()), delay);
+    };
+    next();
+    return () => {
+      stopped = true;
+      clearTimeout(timer);
+    };
+  }, [on, reload]);
+}
+
 export function useJob(onFinish: (warnings: string[]) => Promise<void> | void) {
   const [job, setJob] = useState<RunningJob | null>(null);
   const controller = useRef<AbortController | null>(null);

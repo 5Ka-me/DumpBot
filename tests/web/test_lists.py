@@ -3,17 +3,27 @@ recurring, week, usage, jobs."""
 
 from __future__ import annotations
 
-from datetime import timedelta
+import base64
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from zoneinfo import ZoneInfo
+
+from sqlalchemy import select
 
 from dumpbot.ai.schemas import EditPatch
-from dumpbot.db.models import AiUsage, Job
+from dumpbot.db.models import AiUsage, Job, Occurrence, Reminder
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items
 from dumpbot.web.api_lists import encode_cursor
 
 TOMORROW_13 = {"text": "завтра в 13", "day": "+1", "time": "13:00"}
 TODAY_15 = {"text": "сегодня в 15", "day": "+0", "time": "15:00"}
+WARSAW = ZoneInfo("Europe/Warsaw")
+
+
+def local(day: int, hour: int, minute: int = 0) -> datetime:
+    """A moment of October 2026 in Warsaw, as UTC."""
+    return datetime(2026, 10, day, hour, minute, tzinfo=WARSAW).astimezone(UTC)
 
 
 async def test_me(api) -> None:
@@ -69,6 +79,48 @@ async def test_tasks_someday_recurring(api, make_items) -> None:
     assert [r["id"] for r in recurring] == [series.item.id]
     assert recurring[0]["rrule"] == "FREQ=WEEKLY;BYDAY=MO" and recurring[0]["repeat_text"] == "каждый понедельник"
     assert (await api.get("/api/tasks?limit=0")).status == 400
+
+
+async def test_move_not_done_to_tomorrow(api, make_items, db, ctx) -> None:
+    """«📅 Перенести невыполненное на завтра» (the evening digest's button) on «Сегодня», Tue 10:00: what is already
+    due today and the overdue go to Wednesday at their own time; the 15:00 still ahead stays."""
+    [call] = await make_items(
+        {"kind": "task", "title": "Позвонить", "when": {"text": "в 9", "day": "+0", "time": "09:00"}}, now=local(6, 8)
+    )
+    [late] = await make_items(
+        {"kind": "task", "title": "Вчерашнее", "when": {"text": "в 12", "day": "+0", "time": "12:00"}}, now=local(5, 8)
+    )
+    [ahead] = await make_items({"kind": "task", "title": "Созвон", "when": TODAY_15})
+    ctx.scheduler_wakeup.clear()
+
+    reply = await api.post("/api/today/move", {})
+
+    assert reply.status == 200 and reply.data == {"moved": 2, "message": "📅 Перенёс на завтра: 2"}
+    assert ctx.scheduler_wakeup.is_set()
+    due = {o.item_id: (o.due_at, o.status) for o in await db(select(Occurrence))}
+    assert due[call.item.id] == (local(7, 9), "open") and due[late.item.id] == (local(7, 12), "open")
+    assert due[ahead.item.id] == (local(6, 15), "open")
+    fires = await db(select(Reminder.fire_at).where(Reminder.status == "pending").order_by(Reminder.fire_at))
+    assert local(7, 8, 55) in fires and local(7, 11, 55) in fires
+    today = (await api.get("/api/today")).data
+    assert [r["title"] for r in today["open"]] == ["Созвон"] and today["overdue"] == []
+
+    ctx.scheduler_wakeup.clear()
+    again = await api.post("/api/today/move")
+    assert again.data == {"moved": 0, "message": "Нечего переносить"} and not ctx.scheduler_wakeup.is_set()
+    assert (await api.post("/api/today/move", {"day": "2026-10-05"})).status == 200  # a list opened before midnight
+
+
+async def test_move_not_done_validation(api) -> None:
+    for body, field in [
+        ({"day": "2026-10-07"}, "day"),  # tomorrow
+        ({"day": "2026-10-04"}, "day"),  # two days ago
+        ({"day": "2026-10-6"}, "day"),
+        ({"day": 20261006}, "day"),
+        ({"when": "today"}, "when"),
+    ]:
+        reply = await api.post("/api/today/move", body)
+        assert (reply.status, reply.data["error"]["field"]) == (400, field), body
 
 
 async def test_week_has_seven_days(api, make_items) -> None:
@@ -145,6 +197,16 @@ async def test_feed_rejects_bad_filters(api) -> None:
         reply = await api.get(f"/api/feed?{query}")
         assert reply.status == 400, query
         assert reply.data["error"] == {"code": "bad_request", "message": reply.data["error"]["message"], "field": field}
+
+
+async def test_feed_rejects_cursors_and_text_the_db_cannot_take(api) -> None:
+    for raw in ["2026-10-06T08:00:00+00:00|99999999999999999999999", "0001-01-01T00:00:00+14:00|1"]:
+        cursor = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+        reply = await api.get(f"/api/feed?cursor={cursor}")
+        assert (reply.status, reply.data["error"]["field"]) == (400, "cursor"), raw
+    for query, field in [("q=a%00b", "q"), ("tags=a%00b", "tags")]:
+        reply = await api.get(f"/api/feed?{query}")
+        assert (reply.status, reply.data["error"]["field"]) == (400, field), query
 
 
 def test_cursor_is_opaque_text() -> None:

@@ -75,6 +75,35 @@ describe("requests", () => {
     expect(await blob.text()).toBe("png");
     expect((fetchMock.mock.calls[0]![1]!.headers as Record<string, string>).Authorization).toMatch(/^tma /);
   });
+
+  it("lets the browser cache pictures (the server allows a day) but never API answers", async () => {
+    const { api, fetchMock } = apiWith(async (input) =>
+      String(input).startsWith("/api/files/") ? new Response("jpg", { status: 200 }) : json(200, { rows: [] }),
+    );
+    await api.image("/api/files/3/0?size=thumb");
+    await api.tasks();
+    expect(fetchMock.mock.calls.map(([url, init]) => `${String(url)} ${init!.cache}`)).toEqual([
+      "/api/files/3/0?size=thumb default",
+      "/api/tasks no-store",
+    ]);
+  });
+
+  it("sends the occurrence of a list row with done / undone, and the day to move", async () => {
+    const { api, fetchMock } = apiWith(async () => json(200, {}));
+    await api.occurrenceAction(3, "done", 41);
+    await api.occurrenceAction(3, "undone", 40);
+    await api.action(3, "done");
+    await api.moveToTomorrow("2026-10-06");
+    await api.moveToTomorrow();
+    const seen = fetchMock.mock.calls.map(([url, init]) => `${init!.method} ${String(url)} ${String(init!.body ?? "")}`);
+    expect(seen).toEqual([
+      'POST /api/items/3/done {"occurrence_id":41}',
+      'POST /api/items/3/undone {"occurrence_id":40}',
+      "POST /api/items/3/done {}",
+      'POST /api/today/move {"day":"2026-10-06"}',
+      "POST /api/today/move {}",
+    ]);
+  });
 });
 
 describe("feedParams", () => {

@@ -4,12 +4,23 @@ The AI jobs run through the real handlers with FakeAI (conftest)."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
+
 from sqlalchemy import select
 
-from dumpbot.db.models import Item, Reminder
+from dumpbot.db.models import Item, Occurrence, Reminder
+from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items
 
 TOMORROW_13 = {"text": "завтра в 13", "day": "+1", "time": "13:00"}
+DAILY_9 = {"kind": "task", "title": "таблетки", "when": {"text": "в 9", "time": "09:00"}, "rrule": "FREQ=DAILY"}
+WARSAW = ZoneInfo("Europe/Warsaw")
+
+
+def local(day: int, hour: int, minute: int = 0) -> datetime:
+    """A moment of October 2026 in Warsaw, as UTC."""
+    return datetime(2026, 10, day, hour, minute, tzinfo=WARSAW).astimezone(UTC)
 
 
 async def item_of(db, item_id: int) -> Item:
@@ -167,6 +178,10 @@ async def test_patch_validation(api, make_items) -> None:
         ({"period": "tomorrow"}, "period"),
         ({"someday": "yes"}, "someday"),
         ({"period": "soon", "someday": True}, "someday"),
+        ({"period": "soon\n"}, "period"),  # `$` of a plain re.match would let the newline through
+        ({"title": "a\u0000b"}, "title"),  # Postgres text refuses NUL
+        ({"details": "a\u0000b"}, "details"),
+        ({"tags": ["a\u0000b"]}, "tags"),
         ({"colour": "red"}, "colour"),
     ]:
         reply = await api.patch(path, body)
@@ -203,6 +218,14 @@ async def test_when_from_the_picker(api, make_items) -> None:
 
     for body in [{"due_local": "9 октября"}, {"due_local": "2026-13-01"}, {}, {"text": "x", "due_local": "2026-10-09"}]:
         assert (await api.post(path, body)).status == 400
+    # 0001-01-01 00:00 in Warsaw is before datetime.min in UTC; a trailing newline is not a date
+    for value in ["0001-01-01T00:00", "0001-01-01", "1969-12-31", "9999-12-31T23:59", "2026-10-09\n"]:
+        reply = await api.post(path, {"due_local": value})
+        assert (reply.status, reply.data["error"]["field"]) == (400, "due_local"), value
+    step = await api.post(f"/api/items/{created.item.id}/steps", {"title": "Шаг", "due_local": "0001-01-01T00:00"})
+    assert (step.status, step.data["error"]["field"]) == (400, "due_local")
+    step = await api.post(f"/api/items/{created.item.id}/steps", {"title": "a\u0000b"})
+    assert (step.status, step.data["error"]["field"]) == (400, "title")
 
 
 async def test_when_by_text_runs_the_edit_time_job(api, make_items, fake_ai, run_jobs, jobs_all, bot) -> None:
@@ -258,6 +281,102 @@ async def test_done_of_a_series_names_the_next_time(api, make_items) -> None:
     reply = await api.post(f"/api/items/{created.item.id}/done")
     assert reply.data["message"] == "✅ Готово · следующий раз чт 8 окт 09:00"
     assert reply.data["item"]["status"] == "open" and reply.data["item"]["rec_active"] is True
+
+
+async def _tick(sessionmaker, now: datetime) -> None:
+    """The scheduler's recurrence tick: the next instance of a due series, superseded ones -> missed."""
+    async with sessionmaker() as session:
+        await items.ensure_recurring(session, Prefs(), now)
+        await session.commit()
+
+
+async def _occurrences(db, item_id: int) -> list[tuple[datetime, str]]:
+    occs = await db(select(Occurrence).where(Occurrence.item_id == item_id).order_by(Occurrence.due_at))
+    return [(o.due_at, o.status) for o in occs]
+
+
+async def _pending(db, item_id: int) -> list[datetime]:
+    stmt = (
+        select(Reminder.fire_at)
+        .join(Occurrence, Occurrence.id == Reminder.occurrence_id)
+        .where(Occurrence.item_id == item_id, Reminder.status == "pending")
+        .order_by(Reminder.fire_at)
+    )
+    return await db(stmt)
+
+
+async def test_a_row_closes_its_own_missed_instance_of_a_series(api, make_items, frozen, sessionmaker, db) -> None:
+    """Wed 21:31 (the evening digest): this morning's 09:00 is missed, Thursday's is open with its reminder. The
+    ☐ of Wednesday's row in «Сегодня» closes Wednesday — not Thursday, whose reminder stays."""
+    [created] = await make_items(DAILY_9)
+    item_id = created.item.id
+    frozen.now = local(7, 21, 31)
+    await _tick(sessionmaker, frozen.now)
+    assert await _occurrences(db, item_id) == [(local(7, 9), "missed"), (local(8, 9), "open")]
+    assert await _pending(db, item_id) == [local(8, 8, 55)]
+
+    [row] = [r for r in (await api.get("/api/today")).data["open"] if r["id"] == item_id]
+    assert row["occ_status"] == "missed" and row["when_text"] == "сегодня 09:00"
+    reply = await api.post(f"/api/items/{item_id}/done", {"occurrence_id": row["occurrence_id"]})
+
+    assert reply.status == 200
+    assert reply.data["message"] == "✅ Готово · следующий раз завтра 09:00"
+    assert await _occurrences(db, item_id) == [(local(7, 9), "done"), (local(8, 9), "open")]
+    assert await _pending(db, item_id) == [local(8, 8, 55)]  # Thursday's reminder is still coming
+    today = (await api.get("/api/today")).data
+    assert [r["id"] for r in today["open"]] == [] and [r["id"] for r in today["done"]] == [item_id]
+
+
+async def test_a_week_row_closes_that_day_not_an_earlier_open_one(api, make_items, frozen, sessionmaker, db) -> None:
+    """Wed 15:00: this morning's instance is still open; ticking Thursday's row of «7 дней» closes Thursday."""
+    [created] = await make_items(DAILY_9)
+    item_id = created.item.id
+    frozen.now = local(7, 15)
+    await _tick(sessionmaker, frozen.now)
+    week = (await api.get("/api/week")).data["days"]
+    [thursday] = [r for r in week[1]["open"] if r["id"] == item_id]
+
+    reply = await api.post(f"/api/items/{item_id}/done", {"occurrence_id": thursday["occurrence_id"]})
+
+    assert reply.status == 200 and reply.data["message"].startswith("✅ Готово")
+    assert await _occurrences(db, item_id) == [(local(7, 9), "open"), (local(8, 9), "done"), (local(9, 9), "open")]
+
+
+async def test_undone_of_a_row_reopens_that_occurrence(api, make_items, frozen, sessionmaker, db) -> None:
+    [created] = await make_items(DAILY_9)
+    item_id = created.item.id
+    frozen.now = local(7, 15)
+    await _tick(sessionmaker, frozen.now)
+    [wed, thu] = await db(select(Occurrence.id).where(Occurrence.item_id == item_id).order_by(Occurrence.due_at))
+    await api.post(f"/api/items/{item_id}/done", {"occurrence_id": thu})
+    frozen.advance(minutes=1)
+    await api.post(f"/api/items/{item_id}/done", {"occurrence_id": wed})  # the latest done one now
+
+    reply = await api.post(f"/api/items/{item_id}/undone", {"occurrence_id": thu})
+
+    assert reply.status == 200 and reply.data["message"] == "↩️ Не сделано"
+    assert await _occurrences(db, item_id) == [(local(7, 9), "done"), (local(8, 9), "open"), (local(9, 9), "open")]
+
+
+async def test_occurrence_id_must_be_the_items_own(api, make_items, db) -> None:
+    [first, second] = await make_items(
+        {"kind": "task", "title": "Купить молоко", "when": TOMORROW_13},
+        {"kind": "task", "title": "Позвонить", "when": TOMORROW_13},
+    )
+    [other] = await db(select(Occurrence.id).where(Occurrence.item_id == second.item.id))
+    path = f"/api/items/{first.item.id}"
+    for action in ("done", "undone"):
+        reply = await api.post(f"{path}/{action}", {"occurrence_id": other})
+        assert (reply.status, reply.data["error"]["code"]) == (404, "not_found"), action
+        for body in [{"occurrence_id": "5"}, {"occurrence_id": True}, {"occurrence_id": 0}, {"occurrence_id": 2**63}]:
+            reply = await api.post(f"{path}/{action}", body)
+            assert (reply.status, reply.data["error"]["field"]) == (400, "occurrence_id"), (action, body)
+        assert (await api.post(f"{path}/{action}", {"minutes": 5})).data["error"]["field"] == "minutes"
+    assert (await item_of(db, second.item.id)).status == "open"
+    [own] = await db(select(Occurrence.id).where(Occurrence.item_id == first.item.id))
+    await api.post(f"{path}/delete")
+    reply = await api.post(f"{path}/done", {"occurrence_id": own})
+    assert (reply.status, reply.data["error"]["code"]) == (409, "deleted")
 
 
 async def test_no_reminders_delete_restore_stoprec(api, make_items) -> None:

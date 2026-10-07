@@ -17,7 +17,7 @@ npm run build      # dist/
 |---|---|
 | `src/api/` | `types.ts` (контракт), `client.ts` — по методу на эндпоинт, `Authorization: tma <initData>`, ошибки → `ApiError` (`code`, русский `message`, `field`), `pollJob` |
 | `src/telegram.ts` | `telegram-web-app.js`: ready / expand, тема из `themeParams` (CSS берёт `--tg-theme-*`), haptics, диалоги, ссылки |
-| `src/lib/` | кэш чтений (`useResource`, `markStale`), навигация (вкладки + стек экранов, BackButton), MainButton, «закинуть в свалку» с опросом, превью картинок (fetch → blob URL), форматирование дат по-русски в часовом поясе владельца |
+| `src/lib/` | кэш чтений (`useResource`, `markStale`), навигация (вкладки + стек экранов, BackButton), MainButton, «закинуть в свалку» с опросом, превью картинок (fetch → blob URL, кэш по числу и байтам), черновики (`drafts`: localStorage до сохранения), форматирование дат по-русски в часовом поясе владельца |
 | `src/screens/` | Сегодня (и 7 дней), Лента, Задачи, Карточка (`card/`), Добавить, Спросить, Настройки, Расходы, Ещё |
 | `mock/` | мок-API для `npm run dev` и тестов: те же пути, формы и коды ошибок, данные в памяти |
 

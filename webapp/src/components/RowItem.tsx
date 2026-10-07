@@ -84,7 +84,7 @@ export function RowItem({ row, onOpen, onToggle, overdue, aside, thumbnail, snip
         <span className="row-aside">
           {asideText && <span className="row-aside-text">{asideText}</span>}
           {thumbnail && row.images > 0 && (
-            <AuthImage className="thumb" path={`/api/files/${row.id}/0`} alt={`Картинка: ${row.title}`} />
+            <AuthImage className="thumb" path={`/api/files/${row.id}/0?size=thumb`} alt={`Картинка: ${row.title}`} />
           )}
         </span>
       )}

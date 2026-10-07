@@ -192,7 +192,7 @@ async def test_dead_app_job_without_a_message_is_not_announced(api, ctx, make_it
 
 
 async def test_inbox_validation(api, add_raw) -> None:
-    for body in [{}, {"text": "  "}, {"text": 5}, {"text": "x" * 4097}]:
+    for body in [{}, {"text": "  "}, {"text": 5}, {"text": "x" * 4097}, {"text": "a\u0000b"}]:
         reply = await api.post("/api/inbox", body)
         assert reply.status == 400 and reply.data["error"]["field"] == "text"
     telegram = await add_raw(message_id=55, text="из чата")

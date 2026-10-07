@@ -56,6 +56,10 @@ async def test_patch_settings_validation(api) -> None:
         ({"quiet_enabled": "yes"}, "quiet_enabled"),
         ({"stt_mode": "cloud"}, "stt_mode"),
         ({"soon_days": 0}, "soon_days"),
+        ({"budget_usd": 10**400}, "budget_usd"),  # an integer literal too big for a float
+        ({"missed_grace_minutes": 0}, "missed_grace_minutes"),
+        ({"missed_grace_minutes": 10**15}, "missed_grace_minutes"),  # timedelta(minutes=…) would overflow
+        ({"tz": "Europe/Warsaw\u0000"}, "tz"),
         ({"colour": "red"}, "colour"),
     ]:
         reply = await api.patch("/api/settings", body)
