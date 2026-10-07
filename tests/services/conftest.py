@@ -7,7 +7,7 @@ Reference time: Tue 2026-10-06 10:00 Europe/Warsaw (CEST, UTC+2).
 from __future__ import annotations
 
 import itertools
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -71,6 +71,7 @@ def make(session: AsyncSession, prefs: Prefs) -> Callable[..., Awaitable[list[Cr
         raw: RawMessage | None = None,
         source_text: str | None = None,
         prefs_: Prefs | None = None,
+        related_allowed: Collection[int] = (),
     ) -> list[CreatedItem]:
         created = await items.create_items(
             session,
@@ -84,6 +85,7 @@ def make(session: AsyncSession, prefs: Prefs) -> Callable[..., Awaitable[list[Cr
             now=now,
             model="test-model",
             prompt_version="v1",
+            related_allowed=related_allowed,
         )
         await session.commit()
         return created

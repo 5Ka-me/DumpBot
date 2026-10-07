@@ -105,7 +105,7 @@ src/dumpbot/
     usage.py               запись ai_usage, траты за месяц, состояние бюджета                        [ai]
     items.py               жизненный цикл записей/повторений/напоминаний                             [items]
     query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
-    related.py             «предметные» лексемы для «🔗 похоже на» (стоп-список общих слов)           [items]
+    related.py             «предметные» лексемы для «🔗 похоже на» (без инфинитивов и общих слов)     [items]
     ingest.py              Message → RawMessage, постановка в очередь                                [workers]
     processor.py           обработчики задач очереди                                                  [workers]
     digest.py              данные для дайджестов                                                      [workers]
@@ -396,13 +396,18 @@ async def split_steps(client: ChutesClient, settings: Settings, inp: SplitInput)
 ```
 
 Итерация 2, C ([iteration-2.md §C](features/iteration-2.md)): `ExtractedItem.related: list[int]` (≤ 3, id из строки
-`RELATED CANDIDATES`; чужие id и id без общей «предметной» лексемы в названиях отбрасывает `items.create_items`),
+`RELATED CANDIDATES`; чужие id и id, у которых «предметные» лексемы названий не пересекаются с новой записью,
+отбрасывает `items.create_items`),
 `ExtractedItem.steps: list[StepSpec]` (≤ 8, `{title, when?}`), `EditPatch.action` += `split`. Ответ на карточку с
 шагами вместо правки превращается в `split`.
 
 После валидации `extract` убирает бессмысленный вопрос «утра или вечера?» (`_drop_pointless_ask`): все варианты —
-время, два из них отличаются на 12 часов, а фраза времени записи уже называет этот час однозначно (13–23 или 0:
-«в 17», «17:30», «в семнадцать»; или с «утра/вечера»). Запись остаётся, `conf` low → med. «в 8» по-прежнему спрашивает.
+время, два из них отличаются на 12 часов, а фраза времени записи (`when.text`) называет этот час только однозначно
+(13–23 или 0: «в 17», «17:30», «в семнадцать»; или с «утра/вечера») и ни разу «голым» («в 8»). Вопрос остаётся:
+«в 8», «в 9 или в 21», «до 20 в 8», «к 20 окт в 8», «в восемь двадцать» (двадцать — минуты), «двадцать пятого в
+восемь» (дата), пустая фраза (`when.time` — лишь догадка модели). Время записи с этим часом остаётся, `conf` low →
+med; время другой половины суток (или его нет) заменяется закреплённым часом, `conf` не меняется; другой час или
+`at`/`in_min`/`period` — вопрос остаётся.
 
 Схема `Extraction` (ai/schemas.py): до `MAX_ITEMS=20` записей, `title` ≤ 120, `tags` ≤ 6, `image.text` ≤ 4000 и т.д.
 Ограничения остаются в JSON-схеме (подсказка для constrained decoding), а при валидации слишком длинные строки
@@ -620,10 +625,11 @@ async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, 
 async def items_of_raw(session, raw_ids: Sequence[int]) -> list[Row]   # не deleted записи этих raw (без шагов), по id
 async def related_candidates(session, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (),
                              limit: int = 5) -> list[Row]
-    # итерация 2, C1: tsquery 'a | b | …' по «предметным» лексемам текста (services/related.py: без слов напоминаний,
-    # времени, частых глаголов и чисел; ничего не осталось → []), ts_rank desc; только открытые (не done/deleted,
-    # задача со сделанным текущим повторением — как done, серии остаются), не шаги, created_at за 365 дней,
-    # кроме записей exclude_raw_ids
+    # итерация 2, C1: tsquery 'a | b | …' по «предметным» лексемам текста (services/related.py: без инфинитивов,
+    # слов напоминаний, времени, частых глаголов, чисел, ссылок; ничего не осталось → []); порядок: больше лексем в
+    # title/details, больше лексем во всей записи, ts_rank, новее; только открытые (не done/deleted, задача со
+    # сделанным текущим повторением — как done, серии и просроченные неотмеченные остаются), не шаги, created_at за
+    # 365 дней, кроме записей exclude_raw_ids
 async def related_refs(session, item_id: int) -> list[RelatedRef]   # item_links в обе стороны, не deleted, новые первыми
 async def card_extras(session, item: Item) -> CardExtras            # шаги (☐/☑, время), похожие, название родителя
 async def usage_summary(session, prefs: Prefs, now: datetime) -> UsageSummary

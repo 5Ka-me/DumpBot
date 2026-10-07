@@ -100,7 +100,8 @@ async def test_mark_undone_without_prefs_uses_stored_owner_prefs(session, make, 
     await save_prefs(session, 42, Prefs(lead_minutes=10))
     [c] = await make({"kind": "task", "title": "Отчёт", "when": {"day": "+1", "time": "15:00"}}, now=now)
     await items.mark_done(session, c.occurrence.id, now, prefs)
-    await items.mark_undone(session, c.occurrence.id)
+    # the test's "now", not the wall clock: on the real 2026-10-07 after 14:50 the reminder would be in the past
+    await items.mark_undone(session, c.occurrence.id, now=now)
     assert await reminders_of(c.occurrence.id, "pending") == [(local(2026, 10, 7, 14, 50), "pending", 10, False)]
 
 

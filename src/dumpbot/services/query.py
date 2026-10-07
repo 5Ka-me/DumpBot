@@ -27,7 +27,8 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
-from sqlalchemy import ColumnElement, DateTime, Select, and_, exists, func, literal, literal_column, or_, select
+from sqlalchemy import ColumnElement, DateTime, Select, Text, and_, exists, func, literal, literal_column, or_, select
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 from sqlalchemy.sql.selectable import Subquery
@@ -238,10 +239,13 @@ async def related_candidates(
     session: AsyncSession, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (), limit: int = RELATED_LIMIT
 ) -> list[Row]:
     """Earlier items that share a subject word with ``text`` (§C1, for the "RELATED CANDIDATES" line): full text with
-    an OR of the message's subject lexemes (``services.related``: no reminder / time words, common verbs or
-    numbers), best ``ts_rank`` first, then newest. Only open items (not done, not deleted; an actionable item whose
-    current occurrence is done counts as done, an active series stays), top-level, saved in the last
-    ``RELATED_DAYS`` days, not from ``exclude_raw_ids`` (the message itself). Nothing left of the message -> []."""
+    an OR of the message's subject lexemes (``services.related``: no infinitives, reminder / time words, common verbs
+    or numbers). Best first: most of those lexemes in the title / details, then in the whole item (with the message
+    it came from), then ``ts_rank``, then newest — a word in the title beats one only in the source text of a
+    multi-item message, and two shared words beat one. Only open items (not done, not deleted; an actionable item
+    whose current occurrence is done counts as done, an active series stays; a past-due one the owner has not ticked
+    is still open), top-level, saved in the last ``RELATED_DAYS`` days, not from ``exclude_raw_ids`` (the message
+    itself). Nothing left of the message -> []."""
     lexemes = await subject_lexemes(session, text)
     if not lexemes:
         return []
@@ -257,8 +261,20 @@ async def related_candidates(
     )
     if exclude_raw_ids:
         stmt = stmt.where(or_(Item.raw_message_id.is_(None), Item.raw_message_id.not_in(list(exclude_raw_ids))))
-    stmt = stmt.order_by(func.ts_rank(Item.search_tsv, tsq).desc(), Item.created_at.desc(), Item.id.desc())
+    title = func.to_tsvector(_RU, func.concat_ws(" ", Item.title, Item.details))
+    stmt = stmt.order_by(
+        _lexeme_hits(title, lexemes).desc(),
+        _lexeme_hits(Item.search_tsv, lexemes).desc(),
+        func.ts_rank(Item.search_tsv, tsq).desc(),
+        Item.created_at.desc(),
+        Item.id.desc(),
+    )
     return await _item_rows(session, stmt.limit(limit))
+
+
+def _lexeme_hits(doc: ColumnElement[Any], lexemes: Sequence[str]) -> ColumnElement[int]:
+    """How many of ``lexemes`` the tsvector ``doc`` has: its length minus the length without them."""
+    return func.length(doc) - func.length(func.ts_delete(doc, literal(list(lexemes), ARRAY(Text))))
 
 
 async def related_refs(session: AsyncSession, item_id: int) -> list[RelatedRef]:

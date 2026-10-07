@@ -11,7 +11,7 @@ import pytest
 
 from dumpbot.ai.extract import ExtractInput, _drop_pointless_ask, extract
 from dumpbot.ai.prompts import SYSTEM_PROMPT
-from dumpbot.ai.schemas import Extraction
+from dumpbot.ai.schemas import Extraction, When
 from dumpbot.domain.prefs import Prefs
 
 NOW = datetime(2026, 10, 6, 12, 5, tzinfo=UTC)
@@ -77,14 +77,18 @@ async def test_a_bare_8_keeps_its_question(fake, client, settings):
         ({"text": "в 2 часа дня", "time": "14:00"}, ["02:00", "14:00"]),
         ({"text": "в 8 вечера", "time": "20:00"}, ["08:00", "20:00"]),  # утра / вечера pins it too
         ({"text": "в 7 утра", "time": "07:00"}, ["7 утра", "7 вечера"]),
-        ({"time": "17:00"}, ["17:00", "05:00"]),  # no phrase: the 24-hour time decides
         ({"text": "в 17", "time": "17:00"}, ["(17:00)", "в 5"]),
+        ({"text": "в 12 дня", "time": "12:00"}, ["12:00", "00:00"]),
+        ({"text": "в 11 ночи", "time": "23:00"}, ["11:00", "23:00"]),
+        ({"text": "в восемь вечера", "time": "20:00"}, ["08:00", "20:00"]),  # spoken, with вечера
+        ({"text": "в семнадцать тридцать", "time": "17:30"}, ["17:30", "05:30"]),  # 17 and its minutes
+        ({"text": "к 20 октября в 20", "day": "10-20", "time": "20:00"}, ["08:00", "20:00"]),  # 20 октября is a day
     ],
 )
 def test_pinned_hours_lose_the_am_pm_question(when, options):
     ext = _drop_pointless_ask(ask_of(when, options))
     assert ext.ask is None
-    assert len(ext.items) == 1 and ext.items[0].when is not None
+    assert len(ext.items) == 1 and ext.items[0].when == When.model_validate(when)  # the time stays
 
 
 @pytest.mark.parametrize(
@@ -101,11 +105,51 @@ def test_pinned_hours_lose_the_am_pm_question(when, options):
         ({"text": "в 17", "time": "17:00"}, ["сегодня", "завтра"]),
         ({"text": "после обеда", "time": "14:00"}, ["14:00", "02:00"]),  # a phrase without the hour: asked
         ({"text": "двадцатого в 8", "day": "d20", "time": "20:00"}, ["08:00", "20:00"]),  # «двадцатого» is a day
+        # spoken minutes or dates are no hour: "двадцать" here is 8:20 or the 25th
+        ({"text": "в восемь двадцать", "time": "20:20"}, ["08:20", "20:20"]),
+        ({"text": "двадцать пятого в восемь", "day": "d25", "time": "20:00"}, ["08:00", "20:00"]),
+        ({"text": "двадцать первого октября в восемь", "day": "10-21", "time": "20:00"}, ["8 утра", "8 вечера"]),
+        ({"text": "в семь девятнадцать", "time": "19:19"}, ["07:19", "19:19"]),
+        ({"text": "к двадцать первому в восемь", "day": "d21", "time": "20:00"}, ["08:00", "20:00"]),
+        # a bare hour on the asked position keeps the question, whatever else the phrase pins
+        ({"text": "в 9 или в 21", "time": "21:00"}, ["09:00", "21:00"]),
+        ({"text": "к 20 окт в 8", "day": "10-20", "time": "20:00"}, ["08:00", "20:00"]),
+        ({"text": "к 20му в 8", "day": "d20", "time": "20:00"}, ["08:00", "20:00"]),
+        ({"text": "до 20 в 8", "time": "20:00"}, ["08:00", "20:00"]),
+        ({"text": "двадцать первого в 8", "day": "d21", "time": "20:00"}, ["08:00", "20:00"]),
+        ({"text": "в 17 или в 5 утра", "time": "17:00"}, ["17:00", "05:00"]),  # two pinned hours: which one?
+        # no time phrase: when.time is only the model's guess for a bare "в 8"
+        ({"time": "17:00"}, ["17:00", "05:00"]),
+        ({"time": "20:00"}, ["08:00", "20:00"]),
+        ({"day": "+1", "time": "21:00"}, ["09:00", "21:00"]),
+        ({"time": "20:00"}, ["8 утра", "8 вечера"]),
+        # the item's time is another hour, or not a plain day / time: the question is the safer way
+        ({"text": "в 17", "time": "18:00"}, ["17:00", "05:00"]),
+        ({"text": "в 17", "at": "2026-10-07T05:00"}, ["17:00", "05:00"]),
     ],
 )
-def test_other_questions_stay(when, options):
-    ext = ask_of(when, options)
+@pytest.mark.parametrize("conf", ["low", "high"])
+def test_other_questions_stay(when, options, conf):
+    ext = ask_of(when, options, conf=conf)
     assert _drop_pointless_ask(ext) == ext
+
+
+@pytest.mark.parametrize(
+    ("when", "options", "time"),
+    [
+        ({"text": "в 17", "time": "05:00"}, ["17:00", "05:00"], "17:00"),
+        ({"text": "в 8 вечера", "time": "08:00"}, ["08:00", "20:00"], "20:00"),
+        ({"text": "в 21:30", "time": "09:30"}, ["21:30", "09:30"], "21:30"),
+        ({"text": "в 17", "day": "+1"}, ["17:30", "05:30"], "17:30"),  # no time: the minutes of the option
+        ({"text": "в 17", "time": "evening"}, ["17", "5"], "17:00"),
+    ],
+)
+def test_a_time_of_the_other_half_of_the_day_becomes_the_pinned_hour(when, options, time):
+    ext = _drop_pointless_ask(ask_of(when, options, conf="low"))
+    assert ext.ask is None
+    [item] = ext.items
+    assert item.when == When.model_validate({**when, "time": time})
+    assert item.conf == "low"  # the model was unsure: "⚠️ проверь время" stays
 
 
 def test_low_confidence_about_the_pinned_hour_becomes_med():

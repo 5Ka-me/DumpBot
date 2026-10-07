@@ -56,7 +56,7 @@ async def test_candidates_match_any_subject_word_best_rank_first(session, make, 
 
 async def test_generic_words_bring_no_candidates(session, make, now, local):
     # the live case: «Покушать» was saved from "напомни через час покушать", «Позвонить маме завтра» shares "завтра"
-    [eat] = await make(
+    await make(
         {"kind": "task", "title": "Покушать"}, now=local(2026, 10, 6, 8, 0), source_text="напомни через час покушать"
     )
     await make({"kind": "task", "title": "Позвонить маме завтра"}, now=local(2026, 10, 5, 8, 0))
@@ -64,22 +64,30 @@ async def test_generic_words_bring_no_candidates(session, make, now, local):
 
     text = "Напомни часов в 17 прогуглить про визу в черногорию"
     assert [r.item_id for r in await query.related_candidates(session, text, now)] == [visa.item.id]
-    # nothing but reminder / time words, common verbs and numbers -> no candidates at all
-    for text in ("напомни завтра в 10 позвонить", "Напомни через час", "в пятницу вечером купить", "5-го в 17:00"):
+    # nothing but reminder / time words, common verbs, infinitives and numbers -> no candidates at all: a bare verb
+    # («покушать») names no subject
+    for text in (
+        "напомни завтра в 10 позвонить",
+        "Напомни через час",
+        "в пятницу вечером купить",
+        "5-го в 17:00",
+        "покушать бы",
+        "напомни через час покушать",
+    ):
         assert await query.related_candidates(session, text, now) == [], text
-    assert [r.item_id for r in await query.related_candidates(session, "покушать бы", now)] == [eat.item.id]
 
 
 async def test_candidates_are_open_items_only(session, make, now, local, prefs):
     day = local(2026, 10, 5, 9, 0)
     today = {"text": "сегодня в 12", "day": "+0", "time": "12:00"}
-    [open_, done, gone, done_occ, series, idea] = await make(
-        {"kind": "task", "title": "Покушать"},
-        {"kind": "task", "title": "Покушать", "when": today},
-        {"kind": "task", "title": "Покушать удалённое"},
-        {"kind": "task", "title": "Покушать по старому", "when": today},
-        {"kind": "task", "title": "Покушать по расписанию", "when": today, "rrule": "FREQ=DAILY"},
-        {"kind": "idea", "title": "Покушать в новом месте"},
+    [open_, done, gone, done_occ, series, idea, overdue] = await make(
+        {"kind": "task", "title": "Таблетки"},
+        {"kind": "task", "title": "Таблетки", "when": today},
+        {"kind": "task", "title": "Таблетки удалённые"},
+        {"kind": "task", "title": "Таблетки по старому", "when": today},
+        {"kind": "task", "title": "Таблетки по расписанию", "when": today, "rrule": "FREQ=DAILY"},
+        {"kind": "idea", "title": "Таблетки в новой упаковке"},
+        {"kind": "task", "title": "Купить таблетки", "when": today},
         now=day,
     )
     await items.mark_done(session, done.occurrence.id, day, prefs)
@@ -93,8 +101,9 @@ async def test_candidates_are_open_items_only(session, make, now, local, prefs):
     await session.commit()
     assert (await session.get(Item, done.item.id)).status == "done"
 
-    rows = await query.related_candidates(session, "Покушать", now)
-    assert {r.item_id for r in rows} == {open_.item.id, series.item.id, idea.item.id}
+    # a past-due one the owner has not ticked (yesterday 12:00) is still open: "не сделано" (requirements)
+    rows = await query.related_candidates(session, "таблетки", now)
+    assert {r.item_id for r in rows} == {open_.item.id, series.item.id, idea.item.id, overdue.item.id}
 
 
 async def test_candidates_skip_the_message_itself_old_deleted_and_steps(session, make, now, local, new_raw):
@@ -120,6 +129,32 @@ async def test_candidates_ignore_numbers_and_operators_and_keep_five(session, ma
     rows = await query.related_candidates(session, "отпуск в 15:00 & !", now)
     assert len(rows) == 5 and all("отпуск" in r.title for r in rows)
     assert await query.related_candidates(session, "   ", now) == []
+
+
+async def test_candidates_rank_title_words_and_more_words_first(session, make, now, local):
+    # a word in the title beats one only in the message a multi-item save came from; more shared words beat one
+    [dentist] = await make({"kind": "task", "title": "Записаться к стоматологу"}, now=local(2026, 9, 1, 10, 0))
+    for day in range(10, 15):
+        await make(
+            {"kind": "purchase", "title": f"Купить молоко {day}"},
+            now=local(2026, 9, day, 10, 0),
+            source_text="купить молоко и записаться к стоматологу",
+        )
+    rows = await query.related_candidates(session, "стоматолог", now)
+    assert len(rows) == 5 and rows[0].item_id == dentist.item.id
+    [sony] = await make({"kind": "purchase", "title": "Наушники Sony"}, now=local(2026, 8, 1, 10, 0))
+    rows = await query.related_candidates(session, "наушники Sony стоматолог", now)
+    assert [r.item_id for r in rows[:2]] == [sony.item.id, dentist.item.id]
+
+
+async def test_a_leaked_verb_does_not_crowd_out_the_subject(session, make, now, local):
+    # five newer «Принять …» and the tablets saved on 1 Sep: "принять" is no subject, the tablets come up
+    [tablets] = await make({"kind": "purchase", "title": "Купить таблетки от давления"}, now=local(2026, 9, 1, 10, 0))
+    others = ("Принять посылку", "Принять решение по ипотеке", "Принять душ перед выходом", "Принять работу у мастера")
+    for day, title in enumerate([*others, "Принять звонок от HR"], start=10):
+        await make({"kind": "task", "title": title}, now=local(2026, 9, day, 10, 0), source_text=title.lower())
+    rows = await query.related_candidates(session, "напомни в 21 принять таблетки", now)
+    assert [r.item_id for r in rows] == [tablets.item.id]
 
 
 # --- card extras ---------------------------------------------------------------------------------------------------
