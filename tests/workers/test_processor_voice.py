@@ -237,7 +237,7 @@ async def test_forwarded_audio_file_is_transcribed_like_a_voice_note(
 
     await processor.handle_message(ctx, {"raw_id": raw.id})
 
-    assert local_stt.calls == [{"audio": b"M4A-BYTES", "mime_type": "audio/mp4", "language": None}]
+    assert local_stt.calls == [{"audio": b"M4A-BYTES", "mime_type": "audio/mp4", "language": "ru"}]
     [inp] = fake_ai.inputs
     assert (inp.text, inp.source, inp.forward_from) == ("локальный транскрипт", "forward", "Петя")
     [item] = await items_of_raw(raw.id)

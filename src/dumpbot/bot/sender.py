@@ -98,7 +98,9 @@ async def send(
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
             reply_parameters=reply,
-            disable_notification=True if silent else None,
+            # None lets bot.quiet_requests silence it in quiet hours; a reminder that reaches the sender is for a time
+            # the user named (automatic ones are held back by the scheduler), so it rings unless told otherwise.
+            disable_notification=True if silent else (False if purpose == "reminder" else None),
         ),
         "send_message",
     )

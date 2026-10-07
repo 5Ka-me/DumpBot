@@ -57,7 +57,8 @@ class Prefs(BaseModel):
     digest_evening_time: time = time(21, 0)
 
     budget_usd: float = Field(5.0, ge=0)
-    stt_language: Literal["ru", "en"] | None = None  # None = auto-detect
+    stt_language: Literal["ru", "en"] | None = "ru"  # None = auto-detect (unreliable on short clips: Russian
+    # speech came back as English gibberish), so Russian by default
     # Speech-to-text: auto = chutes, the local Whisper when chutes fails; local = the reverse; chutes = chutes only.
     # Without LOCAL_STT_URL every mode works as "chutes".
     stt_mode: SttMode = "auto"
