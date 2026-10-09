@@ -12,7 +12,8 @@ card; whenever a commit closed a parent by its last step (whatever button did it
 
 Iteration 3 (docs/features/iteration-3.md): [✅ N] / [↩️ N] under /today, /tasks and the digests (``ListCb``) close or
 reopen that line without the AI and re-render the list from its buttons (``bot.lists``); [🌙 Вечером] of a reminder
-(``OccCb`` ``eve``) moves the item to this evening's ``slot_evening`` like the other snooze buttons.
+(``OccCb`` ``eve``) moves the item to this evening's ``slot_evening`` like the other snooze buttons; [↩️ Отменить]
+(``UndoCb``) of an edit applied by description puts back what it changed (``services.undo``).
 
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
@@ -50,6 +51,7 @@ from dumpbot.bot.cbdata import (
     OccCb,
     PickCb,
     SubCb,
+    UndoCb,
 )
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
@@ -57,7 +59,7 @@ from dumpbot.db.models import Occurrence, RawMessage
 from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import fmt_date, fmt_dt, plural_ru
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
-from dumpbot.services import digest, items, processor, query
+from dumpbot.services import digest, items, processor, query, undo
 from dumpbot.workers import jobs
 
 if TYPE_CHECKING:
@@ -73,6 +75,8 @@ MAX_ASK_OPTIONS: Final = 8
 LIST_TOAST_TITLE_MAX: Final = 60
 EVENING_PASSED: Final = "🌙 Вечер уже наступил — выбери другое время"
 SPLITTING: Final = "Уже разбиваю на шаги…"
+UNDO_ALREADY: Final = "Уже отменено"
+UNDO_STALE: Final = "🤷 Запись уже изменилась — отменить нельзя"
 # Digest buttons sent before the digest day was part of the callback data ("d:tmr").
 OLD_DIGEST_DATA: Final = frozenset(f"{DigestCb.__prefix__}:{a}" for a in DIGEST_ACTIONS)
 
@@ -101,6 +105,7 @@ def make_router() -> Router:
     router.callback_query.register(on_pick, PickCb.filter())
     router.callback_query.register(on_step, SubCb.filter())
     router.callback_query.register(on_list, ListCb.filter())
+    router.callback_query.register(on_undo, UndoCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     # Buttons of an older version (the removed "⏱ Напомнить за…" menu: ItemCb "lead", "l:…"), garbage data.
@@ -480,6 +485,38 @@ async def on_pick(callback: CallbackQuery, callback_data: PickCb, ctx: AppContex
         return Outcome(chosen_view(callback), "Применяю правку…", wake_jobs=True)
 
     await run(callback, ctx, op)
+
+
+# --- [↩️ Отменить] of an edit applied by description ----------------------------------------------------------------
+
+
+async def on_undo(callback: CallbackQuery, callback_data: UndoCb, ctx: AppContext) -> None:
+    """[↩️ Отменить] under "✅ Закрыл «…»" / "🕒 Перенёс «…»" / "🗑 Удалил «…»" (docs/features/iteration-3.md §3):
+    everything that edit changed goes back exactly as it was (``services.undo``) and the message turns into the
+    item's card. A second press (a double tap): "Уже отменено", nothing more. The item changed since (another edit, a
+    button, a reminder that went off): nothing is touched, the button goes away and the toast says why."""
+    as_is = _without_buttons(callback)
+
+    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
+        outcome = await undo.undo_edit(session, callback_data.raw, callback_data.item, now)
+        if outcome == undo.MISSING:
+            return Outcome(None, common.STALE)
+        if outcome == undo.ALREADY:
+            return Outcome(None, UNDO_ALREADY)
+        if outcome == undo.STALE:
+            return Outcome(as_is, UNDO_STALE)
+        item = await common.get_item(session, callback_data.item)
+        return Outcome(await common.card_view(session, item, prefs, now), "↩️ Отменено", wake_scheduler=True)
+
+    await run(callback, ctx, op)
+
+
+def _without_buttons(callback: CallbackQuery) -> views.View | None:
+    """The pressed message as it is, without its keyboard (None when it is not accessible)."""
+    message = callback.message
+    if not isinstance(message, Message) or not (message.text or message.caption):
+        return None
+    return views.fit(message.html_text), None
 
 
 def chosen_view(callback: CallbackQuery) -> views.View | None:

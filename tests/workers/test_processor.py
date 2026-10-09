@@ -12,10 +12,11 @@ from sqlalchemy import select
 
 from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
 from dumpbot.ai.extract import ExtractOutput
-from dumpbot.ai.schemas import Extraction
-from dumpbot.bot.cbdata import AskCb, PickCb
+from dumpbot.ai.schemas import EditPatch, Extraction
+from dumpbot.bot.cbdata import AskCb, PickCb, UndoCb
 from dumpbot.db.models import AiUsage, Item, Job, OnceKey, RawMessage
-from dumpbot.services import processor
+from dumpbot.domain.prefs import Prefs
+from dumpbot.services import ingest, items, processor
 from dumpbot.workers import jobs
 from dumpbot.workers.jobs import JobWorker, RetryLater
 
@@ -454,7 +455,7 @@ EDIT_TO_16 = {"intent": "edit", "edit": {"target": "встреча Олег", "w
 
 
 async def test_edit_by_target_single_candidate(
-    ctx, add_raw, fake_ai, bot, make_items, t0, occurrences_of, local, get
+    ctx, add_raw, fake_ai, bot, make_items, t0, occurrences_of, local, get, bot_messages
 ) -> None:
     [created] = await make_items(
         {"kind": "event", "title": "Встреча с Олегом", "when": {"day": "+1", "time": "15:00"}}, now=t0
@@ -464,10 +465,15 @@ async def test_edit_by_target_single_candidate(
     await processor.handle_message(ctx, {"raw_id": raw.id})
     [occ] = [o for o in await occurrences_of(created.item.id) if o.status == "open"]
     assert occ.due_at == local(2026, 10, 7, 16, 0)
-    [card] = bot.sent
-    assert "Встреча с Олегом" in card["text"] and reply_to(card) == raw.message_id
+    [reply] = bot.sent
+    assert reply["text"] == "🕒 Перенёс «Встреча с Олегом» на завтра 16:00"
+    assert reply_to(reply) == raw.message_id
+    assert buttons(reply) == [("↩️ Отменить", UndoCb(raw=raw.id, item=created.item.id).pack())]
+    [record] = await bot_messages()  # a reply to it edits the item, like a reply to a card
+    assert (record.purpose, record.item_id, record.raw_message_id) == ("edited", created.item.id, raw.id)
     assert bot.reactions == [(raw.message_id, "👌")]
-    assert (await get(RawMessage, raw.id)).status == "done"
+    stored = await get(RawMessage, raw.id)
+    assert stored.status == "done" and str(created.item.id) in stored.raw_json[ingest.UNDO_KEY]
 
 
 async def test_edit_by_target_many_candidates_offers_a_pick(
@@ -487,9 +493,13 @@ async def test_edit_by_target_many_candidates_offers_a_pick(
     assert bot.reactions == [(raw.message_id, "🤔")]
     [record] = await bot_messages()
     assert (record.purpose, record.raw_message_id) == ("pick", raw.id)
-    # The list order is kept with the raw: a text reply "2" picks the second item.
-    stored = (await get(RawMessage, raw.id)).raw_json[processor.CANDIDATES_KEY]
+    # The list order is kept with the raw: a text reply "2" picks the second item; and so is the edit itself.
+    data = (await get(RawMessage, raw.id)).raw_json
+    stored = data[processor.CANDIDATES_KEY]
     assert sorted(stored) == sorted(c.item.id for c in created) and len(stored) == 2
+    assert data[ingest.EDIT_KEY] == EditPatch.model_validate(EDIT_TO_16["edit"]).model_dump(
+        mode="json", exclude_none=True
+    )
 
 
 async def test_edit_by_target_loose_single_match_asks_first(
@@ -507,19 +517,90 @@ async def test_edit_by_target_loose_single_match_asks_first(
     assert bot.reactions == [(raw.message_id, "🤔")]
 
 
-@pytest.mark.parametrize("action", ["delete", "done", "no_reminder", "stop_recurrence"])
-async def test_edit_by_target_destructive_action_asks_even_for_an_exact_match(
-    ctx, add_raw, fake_ai, bot, make_items, t0, get, action
+@pytest.mark.parametrize(
+    ("action", "text"),
+    [
+        ("delete", "🗑 Удалил «Встреча с Олегом»"),
+        ("done", "✅ Закрыл «Встреча с Олегом»"),
+        ("no_reminder", "🔕 Выключил напоминания «Встреча с Олегом»"),
+        ("stop_recurrence", "⏹ Остановил повтор «Встреча с Олегом»"),
+    ],
+)
+async def test_edit_by_target_applies_any_action_to_a_single_exact_match(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, action, text
 ) -> None:
-    [created] = await make_items({"kind": "event", "title": "Встреча с Олегом", "when": {"time": "15:00"}}, now=t0)
+    """Iteration 3, §3: one exact match among the open items -> applied at once, delete / done too, with an undo."""
+    spec = {"kind": "event", "title": "Встреча с Олегом", "when": {"time": "15:00"}}
+    if action == "stop_recurrence":
+        spec |= {"rrule": "FREQ=DAILY"}
+    [created] = await make_items(spec, now=t0)
     raw = await add_raw("удали встречу с Олегом")
     fake_ai.push({"intent": "edit", "edit": {"target": "встреча Олег", "action": action}})
     await processor.handle_message(ctx, {"raw_id": raw.id})
 
     item = await get(Item, created.item.id)
-    assert (item.status, item.updated_at) == ("open", created.item.updated_at)
+    changed = {
+        "delete": item.status == "deleted",
+        "done": item.status == "done",
+        "no_reminder": item.lead_minutes == [],
+        "stop_recurrence": item.rec_active is False,
+    }
+    assert changed[action]
     [msg] = bot.sent
-    assert buttons(msg) == [("1", PickCb(raw=raw.id, item=created.item.id).pack())]
+    assert msg["text"].startswith(text)
+    assert buttons(msg) == [("↩️ Отменить", UndoCb(raw=raw.id, item=created.item.id).pack())]
+    assert len(fake_ai.inputs) == 1
+    assert bot.reactions == [(raw.message_id, "👌")]
+
+
+async def test_edit_by_target_picks_the_single_open_match_among_exact_ones(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get
+) -> None:
+    """ "Закрой задачу про документацию": an old one done last week matches too, the open one is meant."""
+    old, current = await make_items(
+        {"kind": "task", "title": "Написать документацию"},
+        {"kind": "task", "title": "Обновить документацию", "when": {"time": "17:00"}},
+        now=t0,
+    )
+    async with ctx.sessionmaker() as session:
+        await items.apply_patch(session, old.item.id, EditPatch(action="done"), Prefs(), t0)
+        await session.commit()
+    raw = await add_raw("закрой задачу про документацию")
+    fake_ai.push({"intent": "edit", "edit": {"target": "документацию", "action": "done"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert (await get(Item, current.item.id)).status == "done"
+    assert bot.texts == ["✅ Закрыл «Обновить документацию»"]
+
+    # "верни": among the done ones
+    raw = await add_raw("верни задачу про документацию")
+    fake_ai.push({"intent": "edit", "edit": {"target": "документацию", "action": "undone"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.texts[-1].startswith("✏️ Какую запись изменить?")  # both are done now: which one?
+
+
+async def test_edit_by_target_done_of_a_series_names_the_next_time(ctx, add_raw, fake_ai, bot, make_items, t0) -> None:
+    await make_items({"kind": "task", "title": "Зарядка", "rrule": "FREQ=DAILY", "when": {"time": "09:00"}}, now=t0)
+    raw = await add_raw("сделал зарядку")
+    fake_ai.push({"intent": "edit", "edit": {"target": "Зарядка", "action": "done"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.texts == ["✅ Закрыл «Зарядка» · следующий раз чт 8 окт 09:00"]
+
+
+@pytest.mark.parametrize("action", ["delete", "done", "no_reminder", "stop_recurrence"])
+async def test_edit_by_target_from_the_app_still_asks_before_destructive_actions(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, action
+) -> None:
+    """The Mini App has no [↩️ Отменить]: a destructive edit waits for the pick there, even for one exact match."""
+    [created] = await make_items({"kind": "event", "title": "Встреча с Олегом", "when": {"time": "15:00"}}, now=t0)
+    raw = await add_raw("удали встречу с Олегом", source="app", message_id=-1)
+    fake_ai.push({"intent": "edit", "edit": {"target": "встреча Олег", "action": action}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    item = await get(Item, created.item.id)
+    assert (item.status, item.updated_at) == ("open", created.item.updated_at)
+    assert (await get(RawMessage, raw.id)).raw_json[processor.CANDIDATES_KEY] == [created.item.id]
+    assert bot.calls == []
 
 
 async def test_edit_by_target_without_candidates_keeps_the_message(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:
@@ -574,6 +655,99 @@ async def test_picked_candidate_runs_the_edit_for_an_already_done_raw(
     await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": created.item.id})
     [occ] = [o for o in await occurrences_of(created.item.id) if o.status == "open"]
     assert occ.due_at == local(2026, 10, 7, 16, 0)
+
+
+async def test_pick_applies_the_edit_read_from_the_message_without_the_ai(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get, occurrences_of, local, bot_messages
+) -> None:
+    """Iteration 3, §3: two matches -> "Какую запись изменить?"; the pick (button or "2") gets the edit already read,
+    no second extract call, and the same short reply with [↩️ Отменить]; a redelivered job changes nothing."""
+    first, second = await make_items(
+        {"kind": "event", "title": "Встреча с Олегом", "when": {"day": "+1", "time": "15:00"}},
+        {"kind": "event", "title": "Встреча с Олегом по проекту", "when": {"day": "+2", "time": "11:00"}},
+        now=t0,
+    )
+    raw = await add_raw("перенеси встречу с Олегом на 16")
+    fake_ai.push(EDIT_TO_16)
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.texts[0].startswith("✏️ Какую запись изменить?")
+
+    payload = {"raw_id": raw.id, "item_id": second.item.id}
+    await processor.handle_edit(ctx, payload)
+    assert len(fake_ai.inputs) == 1  # no second extract call
+    [occ] = [o for o in await occurrences_of(second.item.id) if o.status == "open"]
+    assert occ.due_at == local(2026, 10, 7, 16, 0)
+    [_, reply] = bot.sent
+    assert reply["text"] == "🕒 Перенёс «Встреча с Олегом по проекту» на завтра 16:00"
+    assert reply_to(reply) == raw.message_id
+    assert buttons(reply) == [("↩️ Отменить", UndoCb(raw=raw.id, item=second.item.id).pack())]
+    assert [o.due_at for o in await occurrences_of(first.item.id)] == [local(2026, 10, 7, 15, 0)]  # untouched
+    assert str(second.item.id) in (await get(RawMessage, raw.id)).raw_json[ingest.UNDO_KEY]
+    assert (await get(OnceKey, f"edit:{raw.id}:{second.item.id}")) is not None
+
+    await processor.handle_edit(ctx, payload)  # redelivered
+    assert len(bot.sent) == 2 and len(fake_ai.inputs) == 1
+
+
+async def test_pick_of_a_destructive_edit_applies_it_without_the_ai(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get
+) -> None:
+    first, second = await make_items(
+        {"kind": "task", "title": "Купить молоко"}, {"kind": "task", "title": "Купить молоко козье"}, now=t0
+    )
+    raw = await add_raw("удали молоко")
+    fake_ai.push({"intent": "edit", "edit": {"target": "молоко", "action": "delete"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.texts[0].startswith("✏️ Какую запись изменить?")
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": first.item.id})
+    assert (await get(Item, first.item.id)).status == "deleted"
+    assert (await get(Item, second.item.id)).status == "open"
+    assert bot.texts[1] == "🗑 Удалил «Купить молоко»" and len(fake_ai.inputs) == 1
+
+
+async def test_pick_of_an_item_deleted_meanwhile(ctx, add_raw, fake_ai, bot, make_items, t0, get) -> None:
+    first, _second = await make_items(
+        {"kind": "task", "title": "Купить молоко"}, {"kind": "task", "title": "Купить молоко козье"}, now=t0
+    )
+    raw = await add_raw("купил молоко")
+    fake_ai.push({"intent": "edit", "edit": {"target": "молоко", "action": "done"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    async with ctx.sessionmaker() as session:
+        await items.delete_item(session, first.item.id, t0)
+        await session.commit()
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": first.item.id})
+    assert bot.texts[-1] == processor.ITEM_GONE_TEXT
+    assert (await get(Item, first.item.id)).status == "deleted" and len(fake_ai.inputs) == 1
+
+
+async def test_pick_with_an_unreadable_stored_edit_asks_the_ai_again(
+    ctx, add_raw, fake_ai, bot, make_items, t0, occurrences_of, local
+) -> None:
+    [created] = await make_items({"kind": "event", "title": "Встреча", "when": {"day": "+1", "time": "15:00"}}, now=t0)
+    raw = await add_raw(
+        "перенеси встречу на 16",
+        status="done",
+        raw_json={processor.CANDIDATES_KEY: [created.item.id], ingest.EDIT_KEY: {"action": "explode"}},
+    )
+    fake_ai.push({"intent": "edit", "edit": {"when": {"day": "+1", "time": "16:00"}}})
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": created.item.id})
+    [inp] = fake_ai.inputs
+    assert inp.reply_item is not None and inp.reply_item["id"] == created.item.id
+    [occ] = [o for o in await occurrences_of(created.item.id) if o.status == "open"]
+    assert occ.due_at == local(2026, 10, 7, 16, 0)
+    assert "<b>Встреча</b>" in bot.texts[0]  # the old reply: the item's card
+
+
+async def test_edit_by_target_that_changes_nothing_offers_no_undo(ctx, add_raw, fake_ai, bot, make_items, t0) -> None:
+    [created] = await make_items({"kind": "note", "title": "Идея подкаста"}, now=t0)
+    async with ctx.sessionmaker() as session:
+        await items.apply_patch(session, created.item.id, EditPatch(action="done"), Prefs(), t0)
+        await session.commit()
+    raw = await add_raw("готово: идея подкаста")
+    fake_ai.push({"intent": "edit", "edit": {"target": "Идея подкаста", "action": "done"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    [msg] = bot.sent
+    assert msg["text"] == "✅ «Идея подкаста» — уже сделано" and buttons(msg) == []
 
 
 async def test_edit_time_job(ctx, fake_ai, bot, make_items, t0, occurrences_of, local) -> None:

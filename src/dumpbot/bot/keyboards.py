@@ -9,7 +9,7 @@ from typing import Final, Literal
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import DIGEST_DAY_FMT, SNOOZE_EVENING, DigestCb, ItemCb, ListCb, OccCb, SubCb
+from dumpbot.bot.cbdata import DIGEST_DAY_FMT, SNOOZE_EVENING, DigestCb, ItemCb, ListCb, OccCb, SubCb, UndoCb
 
 # Button colours (Bot API 9.4); clients that do not support them show a normal button.
 Style = Literal["success", "danger", "primary"]
@@ -17,6 +17,7 @@ Style = Literal["success", "danger", "primary"]
 BUTTON_TEXT_MAX: Final = 64  # longer labels get cut by clients anyway
 
 BACK = "← Назад"
+UNDO_LABEL: Final = "↩️ Отменить"
 STEP_BUTTONS_PER_ROW: Final = 4
 LIST_BUTTONS_PER_ROW: Final = 5
 
@@ -97,6 +98,11 @@ def reminder_keyboard(occurrence_id: int, *, evening: bool = False) -> InlineKey
 
 def undone_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
     return markup([button("↩️ Не сделано", OccCb(a="undone", id=occurrence_id))])
+
+
+def undo_keyboard(raw_id: int, item_id: int) -> InlineKeyboardMarkup:
+    """[↩️ Отменить] under an edit applied by description (docs/features/iteration-3.md §3)."""
+    return markup([button(UNDO_LABEL, UndoCb(raw=raw_id, item=item_id))])
 
 
 def back_to_card_row(item_id: int) -> list[InlineKeyboardButton]:

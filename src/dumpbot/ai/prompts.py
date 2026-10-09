@@ -17,6 +17,8 @@ the stated time ("напомни за 30 минут до встречи в 15" �
 time stays in the title ("Встреча (15:00)"; with a lead of a day or more its day too: "Стоматолог (пт 10:30)");
 several leads only when asked ("за день и за час"). Role remind no longer differs from event (both notify at the
 time), so the prompt no longer asks for it.
+v7 (iteration 3, docs/features/iteration-3.md §3): "купил X", "сделал X", "готово: X" about an open task among the
+RELATED CANDIDATES is an edit ``{target: X, action: done}`` (applied at once when exactly one open item matches).
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v6"
+PROMPT_VERSION = "v7"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -262,6 +264,8 @@ items with similar words), MSG.
 INTENT: save (default) | query = asks about OWN saved data or schedule ("что у меня завтра?", \
 "какие идеи я сохранял?"); MODE query → always query | edit = changes an EXISTING item ("перенеси", "отмени", \
 "удали", "готово"), with edit.target naming it; REPLYING TO ITEM → always edit (no target).
+Done in the past tense ("купил X", "сделал X", "готово: X") about an open task (in RELATED CANDIDATES) → edit \
+{{target: X, action: done}}; otherwise a past fact.
 
 ITEMS: split independent things into separate items (one per thing to buy), at most 20; more than 8 things to buy \
 → ONE purchase item with the list in details.

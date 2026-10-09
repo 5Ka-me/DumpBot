@@ -26,6 +26,11 @@ and only their ids are kept from the model's ``related``, and only when the titl
 [🪄 Разбить на шаги] (job "split") run the separate "split" call and show the checklist. Edits that close a parent
 by its last step are followed by "🎉 Все шаги выполнены" (``cards.after_steps``).
 
+Edits by description (docs/features/iteration-3.md §3): "закрой задачу про документацию" with one exact match among
+the open items is applied at once and answered with what changed and [↩️ Отменить] (``services.undo`` keeps the
+difference with the raw message); with several the owner picks one, and the pick gets the edit already read from the
+message (``EDIT_KEY``, no second AI call).
+
 Data changes are committed before their cards are sent (a lost card never duplicates items); replies that change
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
 Everything sent in quiet hours is silent (a deferred message can be processed at night); the final reaction goes on
@@ -52,6 +57,7 @@ from typing import Any, Final
 import aiohttp
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup
+from pydantic import ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,8 +75,8 @@ from dumpbot.domain.kinds import ACTIONABLE, SourceKind
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import BudgetState, CreatedItem, PatchResult, Row
 from dumpbot.services import items as items_svc
-from dumpbot.services import query, usage
-from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY
+from dumpbot.services import query, undo, usage
+from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY, EDIT_KEY
 from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, try_once
 from dumpbot.workers.jobs import WATCH_NAME as JOBS_WATCH
 
@@ -111,8 +117,10 @@ VISION_MIME: Final[dict[str, str]] = {
     "image/gif": "image/gif",
 }
 _FINISHED: Final = ("done", "ignored")
-# Edits by target that wait for the owner to pick the item even when the search found only one.
+# Edits by target that a message from the Mini App (no [↩️ Отменить] there) applies only after the owner picked the
+# item, even when the search found one.
 CONFIRM_ACTIONS: Final = frozenset({"delete", "done", "no_reminder", "stop_recurrence"})
+EXACT_POOL: Final = 20  # exact matches looked at for the single open one (the candidate list shows the first 5)
 
 NOT_FOUND_TEXT: Final = "🤷 Не нашёл, что изменить — сохранил как запись."
 TIME_NOT_UNDERSTOOD_TEXT: Final = "🤷 Не понял время — напиши, например, «завтра в 15:00»."
@@ -210,6 +218,9 @@ async def handle_clarify(ctx: AppContext, payload: dict[str, Any]) -> None:
 async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     """Job "edit" ``{raw_id, item_id}``: a reply to an item card, or the item picked among edit candidates.
 
+    A pick from the list of an edit by description gets the edit already read from that message (``EDIT_KEY``):
+    applied without the AI, answered like an edit applied at once (with [↩️ Отменить]). Otherwise (a reply to a card,
+    a pick after a reply to the owner's own message) the message is read again with the item as context.
     The patch is applied at most once per (raw, item): a once-key is committed together with it.
     """
     raw_id, item_id = int(payload["raw_id"]), int(payload["item_id"])
@@ -220,6 +231,10 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     if raw is None or applied or raw.status == "ignored":
         return
     if raw.status == "done" and raw.reply_item_id == item_id:  # answered as a "?" query on an earlier run
+        return
+    picked = _picked_patch(raw, item_id)
+    if picked is not None:
+        await _apply_picked(ctx, raw, item_id, picked, key)
         return
     prefs = await _prefs(ctx)
     now = _msg_now(raw)
@@ -267,6 +282,32 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, [raw], sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
+
+
+def _picked_patch(raw: RawMessage, item_id: int) -> EditPatch | None:
+    """The edit read from an edit-by-description message (``EDIT_KEY``) when ``item_id`` is on its candidate list;
+    None for any other edit job (or a stored edit that no longer validates: the AI reads the message again)."""
+    data = raw.raw_json or {}
+    listed, stored = data.get(CANDIDATES_KEY), data.get(EDIT_KEY)
+    if not isinstance(stored, dict) or not isinstance(listed, list) or item_id not in listed:
+        return None
+    try:
+        return EditPatch.model_validate(stored)
+    except ValidationError:
+        log.warning("raw %s: the stored edit does not validate, reading the message again", raw.id)
+        return None
+
+
+async def _apply_picked(ctx: AppContext, raw: RawMessage, item_id: int, patch: EditPatch, key: str) -> None:
+    """The picked item gets the edit read from the message: no second AI call (no budget check either). Times in
+    it are relative to the message, as when it was read."""
+    prefs = await _prefs(ctx)
+    now = _msg_now(raw)
+    if patch.action == "split":  # "разбей переезд на шаги": the split call itself still asks the AI
+        note = _join(raw.text, raw.transcript, raw.image_text)
+        await _split(ctx, prefs, item_id, now=now, note=note, raws=[raw], once_key=key)
+        return
+    await _apply_edit(ctx, prefs, [raw], item_id, patch, now=now, image_text=None, once_key=key)
 
 
 async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -837,54 +878,140 @@ async def _edit_by_target(
     replace: bool,
     related: Sequence[int] = (),
 ) -> None:
-    """ "перенеси встречу с Олегом на 16": the item is looked up by ``edit.target``. Only an exact match (every word
-    of the target) of a non-destructive change is applied at once; a loose match (some word, a tag), several
-    matches, or delete / done / no_reminder / stop_recurrence -> the owner picks the item (buttons, or a reply with
-    its number), even when there is one. Nothing found -> the message is kept as a note and its card says so: it may
-    be a new task worded like an edit («удалить приложение банка»)."""
+    """ "закрой задачу про документацию", "перенеси встречу с Олегом на 16": the item is looked up by ``edit.target``
+    (docs/features/iteration-3.md §3). Exactly one exact match (every word of the target) among the open items (the
+    done ones for "undone"; or the only exact match there is) -> the edit is applied at once, whatever it is, and
+    answered "✅ Закрыл «…»" / "🕒 Перенёс «…» на …" / "🗑 Удалил «…»" with [↩️ Отменить] (``_apply_edit``). Several,
+    or only a loose match (some word, a tag) -> the owner picks the item (buttons, or a reply with its number); the
+    edit read from the message is kept with it (``EDIT_KEY``) and applied to the picked item without asking the AI
+    again. The Mini App has no [↩️ Отменить]: there delete / done / no_reminder / stop_recurrence still wait for the
+    pick, even for one match. Nothing found -> the message is kept as a note and its card says so: it may be a new
+    task worded like an edit («удалить приложение банка»)."""
     primary = raws[0]
     patch = out.extraction.edit or EditPatch()
     image_text = _image_text(out.extraction)
     now = _msg_now(primary)
     target = patch.target or ""
     async with ctx.sessionmaker() as session:
-        rows = await query.find_edit_candidates(session, target, prefs, now, exact=True)
+        rows = await query.find_edit_candidates(session, target, prefs, now, EXACT_POOL, exact=True)
         exact = bool(rows)
         if not exact:
             rows = await query.find_edit_candidates(session, target, prefs, now)
     if not rows:
         await _save(ctx, raws, content, out, prefs, replace=replace, note=NOT_FOUND_TEXT, related=related)
         return
-    if len(rows) > 1 or not exact or patch.action in CONFIRM_ACTIONS:
-        await _send_candidates(ctx, prefs, raws, rows, image_text)
+    single = _single_match(rows, patch.action) if exact else None
+    if single is None or (_is_app(raws) and patch.action in CONFIRM_ACTIONS):
+        await _send_candidates(ctx, prefs, raws, rows, image_text, patch=patch)
         return
     if patch.action == "split":  # "разбей переезд на шаги"
-        await _split(ctx, prefs, rows[0].item_id, now=now, note=content.text, raws=raws, image_text=image_text)
+        await _split(ctx, prefs, single.item_id, now=now, note=content.text, raws=raws, image_text=image_text)
         return
+    await _apply_edit(ctx, prefs, raws, single.item_id, patch, now=now, image_text=image_text)
+
+
+def _single_match(rows: Sequence[Row], action: str) -> Row | None:
+    """The item an edit by description is about without asking: the only exact match among the open items (among
+    the done ones for "undone"), else the only exact match there is; None when it is not clear."""
+    wanted = "done" if action == "undone" else "open"
+    pool = [r for r in rows if r.status == wanted]
+    if len(pool) == 1:
+        return pool[0]
+    return rows[0] if len(rows) == 1 else None
+
+
+async def _apply_edit(
+    ctx: AppContext,
+    prefs: Prefs,
+    raws: list[RawMessage],
+    item_id: int,
+    patch: EditPatch,
+    *,
+    now: datetime,
+    image_text: str | None,
+    once_key: str | None = None,
+) -> None:
+    """Apply an edit by description to the item it is about and answer with what changed and [↩️ Отменить]
+    (``views.edit_applied``); what the edit changed is kept with the raw message for the undo (``services.undo``).
+    ``once_key`` (a picked candidate) is committed together with the edit. An item deleted meanwhile -> "🤷 Не нашёл
+    эту запись"."""
+    primary = raws[0]
+    app = _is_app(raws)
+    view: View | None = None
+    applied: undo.Applied | None = None
     async with ctx.sessionmaker() as session:
-        result = await items_svc.apply_patch(session, rows[0].item_id, patch, prefs, now)
-        view = await _patch_view(session, result, prefs)
+        if once_key is not None and not await try_once(session, once_key):
+            return  # applied by an earlier run of the job
+        item = await items_svc.get_item(session, item_id)
+        if item is not None and item.status != "deleted":
+            applied = await undo.apply(session, item_id, patch, prefs, now)
         fresh = await _reload(session, raws)
         _finish(fresh, image_text)
-        _app_update(fresh, edited=[rows[0].item_id])
+        if applied is None:
+            _app_update(fresh, note=ITEM_GONE_TEXT)
+        else:
+            snapshot = applied.snapshot if applied.changed else None  # nothing changed: nothing to undo
+            if snapshot is not None and fresh:
+                undo.keep(fresh[0], item_id, snapshot)
+            _app_update(fresh, edited=[item_id])
+            result = applied.result
+            view = views.edit_applied(
+                result.item,
+                result.occurrence,
+                result.reminders,
+                patch,
+                prefs,
+                clock.utcnow(),
+                title_before=applied.title_before,
+                moved=applied.moved,
+                changed=applied.changed,
+                undo=(primary.id, item_id) if snapshot is not None and not app else None,
+                steps_closed=applied.steps_closed,
+                warnings=result.warnings,
+            )
         await session.commit()
         events = items_svc.take_parent_events(session)
-    if not _is_app(raws):
-        await _send_patch_card(ctx, prefs, view, result, reply_to=primary.message_id, raw_message_id=primary.id)
+    if applied is None or view is None:
+        await _send(ctx, ITEM_GONE_TEXT, prefs=prefs, reply_to=primary.message_id, purpose="answer", app=app)
+        return
+    occ = applied.result.occurrence
+    await _send(
+        ctx,
+        view[0],
+        view[1],
+        prefs=prefs,
+        app=app,
+        reply_to=primary.message_id,
+        purpose=sender.PURPOSE_EDITED,
+        item_id=item_id,
+        occurrence_id=occ.id if occ is not None and not applied.result.deleted else None,
+        raw_message_id=primary.id,
+    )
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, raws, sender.REACT_SAVED)
+    ctx.scheduler_wakeup.set()
 
 
 async def _send_candidates(
-    ctx: AppContext, prefs: Prefs, raws: list[RawMessage], rows: Sequence[Row], image_text: str | None
+    ctx: AppContext,
+    prefs: Prefs,
+    raws: list[RawMessage],
+    rows: Sequence[Row],
+    image_text: str | None,
+    *,
+    patch: EditPatch | None = None,
 ) -> None:
     """ "✏️ Какую запись изменить?" with a button per item (PickCb -> job "edit"); the ids are kept with the raw so
-    that a text reply "2" picks the second one. Sent before the raw is marked done."""
+    that a text reply "2" picks the second one, and so is the edit itself (``patch`` -> ``EDIT_KEY``): the picked
+    item gets it without a second AI call. Sent before the raw is marked done."""
     primary = raws[0]
     rows = list(rows)[: views.CANDIDATES_MAX]
     async with ctx.sessionmaker() as session:
         [head] = await _reload(session, [primary])
-        head.raw_json = {**(head.raw_json or {}), CANDIDATES_KEY: [r.item_id for r in rows]}
+        data = {**(head.raw_json or {}), CANDIDATES_KEY: [r.item_id for r in rows]}
+        if patch is not None:
+            data[EDIT_KEY] = patch.model_dump(mode="json", exclude_none=True)
+        head.raw_json = data
         await session.commit()
     if _is_app(raws):  # the app lists them from raw_json and picks with POST /api/inbox/{raw_id}/pick
         await _mark_done(ctx, raws, image_text)

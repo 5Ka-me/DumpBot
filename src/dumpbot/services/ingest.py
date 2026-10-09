@@ -37,6 +37,8 @@ __all__ = [
     "APP_SOURCE",
     "ASK_KEY",
     "CANDIDATES_KEY",
+    "EDIT_KEY",
+    "UNDO_KEY",
     "enqueue_processing",
     "extract_urls",
     "message_raw_ids",
@@ -56,6 +58,10 @@ ALBUM_DELAY: Final = timedelta(seconds=2)
 # RawMessage.raw_json keys written by the processor and read when the owner answers by replying with text:
 ASK_KEY: Final = "_ask"  # the clarifying question asked about the message (AskCb only carries the option index)
 CANDIDATES_KEY: Final = "_candidates"  # item ids of the "Какую запись изменить?" list, in list order
+# The edit already read from the message (an EditPatch as JSON) that the picked candidate gets — no second AI call.
+EDIT_KEY: Final = "_edit"
+# [↩️ Отменить] of an edit applied by description: {item id: what the edit changed} (``services.undo``).
+UNDO_KEY: Final = "_undo"
 APP_KEY: Final = "_app"  # a message from the Mini App: what the owner was told about it ({note, answer, edited})
 APP_SOURCE: Final = "app"  # RawMessage.source of "закинуть в свалку" from the Mini App ("telegram" otherwise)
 _TEXT_URL_RE: Final = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"'«»]+")

@@ -769,14 +769,7 @@ async def test_edit_by_description_with_candidates(e2e: Any) -> None:
 
     # "перенеси … с Олегом на 18" matches both: the bot asks which one
     text = "перенеси с Олегом на 18"
-    move = {"when": {"text": "на 18", "time": "18:00"}}
-
-    def edit(req: Any) -> dict[str, Any]:
-        if req.line("REPLYING TO ITEM ") is not None:  # the picked item is known now
-            return {"intent": "edit", "edit": move}
-        return {"intent": "edit", "edit": {"target": "Олегом", **move}}
-
-    e2e.ai.script(text, edit)
+    e2e.ai.script(text, {"intent": "edit", "edit": {"target": "Олегом", "when": {"text": "на 18", "time": "18:00"}}})
     message_id = e2e.tg.push_message(text)
     choice = await e2e.card_for(message_id)
     await e2e.reaction(message_id, "🤔")
@@ -787,10 +780,13 @@ async def test_edit_by_description_with_candidates(e2e: Any) -> None:
     second = await e2e.item("Созвон с Олегом")
     data = next(d for _, d in choice.buttons if d.endswith(f":{second.id}"))
 
+    calls = len(e2e.ai.chat_requests)
     e2e.tg.push_callback(choice, data)
-    card = (await e2e.wait(lambda: e2e.tg.replies_to(message_id)[1:], "card of the picked item"))[0]
-    assert card.text.startswith("📅 <b>Созвон с Олегом</b>")
-    assert "🔔 сегодня 18:00" in card.text.splitlines()
+    # the edit read from the message goes to the picked item: no second AI call (iteration 3, §3)
+    reply = (await e2e.wait(lambda: e2e.tg.replies_to(message_id)[1:], "reply about the picked item"))[0]
+    assert reply.text == "🕒 Перенёс «Созвон с Олегом» на сегодня 18:00"
+    assert [t for t, _ in reply.buttons] == ["↩️ Отменить"]
+    assert len(e2e.ai.chat_requests) == calls
     [occ] = await e2e.occurrences(second.id)
     assert wall(occ.due_at) == "2026-10-06 18:00"
     first = await e2e.item("Встреча с Олегом")

@@ -29,7 +29,7 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v6"
+    assert PROMPT_VERSION == "v7"
 
 
 def test_lead_example_keeps_the_stated_time_in_the_title_and_notifies_before_it():
@@ -108,13 +108,24 @@ def test_static_prompt_describes_the_when_grammar_and_rules():
 
 
 def test_static_prompt_size_budget():
-    # ~2400 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
+    # ~2450 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
     # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60), v5 the 24h-hour and
-    # stricter related rules (~35), v6 the notification time and its leads (~80); the static prompt is a cacheable
-    # prefix.
+    # stricter related rules (~35), v6 the notification time and its leads (~80), v7 the past-tense "done" line
+    # (~45); the static prompt is a cacheable prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
-    assert estimate < 2420
+    assert estimate < 2465
+
+
+def test_past_tense_done_of_an_open_task_is_an_edit():
+    """v7 (iteration 3, §3): "купил X" / "сделал X" / "готово: X" about an open task (one of the RELATED CANDIDATES)
+    is edit {target: X, action: done}; otherwise it stays a past fact."""
+    line = _line("Done in the past tense")
+    for phrase in ("купил X", "сделал X", "готово: X", "RELATED CANDIDATES", "{target: X, action: done}", "past fact"):
+        assert phrase in line, phrase
+    # the shape the line asks for is a valid extraction
+    out = Extraction.model_validate({"intent": "edit", "edit": {"target": "Купить молоко", "action": "done"}})
+    assert (out.intent, out.edit.target, out.edit.action) == ("edit", "Купить молоко", "done")
 
 
 def test_examples_are_valid_extractions_and_rendered():

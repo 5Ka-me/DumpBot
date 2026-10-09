@@ -44,6 +44,9 @@ PURPOSE_ASK: Final = "ask"  # clarifying question 🤔 (raw_message_id = the ask
 PURPOSE_PICK: Final = "pick"  # "Какую запись изменить?" (raw_message_id = the edit; its raw_json[CANDIDATES_KEY])
 PURPOSE_SEARCH: Final = "search_prompt"  # /search without text: the reply is the search text
 PURPOSE_QUESTION: Final = "ask_prompt"  # /ask without text: the reply is the question
+# "✅ Закрыл «…»" [↩️ Отменить]: an edit applied by description (item_id: a reply to it edits the item, like a card;
+# not a "card", so a checklist change never redraws it into one).
+PURPOSE_EDITED: Final = "edited"
 
 _NOT_MODIFIED: Final = "message is not modified"
 _CANT_EDIT: Final[tuple[str, ...]] = (

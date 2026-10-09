@@ -283,7 +283,10 @@ TypeScript-типы этого контракта — [`webapp/src/api/types.ts`
 - `POST /api/inbox/{raw_id}/answer` `{option: number}` — ответ на уточняющий вопрос (индекс варианта с 0), как
   кнопки 🤔. → 202 `InboxStatus`. 409 `no_question`, `already_answered`.
 - `POST /api/inbox/{raw_id}/pick` `{item_id: number}` — какую запись менять (из `candidates`), как кнопки «1»…«5».
-  → 202 `InboxStatus`. 409 `not_listed`, `already_answered`.
+  → 202 `InboxStatus`. 409 `not_listed`, `already_answered`. Итерация 3: выбранная запись получает уже понятую
+  правку (без второго вызова ИИ). Правка одной точно найденной открытой записи применяется сразу (`edited`), но
+  удаление / «сделано» / «без напоминания» / «стоп повтор» в приложении всё равно ждут `pick`: кнопки «↩️ Отменить»,
+  как в чате, у приложения нет.
 
 `InboxStatus`:
 

@@ -18,7 +18,8 @@ Rules:
   "📌 Переезд (2/5)"; "🔗 похоже на: «Купить наушники Sony» (12 сен)" with a [🔗 Похожее] button;
 - iteration 3 (docs/features/iteration-3.md): /today, /tasks and the digests number their open lines with [✅ N]
   buttons (§2, "numbered lists" below); a reminder offers [🌙 Вечером] instead of [⏰ 15 мин] while the evening slot
-  is more than an hour away (§4, ``offers_evening``).
+  is more than an hour away (§4, ``offers_evening``); an edit applied by description is answered with a short line
+  ("✅ Закрыл «…»", "🕒 Перенёс «…» на …", "🗑 Удалил «…»") and [↩️ Отменить] (§3, ``edit_applied``).
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -27,6 +28,7 @@ Re-rendering in place (for the callbacks router):
   ``reminder_message(item, occ, None, ...)``; after ``s15``/``s60``/``tmr``/``eve`` -> ``reminder_snoozed`` with the
   new reminder returned by ``items.snooze`` (no buttons: the snoozed reminder brings its own);
 - after ``ItemCb del`` -> ``deleted_card``; after ``undel`` -> ``item_card``;
+- the reply to an edit by description after ``UndoCb`` -> ``item_card`` of the item as it is again;
 - a list after ``ListCb`` -> ``today_list`` / ``tasks_list`` / ``morning_digest`` / ``evening_digest`` with the
   ``lines`` of ``pin_lines`` (``bot.lists``): the same numbers, each line as it is now.
 
@@ -90,16 +92,17 @@ from dumpbot.bot.keyboards import (
     list_buttons,
     markup,
     reminder_keyboard,
+    undo_keyboard,
     undone_keyboard,
 )
 from dumpbot.domain import timeresolve
-from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time
+from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time, plural_ru
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS, KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import SLOT_LABELS, SLOT_NAMES, Prefs
 from dumpbot.domain.recurrence import describe_rrule_ru
 
 if TYPE_CHECKING:
-    from dumpbot.ai.schemas import Ask
+    from dumpbot.ai.schemas import Ask, EditPatch
     from dumpbot.db.models import Item, Occurrence, Reminder
     from dumpbot.dto import Agenda, CardExtras, DigestData, RelatedRef, Row, Step, UsageSummary
 
@@ -642,6 +645,102 @@ def deleted_card(item: Item) -> MenuView:
     return text, markup([button("↩️ Вернуть", ItemCb(a="undel", id=item.id))])
 
 
+# --- edits applied by description (docs/features/iteration-3.md §3) ----------------------------------------------
+
+
+def edit_applied(
+    item: Item,
+    occ: Occurrence | None,
+    reminders: Sequence[Reminder],
+    patch: EditPatch,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    title_before: str,
+    moved: bool,
+    changed: bool = True,
+    undo: tuple[int, int] | None = None,
+    steps_closed: int = 0,
+    warnings: Sequence[str] = (),
+) -> View:
+    """Short reply to an edit applied at once by description ("закрой задачу про документацию"), a line per change:
+    "🗑 Удалил «…»", "✅ Закрыл «…» и 2 шага" (a series: "· следующий раз завтра 09:00"), "↩️ Снова открыл «…»",
+    "✏️ Переименовал «…» → «…»", "🏷 «…» — теперь идея", "#️⃣ Теги «…»: #a #b", "🕒 Перенёс «…» на завтра 10:00" (and
+    the card's time line under it when that says more: a span, a deadline, several notifications, no reminder),
+    "🔔 Напомню о «…» сегодня 14:00" ("напомни за час"), "🌙 Отложил «…» на когда-нибудь", "🔁 «…» — каждый пн",
+    "🔕 Выключил напоминания «…»", "⏹ Остановил повтор «…»"; then the warnings of a new time. ``moved``: the edit
+    changed the item's time (otherwise a time it asked for was not understood); ``changed``: it changed anything at
+    all. ``undo`` = (raw id, item id) of [↩️ Отменить] (None: no button)."""
+    title = q(item.title, LIST_TITLE_MAX)
+    timed = patch.when is not None or bool(patch.rrule) or bool(patch.lead)
+    lines: list[str] = []
+    if patch.action == "delete":
+        lines.append(f"🗑 Удалил «{title}»")
+    else:
+        if item.title != title_before:
+            lines.append(f"✏️ Переименовал «{q(title_before, LIST_TITLE_MAX)}» → «{title}»")
+        if patch.action == "done":
+            done_line = _closed_line(item, occ, title, steps_closed, prefs, now)
+            lines.append(done_line if changed else f"✅ «{title}» — уже сделано")
+        elif patch.action == "undone":
+            lines.append(f"↩️ Снова открыл «{title}»" if changed else f"↩️ «{title}» — и так не сделано")
+        if patch.kind:
+            lines.append(f"🏷 «{title}» — теперь {esc(_kind_label(item.kind).lower())}")
+        if patch.tags_add or patch.tags_remove:
+            tags = " ".join(f"#{q(t, TAG_MAX)}" for t in (item.tags or [])[:TAGS_SHOWN]) or "нет"
+            lines.append(f"#️⃣ Теги «{title}»: {tags}")
+        if timed:
+            lines += _time_change_lines(item, occ, reminders, patch, title, prefs, now, moved=moved)
+        if patch.action == "no_reminder":
+            lines.append(f"🔕 Выключил напоминания «{title}»")
+        elif patch.action == "stop_recurrence":
+            lines.append(f"⏹ Остановил повтор «{title}»")
+    if not lines:
+        lines.append(f"✏️ Изменил «{title}»" if changed else f"🤷 В «{title}» ничего не изменилось")
+    if timed and patch.action != "delete":
+        lines += _warning_lines(item, warnings)
+    return fit("\n".join(lines)), undo_keyboard(*undo) if undo is not None else None
+
+
+def _closed_line(item: Item, occ: Occurrence | None, title: str, steps: int, prefs: Prefs, now: datetime) -> str:
+    """ "✅ Закрыл «…»" (+ " и 2 шага" closed with a parent, " · следующий раз завтра 09:00" of a series)."""
+    line = f"✅ Закрыл «{title}»"
+    if steps:
+        line += f" и {steps} {plural_ru(steps, 'шаг', 'шага', 'шагов')}"
+    if item.rec_active and item.rrule and occ is not None and occ.status == "open":
+        line += f" · следующий раз {fmt_dt(occ.due_at, prefs.zone, now=now)}"
+    return line
+
+
+def _time_change_lines(
+    item: Item,
+    occ: Occurrence | None,
+    reminders: Sequence[Reminder],
+    patch: EditPatch,
+    title: str,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    moved: bool,
+) -> list[str]:
+    """What a new time / repetition / "за N" of an edit did, in a line or two (see ``edit_applied``)."""
+    line = _time_line(item, occ, reminders, prefs, now)
+    if patch.rrule and item.rrule and item.rec_active:
+        rule = repeat_text(item.rrule) or item.rrule
+        return [f"🔁 «{title}» — {esc(rule)}", *filter(None, [line])]
+    if not moved:
+        return [f"🤷 Время «{title}» не изменилось — не понял, на когда"] if patch.when is not None else []
+    if item.someday:
+        return [f"🌙 Отложил «{title}» на когда-нибудь"]
+    if occ is None or occ.status != "open":
+        return [f"🕒 Перенёс «{title}»"]
+    if occ.precision in ("period", "soon") or _is_deadline(item, occ):
+        return [f"🕒 Перенёс «{title}»", *filter(None, [line])]
+    when = fmt_dt(occ.due_at, prefs.zone, now=now)
+    head = f"🕒 Перенёс «{title}» на {when}" if patch.when is not None else f"🔔 Напомню о «{title}» {when}"
+    return [head] if line in (None, f"🔔 {when}") else [head, line]
+
+
 def edit_menu(item: Item) -> MenuView:
     """Field menu; open actionable items also get [✅ Готово] here (the card itself has no done button)."""
     text = (
@@ -1160,6 +1259,8 @@ def help_text() -> str:
             "• ответь (reply) на карточку текстом: «перенеси на пятницу 18:00», «напомни за час», «это идея», «удали»",
             "• запись без карточки (заметка, идея) — ответом на своё сообщение: «это задача, напомни вечером»",
             "• или нажми «✏️ Изменить» в карточке",
+            "• или опиши: «закрой задачу про документацию», «купил молоко» — одну подходящую запись меняю сразу"
+            " (↩️ Отменить вернёт как было), из нескольких — спрошу какую",
             "• правка исходного сообщения в Telegram запись не меняет",
             "",
             "<b>Напоминания</b>",

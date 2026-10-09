@@ -46,6 +46,9 @@ ListCb    ``ld:<a>:<k>:<d>:<s>:<n>:``   [✅ N] / [↩️ N] under a list (docs/
                                         number; ``o`` = the occurrence of the line (0: none, the item itself),
                                         ``i`` = its item. The buttons of a list message are its snapshot: a press
                                         re-renders the same numbered lines (``bot.lists``).
+UndoCb    ``u:<raw id>:<item id>``      [↩️ Отменить] under "✅ Закрыл «…»": undo the edit of ``item`` that raw
+                                        message ``raw`` asked for by description (docs/features/iteration-3.md §3;
+                                        what it changed is stored with the raw message, ``services.undo``)
 ========  ============================  =============================================================================
 
 Removed 2026-10-07 (an item's time is its notification time): ``ItemCb`` ``lead`` (the "⏱ Напомнить за…" menu) and
@@ -143,6 +146,11 @@ class ListCb(CallbackData, prefix="ld"):
     i: int  # item id
 
 
+class UndoCb(CallbackData, prefix="u"):
+    raw: int
+    item: int
+
+
 ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     ItemCb,
     OccCb,
@@ -153,4 +161,5 @@ ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     SetCb,
     SubCb,
     ListCb,
+    UndoCb,
 )

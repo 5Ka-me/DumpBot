@@ -43,7 +43,7 @@ async def test_extract_happy_path(fake, client, settings):
     out = await extract(client, settings, make_input())
 
     assert out.model == GEMMA
-    assert out.prompt_version == PROMPT_VERSION == "v6"
+    assert out.prompt_version == PROMPT_VERSION == "v7"
     assert out.extraction.intent == "save"
     assert out.extraction.items[0].when.time == "lunch"
     body = fake.chat_requests[0]

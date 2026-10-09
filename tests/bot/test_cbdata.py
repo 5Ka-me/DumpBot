@@ -26,6 +26,7 @@ from dumpbot.bot.cbdata import (
     PickCb,
     SetCb,
     SubCb,
+    UndoCb,
 )
 from dumpbot.bot.views import ASK_FIELDS, SETTINGS_MENUS
 from dumpbot.domain.kinds import KINDS
@@ -42,7 +43,7 @@ def _roundtrip(cb: CallbackData) -> str:
 
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
-    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld"]  # "l" (LeadCb) is retired: never reuse it
+    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u"]  # "l" (LeadCb) is retired: never reuse it
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -101,6 +102,14 @@ async def test_list_buttons_match_only_the_list_filter():
     assert await ListCb.filter()(_query(data)) == {"callback_data": ListCb.unpack(data)}
     assert await DigestCb.filter()(_query(data)) is False
     assert await ListCb.filter()(_query("d:tmr:20261009")) is False
+
+
+async def test_undo_button_fits_and_matches_only_its_filter():
+    """[↩️ Отменить] of an edit applied by description (iteration 3, §3): the raw message and the item."""
+    assert _roundtrip(UndoCb(raw=BIG * 1000, item=BIG * 1000)) == f"u:{BIG * 1000}:{BIG * 1000}"
+    data = UndoCb(raw=7, item=12).pack()
+    assert await UndoCb.filter()(_query(data)) == {"callback_data": UndoCb(raw=7, item=12)}
+    assert await PickCb.filter()(_query(data)) is False
 
 
 @pytest.mark.parametrize("kind", KINDS)

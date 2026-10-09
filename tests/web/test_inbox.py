@@ -109,12 +109,32 @@ async def test_edit_with_candidates_and_the_pick(api, fake_ai, run_jobs, make_it
     reply = await api.post(f"/api/inbox/{raw_id}/pick", {"item_id": first.item.id})
     assert reply.status == 202 and reply.data["candidates"] is None and reply.data["pending"] is True
 
-    fake_ai.push({"intent": "edit", "edit": {"when": {"text": "на пятницу", "day": "FR"}}})
-    await run_jobs()
+    await run_jobs()  # the pick gets the edit read from the message: no second AI call
+    assert len(fake_ai.inputs) == 1
     status = (await api.get(f"/api/inbox/{raw_id}")).data
     assert status["pending"] is False
     [edited] = status["edited"]
     assert edited["id"] == first.item.id and edited["when_text"] == "пт 9 окт 10:00"
+    assert bot.calls == []
+
+
+async def test_destructive_edit_of_a_single_match_still_asks_in_the_app(
+    api, fake_ai, run_jobs, make_items, bot, db
+) -> None:
+    """The app has no [↩️ Отменить]: delete / done / … wait for the pick there (iteration 3, §3), then apply the
+    edit read from the message."""
+    [created] = await make_items({"kind": "task", "title": "Стрижка"})
+    raw_id = (await api.post("/api/inbox", {"text": "удали стрижку"})).data["raw_id"]
+    fake_ai.push({"intent": "edit", "edit": {"target": "Стрижка", "action": "delete"}})
+    await run_jobs()
+    status = (await api.get(f"/api/inbox/{raw_id}")).data
+    assert [r["id"] for r in status["candidates"]] == [created.item.id]
+    assert (await db(select(Item).where(Item.id == created.item.id)))[0].status == "open"
+
+    assert (await api.post(f"/api/inbox/{raw_id}/pick", {"item_id": created.item.id})).status == 202
+    await run_jobs()
+    assert len(fake_ai.inputs) == 1
+    assert (await db(select(Item).where(Item.id == created.item.id)))[0].status == "deleted"
     assert bot.calls == []
 
 

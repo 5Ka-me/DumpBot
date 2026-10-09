@@ -109,6 +109,7 @@ src/dumpbot/
     items.py               жизненный цикл записей/повторений/напоминаний                             [items]
     query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
     related.py             «предметные» лексемы для «🔗 похоже на» (без инфинитивов и общих слов)     [items]
+    undo.py                правка описанием: что изменила (разница) и «↩️ Отменить» (итерация 3)      [items]
     ingest.py              Message → RawMessage, постановка в очередь                                [workers]
     processor.py           обработчики задач очереди                                                  [workers]
     digest.py              данные для дайджестов                                                      [workers]
@@ -383,9 +384,11 @@ class RoutedSTT:                           # ctx.stt
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v6" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
+PROMPT_VERSION: str  # "v7" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
                      # v5: часы 13–23 и 0 не переспрашивать, related — только тот же конкретный предмет;
-                     # v6: время — момент уведомления, lead = «за N до названного», названное время — в title)
+                     # v6: время — момент уведомления, lead = «за N до названного», названное время — в title;
+                     # v7 (итерация 3, §3): «купил X», «сделал X», «готово: X» про открытую задачу из RELATED
+                     # CANDIDATES → edit {target: X, action: done}, иначе — прошедший факт)
 
 @dataclass
 class ExtractInput:
@@ -609,6 +612,28 @@ done (его open occurrences → done, pending-напоминания → cance
 (до `MAX_CHECKLIST` = 20; закрытый родитель открывается), `set_details`, `clear_someday` («когда-нибудь» → запись без
 даты, задача получает 19:00), `clear_time` (шаг без своего времени).
 
+Итерация 3, §3 ([features/iteration-3.md](features/iteration-3.md)) — `services/undo.py`, отмена правки описанием:
+
+```python
+@dataclass
+class Applied: result: PatchResult; snapshot: dict | None; title_before: str; steps_closed: int; moved: bool; changed: bool
+async def apply(session, item_id: int, patch: EditPatch, prefs: Prefs, now: datetime) -> Applied
+    # apply_patch между двумя чтениями «семьи» записи (родитель + все шаги): snapshot — только разница (строки
+    # items / occurrences / reminders до и после, созданные правкой occurrences и reminders, наибольшие id после);
+    # None — правку не отменить (она удалила строки). Чтение — выборки колонок из БД, не ORM-объекты сессии.
+def keep(raw: RawMessage, item_id: int, snapshot) -> None     # raw_json[ingest.UNDO_KEY][item_id] = snapshot
+def stored(raw: RawMessage | None, item_id: int) -> dict | None
+async def undo_edit(session, raw_id: int, item_id: int, now: datetime) -> str   # UNDONE | ALREADY | STALE | MISSING
+```
+`undo_edit` блокирует строки семьи (items → occurrences → reminders, как сервисы), потом raw (FOR UPDATE): второе
+нажатие ждёт первого и получает `ALREADY`. Устарело (`STALE`, ничего не меняется) — любая изменённая или созданная
+правкой строка уже не такая, как правка её оставила (у самой записи — и `updated_at`: любая следующая правка, кнопка),
+или в семье появились occurrence / живое напоминание с id больше запомненного (следующее повторение, отложенное).
+Иначе созданные строки удаляются, изменённые получают прежние значения (occurrences, которые сдвигаются, сначала
+«паркуются» на +1000 лет: UNIQUE(item_id, due_at) проверяется построчно), `updated_at` = now, у родителя —
+`items.checklist_changed` (его карточки перерисуются). Почему raw_json, а не таблица: отмена принадлежит сообщению с
+правкой, там уже живут `_ask` / `_candidates` / `_app`, разница — несколько строк, миграция живому боту не нужна.
+
 Внутренние правила: при любом перепланировании pending-напоминания текущего occurrence → cancelled, создаются новые
 по `plan_reminders` (для precision `period` — с `period=(item.period_start, item.period_end)`). Итерация 2: `Item`
 хранит `period_kind/period_start/period_end/someday`; `apply_patch` с `when.period` пересчитывает срок и
@@ -755,6 +780,8 @@ async def enqueue_processing(session, raw: RawMessage, now: datetime) -> None
 async def message_raw_ids(session, chat_id: int, message_id: int) -> list[int]  # raw сообщения или всех частей альбома
 async def picked_item(session, raw_id: int, text: str) -> int | None   # ответ «2» на список кандидатов raw → item_id
 ASK_KEY = "_ask"; CANDIDATES_KEY = "_candidates"   # ключи raw_json: заданный вопрос / item_id списка кандидатов
+EDIT_KEY = "_edit"; UNDO_KEY = "_undo"   # итерация 3, §3: понятая правка (EditPatch JSON) для выбранного кандидата /
+                                         # {item_id: снимок undo.apply} для «↩️ Отменить»
 async def save_app_text(session, chat_id: int, text: str, now: datetime) -> RawMessage   # итерация 2, D
     # source="app", message_id = -id, urls из текста (text_urls), "?" в начале -> force_query
 APP_KEY = "_app"   # raw_json сообщения из приложения: {note, answer: {text, title, item_ids}, edited: [item_id]}
@@ -789,13 +816,16 @@ async def on_dead(ctx: AppContext, job: Job) -> None
    Пустой items → реакция 👌 и запись kind=note с исходным текстом (ничего не теряем).
 6. intent `query`: `run_query` → `answer=="list"` → `views.rows_list`; `summary` → `answer_query` → текст
    (`AIUnavailable`/`AIBadResponse` от `answer_query` → тот же `views.rows_list`: повтор job заплатил бы за extract снова).
-7. intent `edit`: `find_edit_candidates(edit.target, exact=True)`, если пусто — без `exact`. Сразу `apply_patch`
-   (новая карточка) — только одна точная запись и action не delete/done/no_reminder/stop_recurrence; иначе (несколько,
-   найдено лишь по части слов или по тегу, разрушительное действие) → `views.edit_candidates` даже для одной записи
-   (`purpose="pick"`, item_id списка → `raw_json[CANDIDATES_KEY]`; кнопки PickCb или ответ «2» → job "edit" с item_id);
-   0 → сообщение сохраняется заметкой (как при `save` с пустым items), её карточка с «🤷 Не нашёл, что изменить —
-   сохранил как запись.». Пересланный пост (forward_origin) — чужие слова, правкой не бывает: сохраняется как при
-   `save` (пустой items → заметка с текстом).
+7. intent `edit` (итерация 3, §3): `find_edit_candidates(edit.target, exact=True, limit=20)`, если пусто — без
+   `exact`. Ровно одна точная среди открытых (для `undone` — среди сделанных; или единственная точная вообще) →
+   правка применяется сразу, любая, и delete / done тоже (`_apply_edit`: `undo.apply`, снимок → `raw_json[UNDO_KEY]`,
+   ответ `views.edit_applied` «✅ Закрыл «…»» / «🕒 Перенёс «…» на …» / «🗑 Удалил «…»» с [↩️ Отменить] (UndoCb),
+   `purpose="edited"`, item_id — reply на него правит запись). Иначе (несколько, найдено лишь по части слов или по
+   тегу) → `views.edit_candidates` (`purpose="pick"`, item_id списка → `raw_json[CANDIDATES_KEY]`, понятая правка →
+   `raw_json[EDIT_KEY]`; кнопки PickCb или ответ «2» → job "edit" с item_id). Сообщение из Mini App (отмены там нет):
+   delete/done/no_reminder/stop_recurrence и для одной точной записи ждут выбора. 0 → сообщение сохраняется заметкой
+   (как при `save` с пустым items), её карточка с «🤷 Не нашёл, что изменить — сохранил как запись.». Пересланный
+   пост (forward_origin) — чужие слова, правкой не бывает: сохраняется как при `save` (пустой items → заметка).
 8. `raw.status=done`, `processed_at`. Разбудить планировщик (`ctx.scheduler_wakeup.set()`).
 Итоговая реакция (👌/🤔/✍/😢) ставится на все части альбома (capture поставил 👀 на каждую). Все сообщения processor'а
 в тихие часы (`quiet.in_quiet_hours(now)`) уходят без звука (`silent=True`): ночью разбираются отложенные бюджетом
@@ -813,6 +843,10 @@ temperature 0 и фиксированный seed — повтор дал бы т
 до 4 картинок; результат привязывается к первому raw; остальные raw → done.
 `handle_edit(ctx, {"raw_id","item_id"})` — `extract(reply_item=item_snapshot)` → `apply_patch` → обновить карточку
 (новое сообщение-карточка reply на правку) + реакция 👌. `edit.action=delete` → карточка «🗑 Удалено» с кнопкой «Вернуть».
+Итерация 3, §3: выбранный кандидат правки описанием (item_id есть в `CANDIDATES_KEY`, есть `EDIT_KEY`) получает уже
+понятую правку — без второго `extract` и без проверки бюджета (`split` — сразу вызов split), ответ как при правке
+сразу (`_apply_edit`, once_key `edit:{raw}:{item}` в той же транзакции); запись удалили — «🤷 Не нашёл эту запись».
+Невалидный сохранённый patch → прежний путь через ИИ.
 `handle_edit_time(ctx, {"item_id","text"})` — из кнопки «🕒 Время»: текст пользователя → `extract(reply_item=…,
 text="перенеси на: …")` → `apply_patch` только с when/rrule/lead из ответа модели (title/kind/action отбрасываются).
 Нет годного времени (нет when/rrule/lead или when не разрешается) → ничего не меняется, ответ «🤷 Не понял время —
@@ -892,7 +926,8 @@ async def lookup(session, chat_id: int, message_id: int) -> BotMessage | None
 🤔 нужен ответ, 😢 не смог обработать.
 `bot_messages.purpose` сообщений, ждущих ответа (константы `PURPOSE_*`): `ask` (уточняющий вопрос, raw_message_id),
 `pick` (список «Какую запись изменить?», raw_message_id), `search_prompt` / `ask_prompt` (/search и /ask без текста,
-ForceReply).
+ForceReply). `edited` (итерация 3): ответ на правку описанием с [↩️ Отменить] (item_id — reply правит запись; не
+`card`, чтобы перерисовка чек-листа не превратила его в карточку).
 
 ### 4.18 bot/views.py  [bot]
 
@@ -937,6 +972,13 @@ def rows_list(title: str, rows: Sequence[Row], prefs: Prefs, now: datetime, *, e
 # открытые строки пронумерованы «1. 13:00 · 📌 Купить хлеб», под списком [✅ 1] [✅ 2] … (ListCb, по 5 в ряд, ≤ 20;
 # остальные — «•» и подсказка); закрытая строка — «1. ✅ 13:00 · 📌 <s>Купить хлеб</s>» с [↩️ 1]. Kwarg `lines`
 # (pin_lines: номера и разделы из кнопок сообщения + новые строки без номера) — перерисовка после нажатия.
+def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_before: str, moved: bool,
+                 changed: bool = True, undo: tuple[int, int] | None = None, steps_closed: int = 0,
+                 warnings=()) -> View
+    # итерация 3, §3: «✅ Закрыл «…» (и 2 шага / · следующий раз …)», «🗑 Удалил «…»», «↩️ Снова открыл «…»»,
+    # «🕒 Перенёс «…» на завтра 10:00» (+ строка времени карточки, если она говорит больше), «🌙 Отложил «…» на
+    # когда-нибудь», «🔔 Напомню о «…» …», «🔁 «…» — каждый пн», «✏️ Переименовал», «🏷 … — теперь идея», «#️⃣ Теги»,
+    # «🔕 Выключил напоминания», «⏹ Остановил повтор», предупреждения времени; [↩️ Отменить] (UndoCb raw, item)
 def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
 def usage_text(summary: UsageSummary) -> str
@@ -979,6 +1021,9 @@ def help_text() -> str
 `apply_patch(done)`), `undo` — `mark_undone` / `apply_patch(undone)`, без ИИ; затем список (`bot.lists.render`)
 перерисовывается по кнопкам сообщения (`lists.snapshot`): те же номера и разделы, состояние — текущее. Уже
 закрытое / открытое / удалённое — только тост (+ перерисовка); сообщение без кнопок (недоступное) — свежий список.
+UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: вернулось → сообщение становится карточкой записи,
+тост «↩️ Отменено»; второе нажатие — «Уже отменено»; устарело — «🤷 Запись уже изменилась — отменить нельзя», кнопка
+убирается, ничего не меняется; снимка нет — «Кнопка устарела».
 Кнопки убранного «⏱ Напомнить за…» в старых сообщениях (ItemCb `lead`, `LeadCb` `l:…`, SetCb `lead`, `ask`
 `lead_minutes`) отвечают «Кнопка устарела» и ничего не меняют.
 

@@ -7,7 +7,7 @@ from datetime import date, time, timedelta
 
 import pytest
 
-from dumpbot.ai.schemas import Ask
+from dumpbot.ai.schemas import Ask, EditPatch
 from dumpbot.bot import views
 from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, ListCb, OccCb, PickCb, SetCb
 from dumpbot.domain.kinds import KINDS
@@ -1023,6 +1023,9 @@ def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_remind
         views.rows_list("x", [row], prefs, now),
         views.ask_message(Ask(q="?", options=["a", "b", "c", "d"]), BIG),
         views.edit_candidates([row] * 5, BIG, prefs, now),
+        views.edit_applied(
+            item, occ, [rem], EditPatch(action="done"), prefs, now, title_before="x", moved=False, undo=(BIG, BIG)
+        ),
         views.settings_menu(prefs),
         views.usage_text(UsageSummary(month="м", spent_usd=0, limit_usd=5, calls=0, by_purpose={})),
         views.help_text(),

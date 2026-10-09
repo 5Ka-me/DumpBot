@@ -78,6 +78,7 @@ __all__ = [
     "add_steps",
     "apply_patch",
     "can_split",
+    "checklist_changed",
     "clear_someday",
     "clear_time",
     "create_items",
@@ -149,6 +150,12 @@ def take_parent_events(session: AsyncSession) -> ParentEvents:
 
 def _events(session: AsyncSession) -> ParentEvents:
     return session.info.setdefault(_EVENTS_KEY, ParentEvents())
+
+
+def checklist_changed(session: AsyncSession, parent_id: int) -> None:
+    """Record that a parent's checklist was changed by something outside this module (an undo puts rows back as they
+    were, ``services.undo``): ``take_parent_events`` then lists it, so its cards are redrawn."""
+    _events(session).changed.add(parent_id)
 
 
 # --- creation --------------------------------------------------------------------------------------------------
