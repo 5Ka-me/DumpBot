@@ -8,6 +8,14 @@ Error mapping (chutes answers with these in the wild):
   500 "exhausted all available targets", network errors, timeouts -> ``AIUnavailable``
 - 400 -> response_format ladder (strict json_schema -> json_object -> plain), then ``AIBadResponse``
 - anything else -> ``AIBadResponse``
+
+Pause (docs/features/iteration-3.md §1): a 408 / 429 / 5xx or a timeout puts the model on a pause of
+``llm_cooldown_s`` (in process memory, per model; any 200 lifts it). The client only keeps the pause, ``extract``
+decides what to skip (``cooldown_left``).
+
+A call cancelled by its caller (``HEDGE_LOST``: the parallel request of the other model answered first, or a
+shutdown) is recorded with ``ok=False`` and ``error="cancelled: <reason>"``; its tokens and cost only when the answer
+had already arrived (else 0: nothing is known to be billed).
 """
 
 from __future__ import annotations
@@ -17,7 +25,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Coroutine, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -36,6 +44,8 @@ PRICE_TTL = timedelta(hours=6)
 PRICE_RETRY = timedelta(minutes=10)  # after a failed /models fetch: use fallback prices, retry later
 PRICE_FETCH_TIMEOUT_S = 10.0
 SEED = 7
+# Task.cancel() message for the call whose parallel twin gave a valid answer first (docs/features/iteration-3.md §1).
+HEDGE_LOST = "hedge lost"
 
 # response_format levels tried in order when the API rejects a request with HTTP 400.
 LEVEL_SCHEMA = 0  # json_schema (strict) + chat_template_kwargs
@@ -209,6 +219,7 @@ class ChutesClient:
         self._prices: dict[str, tuple[float, float, float]] = {}  # USD per 1M (input, output, cached input)
         self._prices_valid_until: datetime | None = None
         self._prices_lock = asyncio.Lock()
+        self._paused_until: dict[str, float] = {}  # model -> time.monotonic() its pause ends
 
     async def close(self) -> None:
         if self._own_http and self._http is not None and not self._http.closed:
@@ -221,6 +232,31 @@ class ChutesClient:
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._settings.chutes_api_key.get_secret_value()}"}
+
+    # -- pause after errors -------------------------------------------------------------------------------------
+
+    def cooldown_left(self, model: str) -> float:
+        """Seconds the model's pause after a 408 / 429 / 5xx / timeout still lasts; 0.0 when there is none."""
+        until = self._paused_until.get(model)
+        if until is None:
+            return 0.0
+        left = until - time.monotonic()
+        if left <= 0:
+            del self._paused_until[model]
+            return 0.0
+        return left
+
+    def _pause(self, model: str, reason: str) -> None:
+        seconds = self._settings.llm_cooldown_s
+        if seconds <= 0:
+            return
+        if not self.cooldown_left(model):
+            log.warning("model %s paused for %g s after %s", model, seconds, reason)
+        self._paused_until[model] = time.monotonic() + seconds
+
+    def _unpause(self, model: str) -> None:
+        if self._paused_until.pop(model, None) is not None:
+            log.info("model %s answers again, pause lifted", model)
 
     # -- chat ---------------------------------------------------------------------------------------------------
 
@@ -295,8 +331,15 @@ class ChutesClient:
             ) as resp:
                 status, headers = resp.status, resp.headers
                 raw = await resp.read()
+        except asyncio.CancelledError as e:
+            # No answer yet, so nothing is known to be billed; aiohttp has dropped the connection already.
+            await self._record(purpose, model, ok=False, latency_ms=_ms_since(started), error=cancel_reason(e))
+            raise
         except (TimeoutError, aiohttp.ClientError) as e:
             latency = _ms_since(started)
+            # A connect timeout or a refused connection says nothing about the model (the network is down).
+            if isinstance(e, TimeoutError) and not isinstance(e, aiohttp.ConnectionTimeoutError):
+                self._pause(model, "a timeout")
             await self._record(purpose, model, ok=False, latency_ms=latency, error=f"network: {type(e).__name__}")
             raise AIUnavailable(f"chutes unreachable ({type(e).__name__})") from e
         latency = _ms_since(started)
@@ -308,7 +351,10 @@ class ChutesClient:
                 raise _Rejected(snippet)
             err = http_error(status, raw, headers)
             log.warning("chutes %s for %s (%s): %s", status, model, purpose, snippet)
+            if isinstance(err, AIUnavailable):
+                self._pause(model, f"HTTP {status}")
             raise err
+        self._unpause(model)
 
         try:
             data = json.loads(raw)
@@ -339,8 +385,25 @@ class ChutesClient:
             out_tok = _estimate_tokens(len(raw_content) + len(reasoning))
         # prompt_tokens includes the cached prefix, which is billed at the (much lower) cache-read price.
         cached = _cached_tokens(usage_data, in_tok)
-        price_in, price_out, price_cached = await self._price(model)
+        cancelled: asyncio.CancelledError | None = None
+        try:
+            prices = await self._price(model)
+        except asyncio.CancelledError as e:  # the answer is here (and billed), but the caller no longer wants it
+            prices, cancelled = self._known_price(model), e
+        price_in, price_out, price_cached = prices
         cost = ((in_tok - cached) * price_in + cached * price_cached + out_tok * price_out) / 1e6
+        if cancelled is not None:
+            await self._record(
+                purpose,
+                model,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+                cost_usd=cost,
+                ok=False,
+                latency_ms=latency,
+                error=cancel_reason(cancelled),
+            )
+            raise cancelled
         finish_reason = choice.get("finish_reason")
 
         await self._record(
@@ -359,7 +422,9 @@ class ChutesClient:
 
     async def _record(self, purpose: str, model: str, **fields: Any) -> None:
         if self._sessionmaker is not None:
-            await usage.record_usage(self._sessionmaker, purpose=purpose, model=model, **fields)
+            # A write cut off half-way (the call cancelled meanwhile) would lose a paid call or leave a DB connection
+            # mid-transaction: the row is written first, then the cancellation goes on.
+            await _run_to_end(usage.record_usage(self._sessionmaker, purpose=purpose, model=model, **fields))
 
     # -- prices -------------------------------------------------------------------------------------------------
 
@@ -371,6 +436,10 @@ class ChutesClient:
     async def _price(self, model: str) -> tuple[float, float, float]:
         """USD per 1M (input, output, cached input) tokens; cached input costs as much as input when not listed."""
         await self._refresh_prices()
+        return self._known_price(model)
+
+    def _known_price(self, model: str) -> tuple[float, float, float]:
+        """The price from the list fetched last (no refresh), else the fallback prices."""
         found = self._prices.get(model)
         if found is None:
             fallback_in = self._settings.llm_fallback_price_in
@@ -431,3 +500,23 @@ def _next_level(level: int, *, has_schema: bool) -> int | None:
 
 def _ms_since(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def cancel_reason(e: asyncio.CancelledError) -> str:
+    """``ai_usage.error`` of a cancelled call: "cancelled: <the Task.cancel message>" ("cancelled: hedge lost"),
+    else "cancelled"."""
+    reason = str(e.args[0]) if e.args and e.args[0] else ""
+    return f"cancelled: {reason}" if reason else "cancelled"
+
+
+async def _run_to_end[T](aw: Coroutine[Any, Any, T]) -> T:
+    """Await ``aw`` to its end even when the calling task is cancelled meanwhile, then let the cancellation go on.
+
+    A second cancellation while waiting cancels ``aw`` too, so nothing is left running.
+    """
+    task = asyncio.ensure_future(aw)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await task
+        raise
