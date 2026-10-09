@@ -349,6 +349,14 @@ class ChutesClient:
         её снимает. Вызов, отменённый вызывающим (Task.cancel(HEDGE_LOST) — проигравший параллельный запрос, или
         остановка бота), пишется в ai_usage с ok=false, error="cancelled: hedge lost" / "cancelled"; токены и цена —
         только если ответ уже пришёл, иначе 0."""
+    def retry_after_left(self, model: str) -> float
+        """Сколько ещё действует Retry-After последней 408 / 429 / 5xx модели (не дольше её паузы); 0.0 — нет."""
+    def note_lost_hedge(self, model: str) -> None
+        """Вызов модели отменён: параллельный запрос другой ответил первым. LOST_HEDGES_TO_PAUSE=2 таких гонок
+        подряд (без ответа модели между ними) → пауза, как после таймаута: зависшая модель иначе никогда не доходит
+        до своего llm_timeout_s."""
+    def is_missing(self, model: str) -> bool
+        """Модель ответила 404 и с тех пор не отвечала 200."""
 ```
 
 ### 4.6 ai/stt.py  [ai]
@@ -388,11 +396,12 @@ class RoutedSTT:                           # ctx.stt
 ### 4.7 ai/extract.py  [ai]
 
 ```python
-PROMPT_VERSION: str  # "v7" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
+PROMPT_VERSION: str  # "v8" (итерация 2: when.period; related / steps / edit.action split; «к лету» → day;
                      # v5: часы 13–23 и 0 не переспрашивать, related — только тот же конкретный предмет;
                      # v6: время — момент уведомления, lead = «за N до названного», названное время — в title;
                      # v7 (итерация 3, §3): «купил X», «сделал X», «готово: X» про открытую задачу из RELATED
-                     # CANDIDATES → edit {target: X, action: done}, иначе — прошедший факт)
+                     # CANDIDATES → edit {target: X, action: done}, иначе — прошедший факт;
+                     # v8: только если сообщение лишь об этом; просит ещё что-то новое → save, ничего не теряется)
 
 @dataclass
 class ExtractInput:
@@ -423,11 +432,15 @@ async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -
     AIUnavailable или AIModelNotFound (404) основной → сразу пробуем запасную; если и она недоступна → AIUnavailable.
     404 запасной: основная была недоступна → её AIUnavailable; обе 404 (или запасной нет) → AIModelNotFound
     (AIConfigError); основная ответила негодным (это уже оплачено) → AIBadResponse, а не вечный часовой повтор.
-    Итерация 3 (§1): основная на паузе (client.cooldown_left), а запасная нет → сразу запасная, как будто основная
-    только что была недоступна (ничего годного → AIUnavailable с retry_after = остаток паузы). Нет годного ответа
-    основной за llm_hedge_after_s (12 с) → параллельно запасная (если она не на паузе): первый валидный результат
-    выигрывает, второй вызов отменяется (Task.cancel(HEDGE_LOST)) и дожидается записи в ai_usage; без валидного
-    результата ошибки разрешаются как в последовательной лестнице. llm_hedge_after_s=0 / llm_cooldown_s=0 — выключено.
+    Итерация 3 (§1): основная на паузе (client.cooldown_left), а запасная не на паузе и не 404 (client.is_missing)
+    → сразу запасная, вместо основной и с её повтором «исправь JSON» (ничего годного → AIUnavailable с retry_after =
+    остаток паузы); 404 от запасной здесь → сразу основная, несмотря на паузу (её результат или ошибка — как в
+    лестнице). Нет годного ответа основной за llm_hedge_after_s (12 с) → параллельно запасная (пауза запасной этому
+    не мешает, только её действующий Retry-After: client.retry_after_left): первый валидный результат выигрывает,
+    второй вызов отменяется (Task.cancel(HEDGE_LOST)) и дожидается записи в ai_usage; проигравшая основная —
+    client.note_lost_hedge (две гонки подряд → пауза); без валидного результата ошибки разрешаются как в
+    последовательной лестнице. llm_hedge_after_s=0 / llm_cooldown_s=0 — выключено. ExtractOutput.missing_fallback —
+    запасная известна как 404 (процессор раз в день пишет владельцу).
     force_query → intent принудительно query; reply_item → intent принудительно edit (edit.target=None)."""
 
 async def answer_query(client: ChutesClient, settings: Settings, question: str, rows: list[dict],
@@ -632,7 +645,10 @@ async def undo_edit(session, raw_id: int, item_id: int, now: datetime) -> str   
 `undo_edit` блокирует строки семьи (items → occurrences → reminders, как сервисы), потом raw (FOR UPDATE): второе
 нажатие ждёт первого и получает `ALREADY`. Устарело (`STALE`, ничего не меняется) — любая изменённая или созданная
 правкой строка уже не такая, как правка её оставила (у самой записи — и `updated_at`: любая следующая правка, кнопка),
-или в семье появились occurrence / живое напоминание с id больше запомненного (следующее повторение, отложенное).
+любая другая запись семьи не такая, как после правки (снимок `rest`: галочка другого шага, закрывшая родителя, — иначе
+отмена оставила бы сделанного родителя с открытым шагом; у снимков, сохранённых до этого, `rest` нет — проверка
+пропускается), состав семьи другой (добавлен шаг), или в семье появились occurrence / живое напоминание с id больше
+запомненного (следующее повторение, отложенное).
 Иначе созданные строки удаляются, изменённые получают прежние значения (occurrences, которые сдвигаются, сначала
 «паркуются» на +1000 лет: UNIQUE(item_id, due_at) проверяется построчно), `updated_at` = now, у родителя —
 `items.checklist_changed` (его карточки перерисуются). Почему raw_json, а не таблица: отмена принадлежит сообщению с
@@ -709,7 +725,9 @@ async def recurring(session) -> list[Row]                          # rec_active,
 async def find_edit_candidates(session, hint: str, prefs: Prefs, now: datetime, limit: int = 5, *,
                                exact: bool = False) -> list[Row]
     # среди open/недавних (30 дней) не deleted: FTS по hint (все слова, или тег = слово; иначе любое слово),
-    # приоритет — ближайшие по due. exact=True: только все слова (FTS) или title содержит hint — без тегов и OR
+    # приоритет — ближайшие по due. exact=True: только слова самой записи — все слова в title/details (FTS по
+    # to_tsvector(title || details), не search_tsv: source_text общий у записей одного сообщения) или hint целыми
+    # словами в title («чай» не в «случайно») — без тегов и OR
 async def items_of_raw(session, raw_ids: Sequence[int]) -> list[Row]   # не deleted записи этих raw (без шагов), по id
 async def related_candidates(session, text: str, now: datetime, *, exclude_raw_ids: Sequence[int] = (),
                              limit: int = 5) -> list[Row]
@@ -731,10 +749,12 @@ def rows_for_llm(rows: list[Row], prefs: Prefs) -> list[dict]      # компа�
 новых первыми с keyset-курсором `(created_at, id)`; `rows_by_ids`; `item_images(session, item)` / `image_counts` —
 картинки сообщения записи (все части альбома; фото и JPEG/PNG/WebP/GIF файлом) для превью.
 
-Итерация 3, §2 ([features/iteration-3.md](features/iteration-3.md)): `list_rows(session, refs)` — строки
-пронумерованного списка (`(occurrence_id | None, item_id)` из его кнопок) как они есть сейчас: это occurrence записи,
-а если оно отменено (переехало, «когда-нибудь») или его не было — текущее (отменённое → строка без времени, сама
-запись); удалённая / пропавшая запись → None.
+Итерация 3, §2 ([features/iteration-3.md](features/iteration-3.md)): `list_rows(session, refs, *, current=False)` —
+строки пронумерованного списка (`(occurrence_id | None, item_id)` из его кнопок) как они есть сейчас: это occurrence
+записи, а если оно отменено (переехало, «когда-нибудь») или его не было — текущее (отменённое → строка без времени,
+сама запись); удалённая / пропавшая запись → None. `current=True` (/tasks: строка — это задача) — и оставленное
+`missed` повторение серии заменяется текущим. `done_after_day(session, prefs, day)` (§5) — occurrences со сроком в
+day, отмеченные после него (напоминание, придержанное до утра).
 
 ### 4.12 workers/jobs.py  [workers]
 
@@ -821,7 +841,8 @@ async def on_dead(ctx: AppContext, job: Job) -> None
 6. intent `query`: `run_query` → `answer=="list"` → `views.rows_list`; `summary` → `answer_query` → текст
    (`AIUnavailable`/`AIBadResponse` от `answer_query` → тот же `views.rows_list`: повтор job заплатил бы за extract снова).
 7. intent `edit` (итерация 3, §3): `find_edit_candidates(edit.target, exact=True, limit=20)`, если пусто — без
-   `exact`. Ровно одна точная среди открытых (для `undone` — среди сделанных; или единственная точная вообще) →
+   `exact`. Ровно одна точная среди открытых (для `undone` — среди сделанных; для `done` — открытая задача / событие /
+   покупка, не заметка вместо уже сделанной задачи; или единственная точная вообще) →
    правка применяется сразу, любая, и delete / done тоже (`_apply_edit`: `undo.apply`, снимок → `raw_json[UNDO_KEY]`,
    ответ `views.edit_applied` «✅ Закрыл «…»» / «🕒 Перенёс «…» на …» / «🗑 Удалил «…»» с [↩️ Отменить] (UndoCb),
    `purpose="edited"`, item_id — reply на него правит запись). Иначе (несколько, найдено лишь по части слов или по
@@ -830,14 +851,18 @@ async def on_dead(ctx: AppContext, job: Job) -> None
    delete/done/no_reminder/stop_recurrence и для одной точной записи ждут выбора. 0 → сообщение сохраняется заметкой
    (как при `save` с пустым items), её карточка с «🤷 Не нашёл, что изменить — сохранил как запись.». Пересланный
    пост (forward_origin) — чужие слова, правкой не бывает: сохраняется как при `save` (пустой items → заметка).
+   Правка с `items` (модель нашла в сообщении и новое: «купил молоко, хлеба не было — купить завтра») — после правки
+   / списка кандидатов эти записи сохраняются как при `save`.
 8. `raw.status=done`, `processed_at`. Разбудить планировщик (`ctx.scheduler_wakeup.set()`).
 Итерация 3, §6 — голосовые: любой ответ на голосовое/аудио показывает расшифровку строкой «🎤 «…»» (`views.heard_line`,
 ≤ 120 символов, экранируется): карточка — из `CardExtras.heard` (`query.heard`: транскрипт raw записи, у альбома — всех
 голосовых частей; переживает перерисовку), карточка после голосовой правки reply — транскрипт этой правки
 (`cards.patch_card(heard=…)`), ответ на вопрос, уточняющий вопрос, список кандидатов, `edit_applied` — строка сверху
-(`views.with_heard`). Голосовое, давшее только записи без карточек (заметки/идеи; обычно лишь 👌), получает ещё и
-`views.heard_items`: «🎤 «…» → 💡 Идея «…»» с [✏️ Изменить] [🗑 Не то — удалить] (ItemCb edit/del; несколько записей —
-строки «1. …» и [✏️ N] [🗑 N]), `purpose="heard"`, item_id — если запись одна.
+(`views.with_heard`), карточка разбивки на шаги по голосовому — транскрипт этого голосового
+(`cards.card_view(heard=…)`), «😢 Не смог …» (`_tell` / `_give_up`) — строка сверху. Голосовое, давшее только записи
+без карточек (заметки/идеи; обычно лишь 👌), получает ещё и `views.heard_item` на каждую запись: «🎤 «…» → 💡 Идея
+«…»» с [✏️ Изменить] [🗑 Не то — удалить] (ItemCb edit/del), `purpose="heard"`, item_id этой записи (кнопки и reply —
+про неё одну; старые сообщения с несколькими записями и [✏️ N] [🗑 N] продолжают работать как раньше).
 Итоговая реакция (👌/🤔/✍/😢) ставится на все части альбома (capture поставил 👀 на каждую). Все сообщения processor'а
 в тихие часы (`quiet.in_quiet_hours(now)`) уходят без звука (`silent=True`): ночью разбираются отложенные бюджетом
 или недоступностью ИИ сообщения. Бюджет исчерпан → `RetryLater(at=shift_out_of_quiet(next_month_start))`.
@@ -894,7 +919,10 @@ async def build_digest(session, kind: str, prefs: Prefs, now: datetime) -> Diges
 async def digest_data(session, kind: str, prefs: Prefs, now: datetime) -> DigestData   # итерация 3: и пустой
                                                                                        # (перерисовка после [✅ N])
 def folded_key(day: date) -> str          # once_key "digest:evening-folded:YYYY-MM-DD": итог day — в утреннем day+1
-async def missed_evening(session, day: date, prefs: Prefs) -> Agenda | None   # повестка day-1, если её итог свёрнут
+async def missed_evening(session, day: date, prefs: Prefs) -> Agenda | None   # day_summary(day-1), если итог свёрнут
+async def day_summary(session, day: date, prefs: Prefs) -> Agenda   # повестка day; done — и отмеченные позже
+                                                                    # (срок в day: придержанное до утра напоминание)
+def has_summary(agenda: Agenda) -> bool   # есть open или done: только тогда итог сворачивается в утренний
 ```
 
 ### 4.16 workers/scheduler.py  [workers]
@@ -906,9 +934,14 @@ class Scheduler:
     async def tick(self, now: datetime) -> None
 ```
 
-`tick`: (0) итерация 3, §5: время тика → `app_state` `scheduler:last_tick` (`app_state.swap`); предыдущий тик
-`GAP_AFTER` (15 мин) назад и раньше (сон ПК, Docker стоял; в том числе первый тик после рестарта) → `Downtime(start,
-end)` (ещё один разрыв до уведомления продлевает его); (1) `sending` с `claimed_at < now-2мин` → `pending`;
+`tick`: (0) итерация 3, §5: время тика → `app_state` `scheduler:last_tick` (`app_state.swap`); долгий тик (flood
+control) по ходу дела (перед каждым напоминанием и в конце, не чаще `PROGRESS_EVERY` = 1 мин) пишет туда, докуда
+дошёл: тик_now + прошедшее по `time.monotonic` (пауза ≥ `GAP_AFTER` между отметками — процесс, возможно, был заморожен:
+до конца тика больше не пишется); последнее записанное время `GAP_AFTER` (15 мин) назад и раньше (сон ПК, Docker стоял;
+в том числе первый тик после рестарта) → `Downtime(start, end)` (ещё один разрыв до уведомления продлевает его),
+в той же транзакции → `app_state` `scheduler:downtime` {start, end}; первый тик нового процесса подхватывает его
+(процесс умер до свёртки итога / уведомления), после уведомления (или «ничего не задело») ключ удаляется;
+(1) `sending` с `claimed_at < now-2мин` → `pending`;
 (2) claim pending `fire_at ≤ now` (SKIP LOCKED, ≤20):
 item deleted / occurrence не open → `cancelled`; `now - fire_at > prefs.missed_grace_minutes` → `missed`;
 now в тихих часах и (`auto` или опоздало больше `HOLD_AFTER` = 30 мин) → `pending` с
@@ -923,8 +956,11 @@ now в тихих часах и (`auto` или опоздало больше `HO
 в них утренний пропадает, когда окно закроется; вечерний — см. ниже), ключ `digest:{kind}:{YYYY-MM-DD}` в once_keys
 (вставка ON CONFLICT DO NOTHING → только вставивший отправляет); `build_digest` → None → не отправлять;
 итерация 3: перед этим — вечерний итог, проспанный ботом (между прошлым тиком / началом простоя и целью тиков не было),
-который уже нельзя отправить (тихие часы или окно закрылось): его ключ занимается (поздно не придёт), и, если он не
-пуст, `digest.folded_key(day)` — утренний дайджест day+1 показывает «🌙 Вчерашний итог (не успел прислать)»;
+который уже нельзя отправить (тихие часы или окно закрылось): его ключ занимается (поздно не придёт), и, если у дня
+есть что подытожить (`digest.has_summary(day_summary)`: что-то было на этот день — сделано или нет; одни просроченные
+не в счёт, они и так в утреннем), `digest.folded_key(day)` — утренний дайджест day+1 показывает «🌙 Вчерашний итог (не
+успел прислать)»; ключ занят раньше (свёрнут до рестарта) и `folded_key` есть → в уведомлении всё равно «Итог дня —
+в утреннем дайджесте»;
 (5) после простоя, когда его напоминания обработаны (нет бэклога и ждущих Telegram): одно беззвучное
 `views.downtime_notice` (`purpose="notice"`), только если что-то задело — опоздавшие (отправлены поздно / ждут
 конца тихих часов), устаревшие (`missed`), свёрнутый итог; не ушло — повтор на следующем тике (в пределах grace);
@@ -995,8 +1031,10 @@ def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, 
 def rows_list(title: str, rows: Sequence[Row], prefs: Prefs, now: datetime, *, empty: str = "Пусто")
 # Итерация 3, §2: today_list(agenda, …) (/today), tasks_list(rows, …) (/tasks), morning_digest, evening_digest —
 # открытые строки пронумерованы «1. 13:00 · 📌 Купить хлеб», под списком [✅ 1] [✅ 2] … (ListCb, по 5 в ряд, ≤ 20;
-# остальные — «•» и подсказка); закрытая строка — «1. ✅ 13:00 · 📌 <s>Купить хлеб</s>» с [↩️ 1]. Kwarg `lines`
-# (pin_lines: номера и разделы из кнопок сообщения + новые строки без номера) — перерисовка после нажатия.
+# остальные — «•» и подсказка, только если кнопки кончились: строки, добавленные после отправки, — без неё); закрытая
+# строка — «1. ✅ 13:00 · 📌 <s>Купить хлеб</s>» с [↩️ 1]. Kwarg `lines` (pin_lines: номера и разделы из кнопок
+# сообщения + новые строки без номера) — перерисовка после нажатия; строка «🗓 На этой неделе», у записи которой срока
+# больше нет (отложена / перенесена на точное время), остаётся со своим номером и временем после разделов сроков.
 def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_before: str, moved: bool,
                  changed: bool = True, undo: tuple[int, int] | None = None, steps_closed: int = 0,
                  warnings=()) -> View
@@ -1010,7 +1048,7 @@ def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_be
 # с SEC_YESTERDAY «y» (вчерашнее не сделанное; из «Просрочено» убирается), в morning_digest — «🌙 Вчерашний итог (не
 # успел прислать)», «Сделано X из Y», строки с [✅ N]; напоминание с held_from — «⏰ вчера 20:00 · опоздал на 12 ч».
 # §6: heard_line(text) «🎤 «…»» (≤ HEARD_MAX = 120), item_card — из extras.heard (после тегов), with_heard(view, heard)
-# — строка сверху, heard_items(heard, items) — «🎤 «…» → 💡 Идея «…»» [✏️ Изменить] [🗑 Не то — удалить].
+# — строка сверху, heard_item(heard, item) — «🎤 «…» → 💡 Идея «…»» [✏️ Изменить] [🗑 Не то — удалить].
 def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
 def usage_text(summary: UsageSummary) -> str
@@ -1051,8 +1089,14 @@ def help_text() -> str
 наступил…» и напоминание с [⏰ 15 мин]. ListCb `ld:<a>:<k>:<d>:<s>:<n>:<o>:<i>` ([✅ N] / [↩️ N] под /today, /tasks,
 дайджестами): `done` — `mark_done` occurrence строки (у серии — этот раз, у родителя — и открытые шаги; без occurrence —
 `apply_patch(done)`), `undo` — `mark_undone` / `apply_patch(undone)`, без ИИ; затем список (`bot.lists.render`)
-перерисовывается по кнопкам сообщения (`lists.snapshot`): те же номера и разделы, состояние — текущее. Уже
-закрытое / открытое / удалённое — только тост (+ перерисовка); сообщение без кнопок (недоступное) — свежий список.
+перерисовывается по кнопкам сообщения (`lists.snapshot`): те же номера и разделы, состояние — текущее; нажатая строка
+привязывается к occurrence, на которое подействовала (строка /tasks с оставленным `missed` повторением серии —
+`list_rows(current=True)` — закрывает текущее повторение и показывает его с [↩️ N]). [↩️ N] шага, закрытого [✅]
+родителя (`done_at` шага = `done_at` родителя и тем же нажатием закрыты и другие шаги), отменяет весь тот [✅]:
+`apply_patch(undone)` родителя возвращает его и шаги, закрытые с ним (тост «↩️ Снова открыто: «Переезд» и 2 шага»).
+Уже закрытое / открытое / удалённое — только тост (+ перерисовка); сообщение без кнопок (недоступное) — свежий
+список. [📅 Перенести] вечернего дайджеста перерисовывает его так же по кнопкам (`lists.render(…, drop=перенесённые
+occurrences)`): закрытые строки сохраняют номер и [↩️ N], перенесённые пропадают, внизу «📅 Перенесено на завтра: N».
 UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: вернулось → сообщение становится карточкой записи,
 тост «↩️ Отменено»; второе нажатие — «Уже отменено»; устарело — «🤷 Запись уже изменилась — отменить нельзя», кнопка
 убирается, ничего не меняется; снимка нет — «Кнопка устарела».

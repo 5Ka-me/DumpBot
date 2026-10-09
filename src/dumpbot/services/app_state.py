@@ -1,13 +1,16 @@
 """Small values the bot keeps across restarts (``app_state``, a JSON value per key).
 
-The scheduler keeps the time of its last tick here: a tick that finds it far in the past knows the bot was down (the PC
-slept, Docker stood still) — docs/features/iteration-3.md §5.
+The scheduler keeps the time of its last tick (and of its progress during a long one) here: a tick that finds it far
+in the past knows the bot was down (the PC slept, Docker stood still) — docs/features/iteration-3.md §5. A downtime
+whose consequences (the folded evening digest, the notice) are not handled yet is kept too, so that a restart in the
+middle does not lose it.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dumpbot import clock
 from dumpbot.db.models import AppState
 
-__all__ = ["get", "put", "swap"]
+__all__ = ["delete", "get", "put", "swap"]
 
 
 async def get(session: AsyncSession, key: str) -> Any | None:
@@ -40,3 +43,8 @@ async def swap(session: AsyncSession, key: str, value: Any) -> Any | None:
     old = await session.scalar(select(AppState.value).where(AppState.key == key).with_for_update())
     await put(session, key, value)
     return old
+
+
+async def delete(session: AsyncSession, key: str) -> None:
+    """Remove the value stored under ``key`` (if any). Does not commit."""
+    await session.execute(sql_delete(AppState).where(AppState.key == key))

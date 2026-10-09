@@ -325,3 +325,70 @@ async def test_keep_holds_one_undo_per_item(session, make, edit, new_raw, now, p
     assert raw.raw_json["_candidates"] == [a.item.id, b.item.id]
     assert await take_back(session, raw, b.item.id, now) == undo.UNDONE
     assert (a.item.status, b.item.status) == ("done", "open")
+
+
+# --- a checklist changed after an edit of one of its steps (review fix) ---------------------------------------------
+
+
+async def steps_of_moving(session, make, now, prefs):
+    [c] = await make({**TASK_17, "title": "Переезд"}, now=now)
+    specs = [StepSpec(title="Упаковать"), StepSpec(title="Отвезти")]
+    pack, drive = await items.add_steps(session, c.item.id, specs, prefs, now)
+    await session.commit()
+    return c, pack, drive
+
+
+async def test_closing_the_parent_by_another_step_makes_the_undo_of_a_step_stale(session, make, edit, now, prefs):
+    c, pack, drive = await steps_of_moving(session, make, now, prefs)
+    raw, _ = await edit(pack.item.id, now, action="done", target="упаковать")  # the parent stays open
+    await items.toggle_step(session, drive.item.id, done=True, prefs=prefs, now=now)  # the last step: it closes
+    await session.commit()
+    changed = await state(session, c.item.id)
+    assert changed["items"][c.item.id]["status"] == "done"
+
+    assert await take_back(session, raw, pack.item.id, now) == undo.STALE
+    assert await state(session, c.item.id) == changed  # not a done parent with an open step
+
+
+async def test_ticking_another_step_after_reopening_one_makes_the_undo_stale(session, make, edit, now, prefs):
+    c, pack, drive = await steps_of_moving(session, make, now, prefs)
+    await items.toggle_step(session, pack.item.id, done=True, prefs=prefs, now=now)
+    await session.commit()
+    raw, _ = await edit(pack.item.id, now, action="undone", target="упаковать")
+    await items.toggle_step(session, drive.item.id, done=True, prefs=prefs, now=now)
+    await session.commit()
+    changed = await state(session, c.item.id)
+
+    assert await take_back(session, raw, pack.item.id, now) == undo.STALE
+    assert await state(session, c.item.id) == changed  # not every step done under an open parent
+
+
+async def test_closing_the_parent_after_a_step_was_deleted_makes_the_undo_stale(session, make, edit, now, prefs):
+    c, pack, drive = await steps_of_moving(session, make, now, prefs)
+    raw, _ = await edit(pack.item.id, now, action="delete", target="упаковать")
+    await items.toggle_step(session, drive.item.id, done=True, prefs=prefs, now=now)
+    await session.commit()
+    changed = await state(session, c.item.id)
+
+    assert await take_back(session, raw, pack.item.id, now) == undo.STALE
+    assert await state(session, c.item.id) == changed
+
+
+async def test_an_undo_of_a_step_with_the_checklist_untouched_still_works(session, make, edit, now, prefs):
+    c, pack, _ = await steps_of_moving(session, make, now, prefs)
+    before = await state(session, c.item.id)
+    raw, _ = await edit(pack.item.id, now, action="done", target="упаковать")
+    assert await take_back(session, raw, pack.item.id, now) == undo.UNDONE
+    assert await state(session, c.item.id) == before
+
+
+async def test_an_undo_kept_before_the_family_was_recorded_still_works(session, make, edit, now, prefs):
+    # Undos stored by the running bot before this change have no "rest": they keep working as they did.
+    c, pack, _ = await steps_of_moving(session, make, now, prefs)
+    before = await state(session, c.item.id)
+    raw, applied = await edit(pack.item.id, now, action="done", target="упаковать")
+    old = {k: v for k, v in applied.snapshot.items() if k != "rest"}
+    undo.keep(raw, pack.item.id, old)
+    await session.commit()
+    assert await take_back(session, raw, pack.item.id, now) == undo.UNDONE
+    assert await state(session, c.item.id) == before

@@ -21,7 +21,7 @@ reopen that line without the AI and re-render the list from its buttons (``bot.l
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Final
@@ -37,6 +37,7 @@ from dumpbot.bot.cbdata import (
     DIGEST_ACTIONS,
     DIGEST_DAY_FMT,
     LIST_ACTIONS,
+    LIST_EVENING,
     LIST_KINDS,
     OCC_ACTIONS,
     SNOOZE_ACTIONS,
@@ -57,7 +58,7 @@ from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
 from dumpbot.db.models import Occurrence, RawMessage
 from dumpbot.domain import timeresolve
-from dumpbot.domain.fmt import fmt_date, fmt_dt, plural_ru
+from dumpbot.domain.fmt import fmt_dt, plural_ru
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
 from dumpbot.services import digest, items, processor, query, undo
 from dumpbot.workers import jobs
@@ -68,6 +69,7 @@ if TYPE_CHECKING:
     from dumpbot.context import AppContext
     from dumpbot.db.models import Item
     from dumpbot.domain.prefs import Prefs
+    from dumpbot.dto import Row
 
 log = logging.getLogger(__name__)
 
@@ -414,19 +416,33 @@ async def on_list(callback: CallbackQuery, callback_data: ListCb, ctx: AppContex
     day = _digest_day(callback_data.d)
 
     async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
-        toast, changed = await _toggle_line(session, callback_data, prefs, now)
+        toast, changed, row = await _toggle_line(session, callback_data, prefs, now)
         await session.flush()
-        view = await lists.render(session, callback_data.k, day, prefs, now, refs)
+        view = await lists.render(session, callback_data.k, day, prefs, now, _repinned(refs, callback_data, row))
         return Outcome(view, toast, wake_scheduler=changed)
 
     await run(callback, ctx, op)
 
 
-async def _toggle_line(session: AsyncSession, cb: ListCb, prefs: Prefs, now: datetime) -> tuple[str, bool]:
-    """Close / reopen one list line; returns (toast, whether anything changed)."""
-    [row] = await query.list_rows(session, [(cb.o or None, cb.i)])
+def _repinned(refs: Sequence[ListCb], cb: ListCb, row: Row | None) -> list[ListCb]:
+    """The message's lines with the pressed one pinned to the occurrence the press acted on (a /tasks line of an
+    instance left missed: the current one), so that the line shows that occurrence, with [↩️ N] for it."""
+    o = (row.occurrence_id or 0) if row is not None else cb.o
+    return [ref.model_copy(update={"o": o}) if (ref.s, ref.n) == (cb.s, cb.n) else ref for ref in refs]
+
+
+async def _toggle_line(session: AsyncSession, cb: ListCb, prefs: Prefs, now: datetime) -> tuple[str, bool, Row | None]:
+    """Close / reopen one list line; returns (toast, whether anything changed, the line's row it acted on). [↩️ N]
+    of a step that its parent's [✅] closed (done at the parent's ``done_at``) takes that whole [✅] back: the parent
+    and the steps closed with it, as the parent's own [↩️] would."""
+    [row] = await lists.line_rows(session, cb.k, [cb])
     if row is None:
-        return (common.DELETED if await items.get_item(session, cb.i) is not None else common.NOT_FOUND), False
+        return (common.DELETED if await items.get_item(session, cb.i) is not None else common.NOT_FOUND), False, None
+    toast, changed = await _toggle_row(session, cb, row, prefs, now)
+    return toast, changed, row
+
+
+async def _toggle_row(session: AsyncSession, cb: ListCb, row: Row, prefs: Prefs, now: datetime) -> tuple[str, bool]:
     title = views.clip(row.title, LIST_TOAST_TITLE_MAX)
     done = views.row_done(row)
     if cb.a == "done":
@@ -443,11 +459,31 @@ async def _toggle_line(session: AsyncSession, cb: ListCb, prefs: Prefs, now: dat
         return toast + await _next_time(session, item, row.occurrence_id, prefs, now), True
     if not done:
         return f"Уже открыто: «{title}»", False
+    if (closed_by := await _closed_with_parent(session, row)) is not None:
+        parent, steps = closed_by
+        await items.apply_patch(session, parent.id, EditPatch(action="undone"), prefs, now)
+        parent_title = views.clip(parent.title, LIST_TOAST_TITLE_MAX)
+        return f"↩️ Снова открыто: «{parent_title}» и {steps} {plural_ru(steps, 'шаг', 'шага', 'шагов')}", True
     if row.occurrence_id is not None:
         await items.mark_undone(session, row.occurrence_id, prefs=prefs, now=now)
     else:
         await items.apply_patch(session, row.item_id, EditPatch(action="undone"), prefs, now)
     return f"↩️ Снова открыто: «{title}»", True
+
+
+async def _closed_with_parent(session: AsyncSession, row: Row) -> tuple[Item, int] | None:
+    """(the parent, how many of its steps it closed) when the step of ``row`` was closed by its parent's [✅]
+    (done at the very moment the parent was), else None."""
+    if row.parent_id is None:
+        return None
+    step = await items.get_item(session, row.item_id)
+    parent = await items.get_item(session, row.parent_id)
+    if step is None or parent is None or parent.status != "done" or step.status != "done":
+        return None
+    if parent.done_at is None or step.done_at != parent.done_at:
+        return None
+    steps = await items.steps_done_at(session, parent.id, parent.done_at)
+    return (parent, steps) if steps > 1 else None
 
 
 # --- clarifying questions and edit candidates (queue a job) ------------------------------------------------------
@@ -552,12 +588,13 @@ async def on_digest(callback: CallbackQuery, callback_data: DigestCb, ctx: AppCo
     (older buttons) from the day the digest was sent — never from the day the button is pressed.
     """
     sent_at = callback.message.date if isinstance(callback.message, Message) else None
+    refs = lists.snapshot(callback.message)
 
     async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
         day = _digest_day(callback_data.d) or (sent_at or now).astimezone(prefs.zone).date()
         moved = await digest.move_not_done(session, day, prefs, now)
         await session.flush()
-        view = await _evening_after_move(session, prefs, digest.day_moment(day, prefs), now, len(moved))
+        view = await _evening_after_move(session, prefs, day, now, moved, refs)
         toast = f"📅 Перенёс на завтра: {len(moved)}" if moved else "Нечего переносить"
         return Outcome(view, toast, wake_scheduler=bool(moved))
 
@@ -577,15 +614,13 @@ def _digest_day(value: str) -> date | None:
 
 
 async def _evening_after_move(
-    session: AsyncSession, prefs: Prefs, day_of: datetime, now: datetime, moved: int
+    session: AsyncSession, prefs: Prefs, day: date, now: datetime, moved: Sequence[Occurrence], refs: Sequence[ListCb]
 ) -> views.View:
-    data = await digest.build_digest(session, "evening", prefs, day_of)
-    if data is not None:
-        text, markup = views.evening_digest(data, prefs, now)
-    else:
-        text, markup = f"🌙 <b>Итоги дня</b>, {fmt_date(day_of.astimezone(prefs.zone).date())}", None
+    """The digest after the move, re-rendered from its buttons (``refs``) like after [✅ N]: the lines keep their
+    numbers (a closed one its [↩️ N]), the moved ones are gone; the count of moved items under it."""
+    text, markup = await lists.render(session, LIST_EVENING, day, prefs, now, refs, drop={o.id for o in moved})
     if moved:
-        text = views.fit(f"{text}\n\n📅 Перенесено на завтра: {moved}")
+        text = views.fit(f"{text}\n\n📅 Перенесено на завтра: {len(moved)}")
     return text, markup
 
 

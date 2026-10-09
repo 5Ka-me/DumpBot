@@ -5,7 +5,8 @@ buttons are the list's snapshot. After a press (the callbacks router closes or r
 message is rendered again from its buttons: every numbered line keeps its section and number and shows its state now
 (✅ struck through with [↩️ N], or open with [✅ N]); a deleted item's line is gone; rows the list has now but the
 snapshot lacks (added since, past the first 20) follow without a number. A message whose buttons the callback does
-not carry (Telegram sends an inaccessible message for very old ones) is rendered afresh.
+not carry (Telegram sends an inaccessible message for very old ones) is rendered afresh. A /tasks line stands for the
+task: when its pinned instance of a series was left missed, it is the item's current instance now.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from dumpbot.bot.cbdata import LIST_EVENING, LIST_MORNING, LIST_TASKS, LIST_TODA
 from dumpbot.services import digest, query
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
     from aiogram.types import MaybeInaccessibleMessage
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from dumpbot.domain.prefs import Prefs
     from dumpbot.dto import Row
 
-__all__ = ["TASKS_LIMIT", "render", "snapshot"]
+__all__ = ["TASKS_LIMIT", "line_rows", "render", "snapshot"]
 
 TASKS_LIMIT: Final = 30  # rows of /tasks (the first LIST_BUTTONS_MAX get a button)
 
@@ -57,35 +58,51 @@ async def render(
     prefs: Prefs,
     now: datetime,
     refs: Sequence[ListCb] = (),
+    *,
+    drop: Collection[int] = (),
 ) -> views.View:
     """List ``kind`` of local ``day`` (None: of ``now``) as it is now; ``refs`` (a ``snapshot``) keep the numbers of
-    the message being re-rendered."""
+    the message being re-rendered; numbered lines whose occurrence is in ``drop`` (moved to tomorrow by the evening
+    digest's button) are left out."""
     if kind == LIST_TASKS:
         rows = await query.open_tasks(session, prefs, now, limit=TASKS_LIMIT)
-        lines = await _pinned(session, kind, views.tasks_sections(rows), refs)
+        lines = await _pinned(session, kind, views.tasks_sections(rows), refs, drop)
         return views.tasks_list(rows, prefs, now, lines=lines)
     at = digest.day_moment(day, prefs) if day is not None else now
     if kind == LIST_TODAY:
         agenda = await query.agenda(session, prefs, at)
-        lines = await _pinned(session, kind, views.today_sections(agenda), refs)
+        lines = await _pinned(session, kind, views.today_sections(agenda), refs, drop)
         return views.today_list(agenda, prefs, now, lines=lines)
     if kind == LIST_MORNING:
         data = await digest.digest_data(session, "morning", prefs, at)
-        lines = await _pinned(session, kind, views.morning_sections(data), refs)
+        lines = await _pinned(session, kind, views.morning_sections(data), refs, drop)
         return views.morning_digest(data, prefs, now, lines=lines)
     if kind == LIST_EVENING:
         data = await digest.digest_data(session, "evening", prefs, at)
-        lines = await _pinned(session, kind, views.evening_sections(data.agenda, now), refs)
+        lines = await _pinned(session, kind, views.evening_sections(data.agenda, now), refs, drop)
         return views.evening_digest(data, prefs, now, lines=lines)
     raise ValueError(f"unknown list: {kind}")
 
 
+async def line_rows(session: AsyncSession, kind: str, refs: Sequence[ListCb]) -> list[Row | None]:
+    """The rows of these numbered lines of a ``kind`` list as they are now (``query.list_rows``)."""
+    return await query.list_rows(session, [(ref.o or None, ref.i) for ref in refs], current=kind == LIST_TASKS)
+
+
 async def _pinned(
-    session: AsyncSession, kind: str, sections: Mapping[str, Sequence[Row]], refs: Sequence[ListCb]
+    session: AsyncSession,
+    kind: str,
+    sections: Mapping[str, Sequence[Row]],
+    refs: Sequence[ListCb],
+    drop: Collection[int] = (),
 ) -> views.ListLines | None:
     """The lines of a re-render (None: a first render, numbered afresh)."""
     if not refs:
         return None
-    rows = await query.list_rows(session, [(ref.o or None, ref.i) for ref in refs])
-    pinned = [(ref.s, ref.n, row) for ref, row in zip(refs, rows, strict=True) if row is not None]
+    rows = await line_rows(session, kind, refs)
+    pinned = [
+        (ref.s, ref.n, row)
+        for ref, row in zip(refs, rows, strict=True)
+        if row is not None and (row.occurrence_id is None or row.occurrence_id not in drop)
+    ]
     return views.pin_lines(kind, sections, pinned)

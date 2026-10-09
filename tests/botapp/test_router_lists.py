@@ -9,9 +9,9 @@ from aiogram.types import CallbackQuery, Chat, InaccessibleMessage, Update, User
 from sqlalchemy import select
 
 from dumpbot import clock
-from dumpbot.ai.schemas import Extraction, When
+from dumpbot.ai.schemas import EditPatch, Extraction, When
 from dumpbot.bot import lists
-from dumpbot.bot.cbdata import ListCb
+from dumpbot.bot.cbdata import DigestCb, ListCb
 from dumpbot.db.models import Item, Occurrence
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items
@@ -323,3 +323,204 @@ async def test_a_line_without_an_occurrence_closes_the_item(feed, updates, seed,
     tg.clear()
     await press(feed, updates, (edit.text, edit.reply_markup), "↩️ 1")
     assert (await item(seed, note.item.id)).status == "open"
+
+
+# --- review fixes -------------------------------------------------------------------------------------------------
+
+
+async def test_a_period_line_given_an_exact_time_keeps_its_number_and_button(feed, updates, seed, tg, frozen) -> None:
+    bread = await seed.item("Купить хлеб", when=When(text="сегодня в 12", time="12:00"))
+    pi = await seed.item("Посмотреть Raspberry Pi", when=When(text="на этой неделе", period="this_week"))
+    view = await render(seed, "t")
+    assert view[0].split("\n")[-1] == "2. 📌 Посмотреть Raspberry Pi"
+    async with seed.sessionmaker() as s:  # "сделаю сегодня в 20": the span becomes an exact time
+        await items.apply_patch(
+            s, pi.item.id, EditPatch(when=When(text="сегодня в 20", day="+0", time="20:00")), Prefs(), frozen.now
+        )
+        await s.commit()
+    assert (await item(seed, pi.item.id)).period_kind is None
+
+    await press(feed, updates, view, "✅ 1")
+
+    edit = tg.edits[0]
+    assert tg.toasts == ["✅ Закрыл «Купить хлеб»"]
+    assert edit.text.split("\n")[-1] == "2. сегодня 20:00 · 📌 Посмотреть Raspberry Pi"  # still there, not "\n\n"
+    assert not edit.text.endswith("\n")
+    assert labels(edit.reply_markup) == ["↩️ 1", "✅ 2"]
+
+    tg.clear()
+    await press(feed, updates, (edit.text, edit.reply_markup), "✅ 2")
+
+    assert tg.toasts == ["✅ Закрыл «Посмотреть Raspberry Pi»"]
+    assert tg.edits[0].text.split("\n")[-1] == "2. ✅ сегодня 20:00 · 📌 <s>Посмотреть Raspberry Pi</s>"
+    assert labels(tg.edits[0].reply_markup) == ["↩️ 1", "↩️ 2"]  # the accidental ✅ can be taken back
+    assert (await occ(seed, bread.occurrence.id)).status == "done"
+
+
+async def test_tasks_series_line_pressed_a_day_later_closes_the_current_instance(
+    feed, updates, seed, tg, frozen
+) -> None:
+    pills = await seed.item("Таблетки", when=When(text="каждый день в 12", time="12:00"), rrule="FREQ=DAILY")
+    view = await render(seed, "k")  # Tue 10:00: "1. сегодня 12:00 · 📌 Таблетки 🔁", pinned to Tuesday's instance
+    for hours in (2, 25):  # the scheduler's ticks: Tue 12:01 (Wednesday's instance), Wed 13:01 (Thursday's)
+        frozen.advance(hours=hours, minutes=1 if hours == 2 else 0)
+        async with seed.sessionmaker() as s:
+            await items.ensure_recurring(s, Prefs(), frozen.now)
+            await s.commit()
+    async with seed.sessionmaker() as s:
+        stmt = select(Occurrence).where(Occurrence.item_id == pills.item.id).order_by(Occurrence.due_at)
+        tuesday, wednesday, thursday = (await s.scalars(stmt)).all()
+    # Wed 13:01: Tuesday's instance was left missed, Wednesday's is the current one
+    assert (tuesday.id, tuesday.status, wednesday.status, thursday.status) == (
+        pills.occurrence.id,
+        "missed",
+        "open",
+        "open",
+    )
+
+    await press(feed, updates, view, "✅ 1")
+
+    assert (await occ(seed, tuesday.id)).status == "missed"  # yesterday stays as it was
+    assert (await occ(seed, wednesday.id)).status == "done"
+    assert tg.toasts == ["✅ Закрыл «Таблетки» · следующий раз завтра 12:00"]
+    edit = tg.edits[0]
+    assert edit.text.split("\n")[1] == "1. ✅ сегодня 12:00 · 📌 <s>Таблетки</s> 🔁"
+    assert cb_of(edit.reply_markup, "↩️ 1").o == wednesday.id
+
+    tg.clear()
+    await press(feed, updates, (edit.text, edit.reply_markup), "↩️ 1")
+    assert (await occ(seed, wednesday.id)).status == "open"
+
+
+async def test_moving_the_evening_digest_keeps_the_numbers_and_the_undo(feed, updates, seed, tg, frozen) -> None:
+    morning = await seed.item("Утро", when=When(text="сегодня в 11", time="11:00"))
+    lunch = await seed.item("Обед", when=When(text="сегодня в 13", time="13:00"))
+    await seed.item("Поздно", when=When(text="сегодня в 22", time="22:00"))
+    frozen.advance(hours=11)  # Tue 21:00
+    view = await render(seed, "e", date(2026, 10, 6))
+    assert labels(view[1]) == ["✅ 1", "✅ 2", "✅ 3", "📅 Перенести невыполненное на завтра"]
+    await press(feed, updates, view, "✅ 1")
+    closed = tg.edits[0]
+    tg.clear()
+
+    move = DigestCb(a="tmr", d="20261006")
+    await feed(updates.callback(move, text=closed.text, reply_markup=closed.reply_markup, date=frozen.now))
+
+    assert (await occ(seed, morning.occurrence.id)).status == "done"
+    assert (await occ(seed, lunch.occurrence.id)).due_at == lunch.occurrence.due_at + timedelta(days=1)
+    assert tg.toasts == ["📅 Перенёс на завтра: 1"]
+    [edit] = tg.edits
+    lines_ = edit.text.split("\n")
+    assert "1. ✅ 11:00 · 📌 <s>Утро</s>" in lines_  # its number and [↩️ 1] stay
+    assert "3. 🕒 22:00 · 📌 Поздно" in lines_  # not renumbered
+    assert "Обед" not in edit.text  # moved: gone from this day's summary
+    assert lines_[-1] == "📅 Перенесено на завтра: 1"
+    assert labels(edit.reply_markup) == ["↩️ 1", "✅ 3"]
+
+    tg.clear()
+    await press(feed, updates, (edit.text, edit.reply_markup), "↩️ 1")
+    assert (await occ(seed, morning.occurrence.id)).status == "open"
+
+
+async def test_rows_added_after_the_list_was_sent_get_no_first_20_hint(feed, updates, seed, tg) -> None:
+    await today_items(seed)
+    view = await render(seed, "t")
+    await seed.item("Новое", when=When(text="сегодня в 18", time="18:00"))
+
+    await press(feed, updates, view, "✅ 1")
+
+    text = tg.edits[0].text
+    assert "• сегодня 18:00 · 📌 Новое" in text  # shown, without a button
+    assert "Кнопки" not in text  # the list had 2 lines: no "first 20" to speak of
+    assert labels(tg.edits[0].reply_markup) == ["↩️ 1", "✅ 2"]
+
+
+async def test_lines_past_the_first_20_keep_the_hint_after_a_press(feed, updates, seed, tg) -> None:
+    for n in range(21):
+        await seed.item(f"Дело {n:02d}", when=When(text="сегодня в 18", time=f"18:{n:02d}"))
+    view = await render(seed, "t")
+    assert "Кнопки — у первых 20 дел" in view[0]
+
+    await press(feed, updates, view, "✅ 1")
+
+    assert "Кнопки — у первых 20 дел" in tg.edits[0].text
+
+
+async def test_undo_of_a_step_closed_by_its_parent_takes_the_whole_close_back(feed, updates, seed, tg) -> None:
+    spec = {
+        "kind": "task",
+        "title": "Переезд",
+        "when": {"text": "сегодня в 18", "time": "18:00"},
+        "steps": [{"title": "Упаковать", "when": {"text": "в 12", "time": "12:00"}}, {"title": "Ключи"}],
+    }
+    async with seed.sessionmaker() as s:
+        [parent] = await items.create_items(
+            s,
+            raw=None,
+            extraction=Extraction.model_validate({"items": [spec]}),
+            source="text",
+            source_text=None,
+            source_meta=None,
+            urls=[],
+            prefs=Prefs(),
+            now=clock.utcnow(),
+            model=None,
+            prompt_version=None,
+        )
+        await s.commit()
+        pack, keys = (await s.scalars(select(Item).where(Item.parent_id == parent.item.id).order_by(Item.id))).all()
+    view = await render(seed, "t")
+    assert [line for line in view[0].split("\n") if line[:2] in ("1.", "2.")] == [
+        "1. сегодня 12:00 · 📌 Упаковать (из «Переезд»)",
+        "2. сегодня 18:00 · 📌 Переезд (0/2)",
+    ]
+    await press(feed, updates, view, "✅ 2")
+    assert tg.toasts == ["✅ Закрыл «Переезд» и 2 шага"]
+    edit = tg.edits[0]
+    assert labels(edit.reply_markup) == ["↩️ 1", "↩️ 2"]
+    tg.clear()
+
+    await press(feed, updates, (edit.text, edit.reply_markup), "↩️ 1")  # the ✅ 2 was a mistake
+
+    assert [(await item(seed, i)).status for i in (parent.item.id, pack.id, keys.id)] == ["open", "open", "open"]
+    assert tg.toasts == ["↩️ Снова открыто: «Переезд» и 2 шага"]
+    assert labels(tg.edits[0].reply_markup) == ["✅ 1", "✅ 2"]
+    assert "2. сегодня 18:00 · 📌 Переезд (0/2)" in tg.edits[0].text
+
+
+async def test_undo_of_a_step_ticked_on_its_own_reopens_only_it(feed, updates, seed, tg, frozen) -> None:
+    spec = {
+        "kind": "task",
+        "title": "Переезд",
+        "when": {"text": "сегодня в 18", "time": "18:00"},
+        "steps": [{"title": "Упаковать", "when": {"text": "в 12", "time": "12:00"}}, {"title": "Ключи"}],
+    }
+    async with seed.sessionmaker() as s:
+        [parent] = await items.create_items(
+            s,
+            raw=None,
+            extraction=Extraction.model_validate({"items": [spec]}),
+            source="text",
+            source_text=None,
+            source_meta=None,
+            urls=[],
+            prefs=Prefs(),
+            now=clock.utcnow(),
+            model=None,
+            prompt_version=None,
+        )
+        await s.commit()
+        pack, keys = (await s.scalars(select(Item).where(Item.parent_id == parent.item.id).order_by(Item.id))).all()
+        await items.toggle_step(s, keys.id, done=True, prefs=Prefs(), now=clock.utcnow())
+        await s.commit()
+    view = await render(seed, "t")
+    frozen.advance(minutes=5)
+    await press(feed, updates, view, "✅ 1")  # the last open step: the parent closes with it
+    assert (await item(seed, parent.item.id)).status == "done"
+    edit = tg.edits[0]
+    tg.clear()
+
+    await press(feed, updates, (edit.text, edit.reply_markup), "↩️ 1")
+
+    assert tg.toasts == ["↩️ Снова открыто: «Упаковать»"]
+    assert [(await item(seed, i)).status for i in (parent.item.id, pack.id, keys.id)] == ["open", "open", "done"]

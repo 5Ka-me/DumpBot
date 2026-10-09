@@ -150,6 +150,23 @@ async def agenda(session: AsyncSession, prefs: Prefs, now: datetime, *, day_offs
     return Agenda(day=day, open=open_rows, overdue=overdue, done=done, period_items=period_rows)
 
 
+async def done_after_day(session: AsyncSession, prefs: Prefs, day: date) -> list[Row]:
+    """Occurrences due on local ``day`` and done after it ended (an evening's reminder held until the morning and
+    ticked then): ``Agenda.done`` of that day counts only those done on it."""
+    tz = prefs.zone
+    start = timeresolve.localize(day, time(0), tz).astimezone(UTC)
+    end = timeresolve.localize(day + timedelta(days=1), time(0), tz).astimezone(UTC)
+    return await _occ_rows(
+        session,
+        Occurrence.status == "done",
+        Occurrence.due_at >= start,
+        Occurrence.due_at < end,
+        Occurrence.done_at >= end,
+        and_(_no_running_period(day), Item.someday.is_(False)),
+        order=(Occurrence.due_at, Occurrence.id),
+    )
+
+
 async def _period_rows(session: AsyncSession, day: date) -> list[Row]:
     """Open items whose week / month / season contains ``day``: the shortest (soonest ending) span first."""
     occ = _occ_subquery(open_only=True)
@@ -224,11 +241,16 @@ async def recurring(session: AsyncSession) -> list[Row]:
     return await _item_rows(session, stmt)
 
 
-async def list_rows(session: AsyncSession, refs: Sequence[tuple[int | None, int]]) -> list[Row | None]:
+async def list_rows(
+    session: AsyncSession, refs: Sequence[tuple[int | None, int]], *, current: bool = False
+) -> list[Row | None]:
     """The numbered lines of a list message as they are now (docs/features/iteration-3.md §2), one per
     ``(occurrence id | None, item id)``, in order: the item with that occurrence — or, when it is gone (cancelled:
     moved onto another instance, the item became "когда-нибудь") or there was none, with the item's current one
-    (none when that is cancelled too: the line is the item itself). None for a missing or deleted item."""
+    (none when that is cancelled too: the line is the item itself). None for a missing or deleted item.
+
+    ``current`` (/tasks, a line per item): an instance of a series that was left ``missed`` (the next one is due
+    now) stands for the item's current one too — the line is the task, not yesterday's instance."""
     if not refs:
         return []
     item_ids = {item_id for _, item_id in refs}
@@ -245,7 +267,8 @@ async def list_rows(session: AsyncSession, refs: Sequence[tuple[int | None, int]
             rows.append(None)
             continue
         occ = occs.get(occ_id) if occ_id else None
-        if occ is None or occ.item_id != item.id or occ.status == "cancelled":
+        gone = ("cancelled", "missed") if current else ("cancelled",)
+        if occ is None or occ.item_id != item.id or occ.status in gone:
             occ = await current_occurrence(session, item.id)
             if occ is not None and occ.status == "cancelled":
                 occ = None
@@ -592,22 +615,38 @@ async def find_edit_candidates(
     deleted, matching ``hint``; the nearest open occurrence (by |due - now|) first, then rank.
 
     All words must match (or a tag equals one of them); if nothing does, any word may (stop words are ignored by
-    the FTS config). ``exact=True`` (an optional extension of the contract): only items that match every word
-    (full text) or whose title contains the hint — no tag-only match, no any-word fallback.
+    the FTS config). ``exact=True`` (an optional extension of the contract): only items whose own words match —
+    every word in the title / details (full text, not the message the item came from: the items of one message
+    share it), or the hint as whole words of the title ("чай" is not in "случайно") — no tag-only match, no any-word
+    fallback.
     """
     hint = (hint or "").strip()
     if not hint:
         return []
     now = _utc(now)
-    rows = await _edit_candidates(session, hint, _tsquery(hint), now, limit, tags=not exact)
+    tsq = _tsquery(hint)
+    if exact:
+        return await _edit_candidates(session, tsq, now, limit, match=_own_words_match(hint, tsq))
+    rows = await _edit_candidates(session, tsq, now, limit, match=_matches(hint, tsq))
     words = [w for w in _WORD_RE.findall(hint) if w.lower() != "or"]
-    if not rows and len(words) > 1 and not exact:
-        rows = await _edit_candidates(session, hint, _tsquery(" or ".join(words)), now, limit)
+    if not rows and len(words) > 1:
+        any_word = _tsquery(" or ".join(words))
+        rows = await _edit_candidates(session, any_word, now, limit, match=_matches(hint, any_word))
     return rows
 
 
+def _own_words_match(hint: str, tsq: ColumnElement[Any]) -> ColumnElement[bool]:
+    """The item's title / details match every word of ``hint`` (full text), or its title has ``hint`` as whole
+    words."""
+    own = func.to_tsvector(_RU, func.concat_ws(" ", Item.title, Item.details)).op("@@", is_comparison=True)(tsq)
+    words = re.findall(r"\w+", hint)  # letters and digits only: nothing to escape in the pattern
+    if not words:
+        return own
+    return or_(own, Item.title.op("~*")(r"\m" + r"\W+".join(words) + r"\M"))
+
+
 async def _edit_candidates(
-    session: AsyncSession, hint: str, tsq: ColumnElement[Any], now: datetime, limit: int, *, tags: bool = True
+    session: AsyncSession, tsq: ColumnElement[Any], now: datetime, limit: int, *, match: ColumnElement[bool]
 ) -> list[Row]:
     cutoff = now - timedelta(days=EDIT_WINDOW_DAYS)
     occ = _occ_subquery(open_only=True)
@@ -617,7 +656,7 @@ async def _edit_candidates(
         .where(
             Item.status != "deleted",
             or_(Item.status == "open", Item.created_at >= cutoff, Item.updated_at >= cutoff),
-            _matches(hint, tsq, tags=tags),
+            match,
         )
         .order_by(
             distance.asc().nulls_last(),

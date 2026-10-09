@@ -35,13 +35,16 @@ log = logging.getLogger(__name__)
 View = views.View
 
 
-async def card_view(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> View:
-    """Fresh card of an item: current occurrence and its pending reminders (deleted -> ``deleted_card``)."""
+async def card_view(
+    session: AsyncSession, item: Item, prefs: Prefs, now: datetime, *, heard: str | None = None
+) -> View:
+    """Fresh card of an item: current occurrence and its pending reminders (deleted -> ``deleted_card``); ``heard``:
+    see ``render_card``."""
     if item.status == "deleted":
         return views.deleted_card(item)
     occ = await items.current_occurrence(session, item.id)
     reminders = await items.pending_reminders(session, occ.id) if occ is not None else []
-    return await render_card(session, item, occ, reminders, prefs, now)
+    return await render_card(session, item, occ, reminders, prefs, now, heard=heard)
 
 
 async def render_card(

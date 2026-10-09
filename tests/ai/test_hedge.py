@@ -135,7 +135,7 @@ async def test_slow_primary_gets_the_fallback_in_parallel_and_the_first_valid_an
     assert (lost.input_tokens, lost.output_tokens, lost.cost_usd) == (0, 0, Decimal("0"))  # no answer: not billed
     won = next(r for r in rows if r.model == QWEN)
     assert won.cost_usd == Decimal(f"{900 * 0.104 / 1e6 + 100 * 0.416 / 1e6:.6f}")
-    assert client.cooldown_left(GEMMA) == 0  # slow is not broken: no pause
+    assert client.cooldown_left(GEMMA) == 0  # one slow answer is not an outage (two lost races in a row are)
     await assert_cleaned_up(http, loop_problems)
 
 
@@ -240,9 +240,9 @@ async def test_no_parallel_request_when_turned_off(fake, make_settings):
     assert fake.chat_models == [GEMMA]
 
 
-async def test_no_parallel_request_to_a_paused_fallback(fake, hedged):
+async def test_no_parallel_request_while_the_fallback_asks_to_retry_later(fake, hedged):
     client = ChutesClient(hedged)
-    fake.chat_error(503, UNAVAILABLE, model=QWEN)
+    fake.chat_error(429, "Too Many Requests", headers={"Retry-After": "60"}, model=QWEN)
     fake.chat_json(GOOD, model=GEMMA, delay=0.5)
     try:
         with pytest.raises(AIUnavailable):
@@ -253,6 +253,29 @@ async def test_no_parallel_request_to_a_paused_fallback(fake, hedged):
         await client.close()
     assert out.model == GEMMA
     assert fake.chat_models == [GEMMA]
+    assert 50 < client.retry_after_left(QWEN) <= 60
+
+
+async def test_a_paused_fallback_is_still_asked_in_parallel(fake, hedged, http, loop_problems):
+    # Message 1: the slow primary wins after the parallel fallback answered 503 (the fallback is now paused).
+    client = ChutesClient(hedged, http=http)
+    fake.chat_json(GOOD, model=GEMMA, delay=0.6)
+    fake.chat_error(503, UNAVAILABLE, model=QWEN)
+    assert (await extract(client, hedged, make_input())).model == GEMMA
+    assert client.cooldown_left(QWEN) > 0 and client.retry_after_left(QWEN) == 0
+
+    # Message 2: the primary hangs; the fallback is still asked after the hedge, not after the primary's timeout.
+    fake.chat_requests.clear()
+    fake.chat_json(GOOD, model=GEMMA, delay=HANG)
+    fake.chat_json(OTHER, model=QWEN)
+    started = time.monotonic()
+    out = await extract(client, hedged, make_input())
+    elapsed = time.monotonic() - started
+
+    assert out.model == QWEN and fake.chat_models == [GEMMA, QWEN]
+    assert HEDGE <= elapsed < 2.0  # the primary's timeout is 5 s
+    assert client.cooldown_left(QWEN) == 0  # its answer lifted the pause
+    await assert_cleaned_up(http, loop_problems)
 
 
 async def test_cancelling_the_caller_cancels_both_calls(fake, hedged, sessionmaker, http, loop_problems):
@@ -418,11 +441,108 @@ async def test_paused_primary_and_unusable_fallback_wait_for_the_pause_to_end(fa
 
     fake.chat_requests.clear()
     fake.chat_ok("garbage", model=QWEN)
+    fake.chat_ok("garbage again", model=QWEN)
     with pytest.raises(AIUnavailable) as ei:
         await extract(client, settings, make_input())
 
-    assert fake.chat_models == [QWEN]
+    assert fake.chat_models == [QWEN, QWEN]  # standing in for the primary, it got the primary's repair retry
     assert settings.llm_cooldown_s - 10 < ei.value.retry_after <= settings.llm_cooldown_s
+
+
+async def test_fallback_standing_in_for_a_paused_primary_gets_the_repair_retry(fake, client, settings):
+    fake.chat_error(503, UNAVAILABLE, model=GEMMA)
+    fake.chat_json(GOOD, model=QWEN)
+    await extract(client, settings, make_input())
+
+    fake.chat_requests.clear()
+    fake.chat_json({"intent": "save", "items": [{"kind": "chore", "title": "Позвонить маме"}]}, model=QWEN)
+    fake.chat_json(OTHER, model=QWEN)
+    out = await extract(client, settings, make_input())
+
+    assert out.model == QWEN and out.extraction.items[0].kind == "task"
+    assert fake.chat_models == [QWEN, QWEN]
+    assert "invalid" in fake.chat_requests[1]["messages"][-1]["content"]
+
+
+async def test_missing_fallback_sends_the_message_to_the_paused_primary(fake, client, settings):
+    fake.chat_error(503, UNAVAILABLE, model=GEMMA)
+    fake.chat_error(404, NOT_FOUND, model=QWEN)
+    with pytest.raises(AIUnavailable):
+        await extract(client, settings, make_input())
+    assert client.cooldown_left(GEMMA) > 0 and client.is_missing(QWEN)
+
+    # The primary works again: it answers at once instead of the message waiting out its 10-minute pause.
+    fake.chat_requests.clear()
+    fake.chat_json(GOOD, model=GEMMA)
+    out = await extract(client, settings, make_input())
+
+    assert fake.chat_models == [GEMMA]  # a fallback known to be missing is not skipped to
+    assert (out.model, out.missing_model, out.missing_fallback) == (GEMMA, None, QWEN)
+    assert client.cooldown_left(GEMMA) == 0
+
+
+async def test_fallback_found_missing_while_standing_in_hands_back_to_the_primary(fake, client, settings):
+    fake.chat_error(503, UNAVAILABLE, model=GEMMA)
+    fake.chat_json(GOOD, model=QWEN)
+    await extract(client, settings, make_input())  # the primary is paused, the fallback was fine
+
+    fake.chat_requests.clear()
+    fake.chat_error(404, NOT_FOUND, model=QWEN)  # ... and now it is retired
+    fake.chat_json(OTHER, model=GEMMA)
+    out = await extract(client, settings, make_input())
+
+    assert fake.chat_models == [QWEN, GEMMA]
+    assert (out.model, out.missing_fallback) == (GEMMA, QWEN)
+    assert out.extraction.items[0].title == "Позвонить маме"
+
+
+async def test_missing_fallback_and_failing_primary_leave_it_to_the_queue(fake, client, settings):
+    fake.chat_error(503, UNAVAILABLE, model=GEMMA)
+    fake.chat_json(GOOD, model=QWEN)
+    await extract(client, settings, make_input())
+
+    fake.chat_requests.clear()
+    fake.chat_error(404, NOT_FOUND, model=QWEN)
+    fake.chat_error(503, UNAVAILABLE, model=GEMMA)
+    with pytest.raises(AIUnavailable) as ei:
+        await extract(client, settings, make_input())
+
+    assert fake.chat_models == [QWEN, GEMMA]
+    assert ei.value.retry_after is None  # the primary's own error: the queue's usual backoff, not the 10-min pause
+
+
+async def test_a_hanging_primary_is_paused_after_two_lost_races(fake, hedged, http, loop_problems):
+    client = ChutesClient(hedged, http=http)
+    for _ in range(2):
+        fake.chat_json(GOOD, model=GEMMA, delay=HANG)
+        fake.chat_json(OTHER, model=QWEN)
+    fake.chat_json(OTHER, model=QWEN)
+
+    assert (await extract(client, hedged, make_input())).model == QWEN
+    assert client.cooldown_left(GEMMA) == 0  # one slow answer is not an outage
+    assert (await extract(client, hedged, make_input())).model == QWEN
+    assert hedged.llm_cooldown_s - 10 < client.cooldown_left(GEMMA) <= hedged.llm_cooldown_s
+
+    fake.chat_requests.clear()
+    started = time.monotonic()
+    assert (await extract(client, hedged, make_input())).model == QWEN
+    assert time.monotonic() - started < HEDGE  # straight to the fallback, no doomed primary request
+    assert fake.chat_models == [QWEN]
+    await assert_cleaned_up(http, loop_problems)
+
+
+async def test_an_answer_of_the_primary_resets_its_lost_races(fake, hedged, http, loop_problems):
+    client = ChutesClient(hedged, http=http)
+    fake.chat_json(GOOD, model=GEMMA, delay=HANG)
+    fake.chat_json(OTHER, model=QWEN)
+    fake.chat_json(GOOD, model=GEMMA)  # fast
+    fake.chat_json(GOOD, model=GEMMA, delay=HANG)
+    fake.chat_json(OTHER, model=QWEN)
+
+    for model in (QWEN, GEMMA, QWEN):
+        assert (await extract(client, hedged, make_input())).model == model
+    assert client.cooldown_left(GEMMA) == 0  # lost, answered, lost: not two in a row
+    await assert_cleaned_up(http, loop_problems)
 
 
 async def test_paused_primary_sends_images_to_the_vision_fallback(fake, settings, sessionmaker):

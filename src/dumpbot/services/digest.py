@@ -1,12 +1,13 @@
 """Data for the morning / evening digests (architecture.md §4.15). Rendering lives in ``bot.views``.
 
 An evening digest the bot was down for goes into the next morning digest (docs/features/iteration-3.md §5): the
-scheduler marks its day with ``folded_key``, and the morning digest of the day after carries that day's agenda as
-``DigestData.yesterday`` ("Вчерашний итог (не успел прислать)").
+scheduler marks its day with ``folded_key`` (only when ``day_summary`` has something to say), and the morning digest
+of the day after carries that day's summary as ``DigestData.yesterday`` ("Вчерашний итог (не успел прислать)").
 """
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from typing import Literal, cast
 
@@ -18,7 +19,17 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, DigestData
 from dumpbot.services import items, query
 
-__all__ = ["DigestData", "build_digest", "day_moment", "digest_data", "folded_key", "missed_evening", "move_not_done"]
+__all__ = [
+    "DigestData",
+    "build_digest",
+    "day_moment",
+    "day_summary",
+    "digest_data",
+    "folded_key",
+    "has_summary",
+    "missed_evening",
+    "move_not_done",
+]
 
 DigestKind = Literal["morning", "evening"]
 
@@ -36,7 +47,7 @@ async def build_digest(session: AsyncSession, kind: str, prefs: Prefs, now: date
     if kind == "morning":
         yesterday = data.yesterday
         empty = not agenda.open and not agenda.overdue and not agenda.period_items
-        empty = empty and (yesterday is None or (not yesterday.open and not yesterday.done))
+        empty = empty and (yesterday is None or not has_summary(yesterday))
     else:
         empty = not agenda.open and not agenda.done and not agenda.overdue
     return None if empty else data
@@ -59,12 +70,25 @@ def folded_key(day: date) -> str:
 
 
 async def missed_evening(session: AsyncSession, day: date, prefs: Prefs) -> Agenda | None:
-    """The agenda of the day before ``day`` when its evening digest was folded into ``day``'s morning digest
-    (``folded_key``), else None. Its ``open`` rows are what was not done (``done``: what was)."""
+    """``day_summary`` of the day before ``day`` when its evening digest was folded into ``day``'s morning digest
+    (``folded_key``), else None."""
     before = day - timedelta(days=1)
     if await session.get(OnceKey, folded_key(before)) is None:
         return None
-    return await query.agenda(session, prefs, day_moment(before, prefs))
+    return await day_summary(session, before, prefs)
+
+
+async def day_summary(session: AsyncSession, day: date, prefs: Prefs) -> Agenda:
+    """The agenda of local ``day`` as its evening summary: ``open`` what is still not done, ``done`` what was done
+    that day or, due that day, since then (its reminder came late, in the morning, and was ticked there)."""
+    agenda = await query.agenda(session, prefs, day_moment(day, prefs))
+    later = await query.done_after_day(session, prefs, day)
+    return replace(agenda, done=[*agenda.done, *later])
+
+
+def has_summary(agenda: Agenda) -> bool:
+    """A day's summary says something: something was due that day (done or not) or done on it."""
+    return bool(agenda.open or agenda.done)
 
 
 def day_moment(day: date, prefs: Prefs) -> datetime:

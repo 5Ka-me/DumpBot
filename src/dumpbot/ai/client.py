@@ -10,8 +10,11 @@ Error mapping (chutes answers with these in the wild):
 - anything else -> ``AIBadResponse``
 
 Pause (docs/features/iteration-3.md §1): a 408 / 429 / 5xx or a timeout puts the model on a pause of
-``llm_cooldown_s`` (in process memory, per model; any 200 lifts it). The client only keeps the pause, ``extract``
-decides what to skip (``cooldown_left``).
+``llm_cooldown_s`` (in process memory, per model; any 200 lifts it), and so do ``LOST_HEDGES_TO_PAUSE`` parallel
+races in a row that the model lost without answering (``note_lost_hedge``: a hanging model is cancelled long before its
+own timeout). A ``Retry-After`` of such an error is kept too (``retry_after_left``, at most as long as the pause), and
+a 404 marks the model missing until it answers (``is_missing``). The client only keeps this state, ``extract`` decides
+what to skip.
 
 A call cancelled by its caller (``HEDGE_LOST``: the parallel request of the other model answered first, or a
 shutdown) is recorded with ``ok=False`` and ``error="cancelled: <reason>"``; its tokens and cost only when the answer
@@ -46,6 +49,9 @@ PRICE_FETCH_TIMEOUT_S = 10.0
 SEED = 7
 # Task.cancel() message for the call whose parallel twin gave a valid answer first (docs/features/iteration-3.md §1).
 HEDGE_LOST = "hedge lost"
+# Races lost in a row without an answer after which the model is paused like after a timeout: a hanging model never
+# reaches its own timeout while the parallel request keeps winning.
+LOST_HEDGES_TO_PAUSE = 2
 
 # response_format levels tried in order when the API rejects a request with HTTP 400.
 LEVEL_SCHEMA = 0  # json_schema (strict) + chat_template_kwargs
@@ -220,6 +226,9 @@ class ChutesClient:
         self._prices_valid_until: datetime | None = None
         self._prices_lock = asyncio.Lock()
         self._paused_until: dict[str, float] = {}  # model -> time.monotonic() its pause ends
+        self._retry_until: dict[str, float] = {}  # model -> time.monotonic() its Retry-After ends (within the pause)
+        self._lost_hedges: dict[str, int] = {}  # model -> races lost in a row without an answer
+        self._missing: set[str] = set()  # models that answered 404 and have not answered since
 
     async def close(self) -> None:
         if self._own_http and self._http is not None and not self._http.closed:
@@ -246,15 +255,50 @@ class ChutesClient:
             return 0.0
         return left
 
-    def _pause(self, model: str, reason: str) -> None:
+    def retry_after_left(self, model: str) -> float:
+        """Seconds the ``Retry-After`` of the model's last 408 / 429 / 5xx still asks to wait (never past its pause);
+        0.0 when there is none."""
+        until = self._retry_until.get(model)
+        if until is None:
+            return 0.0
+        left = min(until - time.monotonic(), self.cooldown_left(model))
+        if left <= 0:
+            del self._retry_until[model]
+            return 0.0
+        return left
+
+    def is_missing(self, model: str) -> bool:
+        """The model answered 404 (renamed, retired, a typo) and has not answered since."""
+        return model in self._missing
+
+    def note_lost_hedge(self, model: str) -> None:
+        """The model's call was cancelled because the parallel request of the other model answered first. After
+        ``LOST_HEDGES_TO_PAUSE`` such races in a row (no answer of the model between them) it is paused like after
+        a timeout: it hangs, and asking it first only delays every message by the hedge."""
+        lost = self._lost_hedges.get(model, 0) + 1
+        if lost >= LOST_HEDGES_TO_PAUSE:
+            self._lost_hedges.pop(model, None)
+            self._pause(model, f"{lost} lost parallel races in a row")
+        else:
+            self._lost_hedges[model] = lost
+
+    def _pause(self, model: str, reason: str, retry_after: float | None = None) -> None:
         seconds = self._settings.llm_cooldown_s
         if seconds <= 0:
             return
         if not self.cooldown_left(model):
             log.warning("model %s paused for %g s after %s", model, seconds, reason)
-        self._paused_until[model] = time.monotonic() + seconds
+        now = time.monotonic()
+        self._paused_until[model] = now + seconds
+        if retry_after:
+            self._retry_until[model] = now + min(retry_after, seconds)
+        else:
+            self._retry_until.pop(model, None)
 
     def _unpause(self, model: str) -> None:
+        self._retry_until.pop(model, None)
+        self._lost_hedges.pop(model, None)
+        self._missing.discard(model)
         if self._paused_until.pop(model, None) is not None:
             log.info("model %s answers again, pause lifted", model)
 
@@ -352,7 +396,9 @@ class ChutesClient:
             err = http_error(status, raw, headers)
             log.warning("chutes %s for %s (%s): %s", status, model, purpose, snippet)
             if isinstance(err, AIUnavailable):
-                self._pause(model, f"HTTP {status}")
+                self._pause(model, f"HTTP {status}", err.retry_after)
+            elif isinstance(err, AIModelNotFound):
+                self._missing.add(model)
             raise err
         self._unpause(model)
 

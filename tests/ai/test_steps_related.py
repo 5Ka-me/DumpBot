@@ -135,7 +135,7 @@ async def test_split_steps_happy_path(fake, settings, sessionmaker):
         await client.close()
     assert [s.title for s in out.steps] == ["Упаковать вещи", "Заказать машину"]
     assert out.steps[1].when is not None and out.steps[1].when.day == "TH"
-    assert (out.model, out.prompt_version, out.missing_model) == (GEMMA, "v7", None)
+    assert (out.model, out.prompt_version, out.missing_model) == (GEMMA, "v8", None)
     body = fake.chat_requests[0]
     assert body["messages"][0] == {"role": "system", "content": SPLIT_SYSTEM_PROMPT}
     assert body["messages"][1]["content"].endswith(

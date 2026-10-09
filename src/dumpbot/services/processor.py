@@ -29,11 +29,13 @@ by its last step are followed by "🎉 Все шаги выполнены" (``ca
 Edits by description (docs/features/iteration-3.md §3): "закрой задачу про документацию" with one exact match among
 the open items is applied at once and answered with what changed and [↩️ Отменить] (``services.undo`` keeps the
 difference with the raw message); with several the owner picks one, and the pick gets the edit already read from the
-message (``EDIT_KEY``, no second AI call).
+message (``EDIT_KEY``, no second AI call). "Exact" is about the item's own words (title / details), never the message
+it came from, so the items of one message are told apart; new items said with the edit are saved too.
 
 Voice notes (§6): every reply to one shows what was heard, "🎤 «…»" (cards: ``CardExtras.heard``; answers, questions,
 candidate lists and edits: the line on top). One that gave only notes / ideas (otherwise just 👌) gets the short
-"🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить], so that a garbled transcript shows at once.
+"🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] (a message per item), so that a garbled transcript
+shows at once.
 
 Data changes are committed before their cards are sent (a lost card never duplicates items); replies that change
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
@@ -448,7 +450,7 @@ async def _split(
     if problem is not None or snapshot is None:
         await _mark_done(ctx, raws, image_text, note=problem, edited=[item_id])
         if not app:
-            await _show_split(ctx, prefs, item_id, problem, reply_to=reply_to, raw_id=raw_id)
+            await _show_split(ctx, prefs, item_id, problem, reply_to=reply_to, raw_id=raw_id, heard=_heard(raws))
         await _react(ctx, raws, sender.REACT_SAVED)
         return _outcome(False, "has_steps" if problem == HAS_STEPS_TEXT else "cant_split", problem)
     task = {k: v for k, v in snapshot.items() if k in SPLIT_TASK_FIELDS and v not in (None, "", [])}
@@ -486,13 +488,14 @@ async def _present_split(
     card_message: int | None,
     raws: Sequence[RawMessage],
 ) -> None:
-    """The checklist in the chat: the button's card redrawn in place, else a new card (``why`` above it)."""
+    """The checklist in the chat: the button's card redrawn in place, else a new card (``why`` above it; in reply to
+    a voice note with what was heard)."""
     reply_to = raws[0].message_id if raws else card_message
     raw_id = raws[0].id if raws else None
     if created and card_message is not None and not raws:
         await _redraw_card(ctx, prefs, item_id, card_message)
     else:
-        await _show_split(ctx, prefs, item_id, why, reply_to=reply_to, raw_id=raw_id)
+        await _show_split(ctx, prefs, item_id, why, reply_to=reply_to, raw_id=raw_id, heard=_heard(raws))
 
 
 async def _split_problem(session: AsyncSession, item: Any) -> str | None:
@@ -540,14 +543,22 @@ async def _split_call(
 
 
 async def _show_split(
-    ctx: AppContext, prefs: Prefs, item_id: int, note: str | None, *, reply_to: int | None, raw_id: int | None = None
+    ctx: AppContext,
+    prefs: Prefs,
+    item_id: int,
+    note: str | None,
+    *,
+    reply_to: int | None,
+    raw_id: int | None = None,
+    heard: str | None = None,
 ) -> None:
-    """A new card of the item (with ``note`` above it) in reply to ``reply_to``."""
+    """A new card of the item (with ``note`` above it) in reply to ``reply_to``; ``heard``: the transcript of the
+    voice note it answers (instead of the one the item came from)."""
     async with ctx.sessionmaker() as session:
         item = await items_svc.get_item(session, item_id)
         if item is None:
             return
-        text, markup = await cards.card_view(session, item, prefs, clock.utcnow())
+        text, markup = await cards.card_view(session, item, prefs, clock.utcnow(), heard=heard)
         occ = await items_svc.current_occurrence(session, item_id)
         await session.commit()
     await _send(
@@ -648,20 +659,34 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
 
 
 async def _extract(ctx: AppContext, prefs: Prefs, inp: ExtractInput) -> ExtractOutput:
-    """``extract()``; when the fallback stood in for a missing (404) primary model, tell the owner once a day."""
+    """``extract()``; when the fallback stood in for a missing (404) primary model, or the fallback itself is missing,
+    tell the owner once a day (each)."""
     out = await extract(ctx.ai, ctx.settings, inp)
+    day = clock.utcnow().astimezone(prefs.zone).date().isoformat()
     if out.missing_model:
-        async with ctx.sessionmaker() as session:
-            first = await try_once(session, f"aimodel:{clock.utcnow().astimezone(prefs.zone).date().isoformat()}")
-            await session.commit()
-        if first:
-            text = (
-                f"⚠️ Модели <code>{views.esc(out.missing_model)}</code> нет на chutes.ai (404), "
-                f"пока работаю на запасной <code>{views.esc(out.model)}</code>.\n"
-                "Проверь LLM_MODEL в .env."
-            )
-            await _send(ctx, text, prefs=prefs, purpose="notice")
+        text = (
+            f"⚠️ Модели <code>{views.esc(out.missing_model)}</code> нет на chutes.ai (404), "
+            f"пока работаю на запасной <code>{views.esc(out.model)}</code>.\n"
+            "Проверь LLM_MODEL в .env."
+        )
+        await _notice_once(ctx, prefs, f"aimodel:{day}", text)
+    if out.missing_fallback:
+        setting = "VISION_FALLBACK_MODEL" if inp.images else "LLM_FALLBACK_MODEL"
+        text = (
+            f"⚠️ Запасной модели <code>{views.esc(out.missing_fallback)}</code> нет на chutes.ai (404): "
+            "когда основная занята, подменить её некому.\n"
+            f"Проверь {setting} в .env."
+        )
+        await _notice_once(ctx, prefs, f"aifallback:{out.missing_fallback}:{day}", text)
     return out
+
+
+async def _notice_once(ctx: AppContext, prefs: Prefs, key: str, text: str) -> None:
+    async with ctx.sessionmaker() as session:
+        first = await try_once(session, key)
+        await session.commit()
+    if first:
+        await _send(ctx, text, prefs=prefs, purpose="notice")
 
 
 async def _dispatch(
@@ -763,19 +788,20 @@ async def _save(
         return
     heard = _heard(raws)
     if heard and created and not shown and not _is_app(raws):
-        # Only notes / ideas from a voice note: no card, but the owner sees what was heard (a garbled transcript).
-        saved = [c.item for c in created]
-        text, markup = views.heard_items(heard, saved)
-        await _send(
-            ctx,
-            text,
-            markup,
-            prefs=prefs,
-            reply_to=primary.message_id,
-            purpose=sender.PURPOSE_HEARD,
-            item_id=saved[0].id if len(saved) == 1 else None,
-            raw_message_id=primary.id,
-        )
+        # Only notes / ideas from a voice note: no card, but the owner sees what was heard (a garbled transcript) —
+        # a message per item, so that its buttons and a reply to it are about that item alone.
+        for saved in created:
+            text, markup = views.heard_item(heard, saved.item)
+            await _send(
+                ctx,
+                text,
+                markup,
+                prefs=prefs,
+                reply_to=primary.message_id,
+                purpose=sender.PURPOSE_HEARD,
+                item_id=saved.item.id,
+                raw_message_id=primary.id,
+            )
     for created_item, (text, markup) in shown:
         occ = created_item.occurrence
         await _send(
@@ -906,7 +932,8 @@ async def _edit_by_target(
     edit read from the message is kept with it (``EDIT_KEY``) and applied to the picked item without asking the AI
     again. The Mini App has no [↩️ Отменить]: there delete / done / no_reminder / stop_recurrence still wait for the
     pick, even for one match. Nothing found -> the message is kept as a note and its card says so: it may be a new
-    task worded like an edit («удалить приложение банка»)."""
+    task worded like an edit («удалить приложение банка»). New items the model found in the same message ("купил
+    молоко, хлеба не было — купить завтра") are saved as well, after the edit (``_with_items``)."""
     primary = raws[0]
     patch = out.extraction.edit or EditPatch()
     image_text = _image_text(out.extraction)
@@ -923,18 +950,30 @@ async def _edit_by_target(
     single = _single_match(rows, patch.action) if exact else None
     if single is None or (_is_app(raws) and patch.action in CONFIRM_ACTIONS):
         await _send_candidates(ctx, prefs, raws, rows, image_text, patch=patch)
-        return
-    if patch.action == "split":  # "разбей переезд на шаги"
+    elif patch.action == "split":  # "разбей переезд на шаги"
         await _split(ctx, prefs, single.item_id, now=now, note=content.text, raws=raws, image_text=image_text)
-        return
-    await _apply_edit(ctx, prefs, raws, single.item_id, patch, now=now, image_text=image_text)
+    else:
+        await _apply_edit(ctx, prefs, raws, single.item_id, patch, now=now, image_text=image_text)
+    if (also := _with_items(out)) is not None:
+        await _save(ctx, raws, content, also, prefs, replace=False, related=related)
+
+
+def _with_items(out: ExtractOutput) -> ExtractOutput | None:
+    """The new items of an edit by description, when the message asked for more than the edit (else None): they
+    are saved like any message, nothing it said is lost."""
+    ext = out.extraction
+    if not ext.items:
+        return None
+    extraction = Extraction(intent="save", items=ext.items, image=ext.image)
+    return ExtractOutput(extraction=extraction, model=out.model, prompt_version=out.prompt_version)
 
 
 def _single_match(rows: Sequence[Row], action: str) -> Row | None:
     """The item an edit by description is about without asking: the only exact match among the open items (among
-    the done ones for "undone"), else the only exact match there is; None when it is not clear."""
+    the done ones for "undone"; for "done" an open task, event or purchase: an open note or idea is never closed
+    in place of a task that is done already), else the only exact match there is; None when it is not clear."""
     wanted = "done" if action == "undone" else "open"
-    pool = [r for r in rows if r.status == wanted]
+    pool = [r for r in rows if r.status == wanted and (action != "done" or r.kind in ACTIONABLE)]
     if len(pool) == 1:
         return pool[0]
     return rows[0] if len(rows) == 1 else None
@@ -1528,7 +1567,7 @@ async def _give_up(
             await session.commit()
     await _send(
         ctx,
-        text,
+        _with_heard_text(text, raws),
         prefs=prefs,
         reply_to=reply_to,
         purpose="notice",
@@ -1613,7 +1652,13 @@ async def _tell(ctx: AppContext, raws: list[RawMessage], text: str, *, prefs: Pr
             await session.commit()
         return
     primary = raws[0]
+    text = _with_heard_text(text, raws)
     await _send(ctx, text, prefs=prefs, reply_to=primary.message_id, purpose=purpose, raw_message_id=primary.id)
+
+
+def _with_heard_text(text: str, raws: Sequence[RawMessage]) -> str:
+    """A reply to a voice note with the "🎤 «…»" line on top (§6: the owner sees what a garbled transcript was)."""
+    return views.with_heard((text, None), _heard(raws))[0]
 
 
 async def _fail_raws(ctx: AppContext, job: Job) -> RawMessage | None:

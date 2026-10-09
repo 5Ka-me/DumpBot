@@ -14,8 +14,9 @@ from aiogram.methods import SendMessage
 
 from dumpbot.db.models import AppState, OnceKey, Reminder
 from dumpbot.domain.prefs import Prefs
-from dumpbot.services import digest
-from dumpbot.workers.scheduler import LAST_TICK_KEY, Scheduler
+from dumpbot.services import digest, items
+from dumpbot.workers import scheduler as scheduler_module
+from dumpbot.workers.scheduler import DOWNTIME_KEY, LAST_TICK_KEY, Scheduler
 
 OWNER = 4242
 
@@ -314,3 +315,152 @@ async def test_held_reminder_not_lost_to_the_grace_but_lost_to_a_second_long_gap
     await scheduler.tick(local(2026, 10, 7, 14, 30))  # down again over 08:00: 6 h 30 min after its new time
     assert (await get(Reminder, mom.reminders[0].id)).status == "missed"
     assert texts(bot)[-1].endswith("Не прислал устаревших напоминаний: 1 — эти дела в /today.")
+
+
+# --- review fixes -------------------------------------------------------------------------------------------------
+
+
+async def test_a_restart_right_after_waking_up_still_folds_and_reports(ctx, make_items, t0, bot, local, get) -> None:
+    await mom_at_20(make_items, t0)
+    first = Scheduler(ctx)
+    await first.tick(local(2026, 10, 6, 19, 0))
+    # 23:19: the PC wakes up, the tick is stored ... and the process dies before its digests step (Docker restarting)
+    await first._note_tick(local(2026, 10, 6, 23, 19))
+    stored = await get(AppState, DOWNTIME_KEY)
+    assert stored.value == {
+        "start": local(2026, 10, 6, 19, 0).isoformat(),
+        "end": local(2026, 10, 6, 23, 19).isoformat(),
+    }
+
+    await Scheduler(ctx).tick(local(2026, 10, 6, 23, 19, 30))  # the new process: no gap since 23:19
+
+    [notice] = bot.sent
+    assert notice["text"] == (
+        "😴 Меня не было с 19:00 до 23:19 (компьютер спал?). Опоздало напоминаний: 1 — пришлю в 08:00. "
+        "Итог дня — в утреннем дайджесте."
+    )
+    assert await get(OnceKey, digest.folded_key(local(2026, 10, 6, 12, 0).date())) is not None
+    assert await get(AppState, DOWNTIME_KEY) is None  # handled: a later restart does not report it again
+
+
+async def test_a_fold_done_before_a_restart_is_still_reported(ctx, make_items, t0, bot, local, get) -> None:
+    await mom_at_20(make_items, t0)
+    first = Scheduler(ctx)
+    await first.tick(local(2026, 10, 6, 19, 0))
+    bot.fail("send_message", RuntimeError("the process is killed while it sends the notice"))
+    await first.tick(local(2026, 10, 6, 23, 19))  # folded, reminder held; the notice did not go out
+    assert await get(OnceKey, digest.folded_key(local(2026, 10, 6, 12, 0).date())) is not None
+
+    await Scheduler(ctx).tick(local(2026, 10, 6, 23, 20))
+
+    assert texts(bot)[-1].endswith("Итог дня — в утреннем дайджесте.")
+
+
+async def test_overdue_items_alone_do_not_fold_the_missed_evening(ctx, make_items, t0, bot, local, get) -> None:
+    yesterday = t0.replace(day=5)
+    await make_items({"kind": "task", "title": "Старое", "when": {"time": "18:00"}}, now=yesterday)
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(local(2026, 10, 6, 19, 0))
+    await scheduler.tick(local(2026, 10, 6, 23, 19))  # nothing was due today: the evening had nothing to sum up
+
+    assert await get(OnceKey, "digest:evening:2026-10-06") is not None
+    assert await get(OnceKey, digest.folded_key(local(2026, 10, 6, 12, 0).date())) is None
+    assert bot.sent == []  # no "Итог дня — в утреннем дайджесте" promise
+    await scheduler.tick(local(2026, 10, 7, 9, 0))
+    [morning] = texts(bot)
+    assert "Вчерашний итог" not in morning and "Старое" in morning  # under "Просрочено", as always
+
+
+async def test_items_closed_from_their_held_reminder_count_in_yesterdays_summary(
+    ctx, make_items, t0, bot, local, get
+) -> None:
+    mom = await mom_at_20(make_items, t0)
+    await make_items({"kind": "task", "title": "Купить хлеб", "when": {"time": "20:30"}}, now=t0)
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(local(2026, 10, 6, 19, 0))
+    await scheduler.tick(local(2026, 10, 6, 23, 19))  # both held until 08:00, the evening digest folded
+    await scheduler.tick(local(2026, 10, 7, 8, 0))  # the held reminders come
+    async with ctx.sessionmaker() as session:  # 08:05: ✅ on mom's
+        await items.mark_done(session, mom.occurrence.id, local(2026, 10, 7, 8, 5), Prefs())
+        await session.commit()
+
+    await scheduler.tick(local(2026, 10, 7, 9, 0))
+
+    morning = texts(bot)[-1]
+    assert "🌙 <b>Вчерашний итог</b> (не успел прислать)\nСделано 1 из 2\n1. 20:30 · 📌 Купить хлеб" in morning
+    assert "Позвонить маме" not in morning
+
+
+async def test_a_morning_digest_for_a_folded_day_closed_in_the_morning_is_still_sent(
+    ctx, set_prefs, make_items, t0, bot, local
+) -> None:
+    mom = await mom_at_20(make_items, t0)
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(local(2026, 10, 6, 19, 0))
+    await scheduler.tick(local(2026, 10, 6, 23, 19))  # the notice promises the summary in the morning digest
+    await scheduler.tick(local(2026, 10, 7, 8, 0))
+    async with ctx.sessionmaker() as session:
+        await items.mark_done(session, mom.occurrence.id, local(2026, 10, 7, 8, 5), Prefs())
+        await session.commit()
+
+    await scheduler.tick(local(2026, 10, 7, 9, 0))  # nothing else today: sent all the same
+
+    assert "🌙 <b>Вчерашний итог</b> (не успел прислать)\nВсё сделано 🎉" in texts(bot)[-1]
+
+
+class FakePace:
+    """``scheduler._monotonic``: moves only when told to (a send under flood control, a frozen process)."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+@pytest.fixture
+def pace(monkeypatch) -> FakePace:
+    fake = FakePace()
+    monkeypatch.setattr(scheduler_module, "_monotonic", fake)
+    return fake
+
+
+def slow_sends(monkeypatch, bot, pace: FakePace, seconds: float) -> None:
+    send = bot.send_message
+
+    async def slow(**kwargs):
+        pace.now += seconds
+        return await send(**kwargs)
+
+    monkeypatch.setattr(bot, "send_message", slow)
+
+
+async def test_a_slow_tick_is_no_downtime(ctx, no_digests, make_items, t0, bot, local, pace, monkeypatch) -> None:
+    before = t0.replace(hour=t0.hour - 1)
+    for title in ("Раз", "Два", "Три"):
+        await make_items({"kind": "event", "title": title, "when": {"time": "10:00"}}, now=before)
+    await make_items({"kind": "event", "title": "Четыре", "when": {"time": "10:10"}}, now=before)
+    slow_sends(monkeypatch, bot, pace, 6 * 60)  # flood control: 6 min per message
+    scheduler = Scheduler(ctx)
+
+    await scheduler.tick(local(2026, 10, 6, 10, 0))  # 3 reminders: the tick ends at 10:18
+    await scheduler.tick(local(2026, 10, 6, 10, 18, 30))
+
+    assert scheduler.downtime is None
+    assert len(bot.sent) == 4 and not any("Меня не было" in t for t in texts(bot))
+    assert "опоздал на 8 мин" in texts(bot)[3]
+
+
+async def test_a_process_frozen_during_a_tick_is_still_a_downtime(
+    ctx, no_digests, make_items, t0, bot, local, pace, monkeypatch
+) -> None:
+    before = t0.replace(hour=t0.hour - 1)
+    await make_items({"kind": "event", "title": "Раз", "when": {"time": "10:00"}}, now=before)
+    await make_items({"kind": "event", "title": "Обед", "when": {"time": "12:00"}}, now=before)
+    slow_sends(monkeypatch, bot, pace, 5 * 3600)  # the PC slept while the 10:00 reminder was being sent
+    scheduler = Scheduler(ctx)
+
+    await scheduler.tick(local(2026, 10, 6, 10, 0))
+    await scheduler.tick(local(2026, 10, 6, 15, 0))
+
+    assert texts(bot)[-1] == "😴 Меня не было с 10:00 до 15:00 (компьютер спал?). Опоздало напоминаний: 1."

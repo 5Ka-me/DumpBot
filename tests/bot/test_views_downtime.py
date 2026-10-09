@@ -203,9 +203,9 @@ def test_item_card_shows_what_was_heard(prefs, at, make_item, make_occ, make_rem
     assert "🎤" not in plain
 
 
-def test_heard_items_for_one_idea(make_item, check_view, buttons):
+def test_heard_item_for_one_idea(make_item, check_view, buttons):
     idea = make_item(id=42, kind="idea", title="Бот, который <сам> предлагает подзадачи")
-    text, kb = check_view(views.heard_items("идея бот который сам предлагает подзадачи", [idea]))
+    text, kb = check_view(views.heard_item("идея бот который сам предлагает подзадачи", idea))
     assert (
         text
         == "🎤 «идея бот который сам предлагает подзадачи» → 💡 Идея «Бот, который &lt;сам&gt; предлагает подзадачи»"
@@ -216,16 +216,14 @@ def test_heard_items_for_one_idea(make_item, check_view, buttons):
     ]
 
 
-def test_heard_items_for_several_notes(make_item, check_view, buttons):
-    saved = [make_item(id=10**12 + n, kind=kind, title=f"Запись {n}") for n, kind in enumerate(["note", "idea"], 1)]
-    text, kb = check_view(views.heard_items("ммм " * 80, saved))
-    assert lines(text)[1:] == ["1. 📝 Заметка «Запись 1»", "2. 💡 Идея «Запись 2»"]
-    assert lines(text)[0].startswith("🎤 «ммм ммм") and lines(text)[0].endswith("…» →")
+def test_heard_item_with_a_long_transcript_and_big_ids(make_item, check_view, buttons):
+    note = make_item(id=10**12 + 1, kind="note", title="Запись 1")
+    text, kb = check_view(views.heard_item("ммм " * 80, note))
+    [line] = lines(text)
+    assert line.startswith("🎤 «ммм ммм") and line.endswith("…» → 📝 Заметка «Запись 1»")
     assert buttons(kb) == [
-        ("✏️ 1", ItemCb(a="edit", id=10**12 + 1).pack()),
-        ("🗑 1", ItemCb(a="del", id=10**12 + 1).pack()),
-        ("✏️ 2", ItemCb(a="edit", id=10**12 + 2).pack()),
-        ("🗑 2", ItemCb(a="del", id=10**12 + 2).pack()),
+        ("✏️ Изменить", ItemCb(a="edit", id=10**12 + 1).pack()),
+        ("🗑 Не то — удалить", ItemCb(a="del", id=10**12 + 1).pack()),
     ]
 
 

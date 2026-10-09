@@ -8,9 +8,11 @@ item and of its checklist (a parent closes its open steps, the last step closes 
 ``apply`` runs ``items.apply_patch`` between two reads of the item's family (the top-level item and all its steps:
 whatever an edit can touch) and keeps only the difference, as JSON the caller stores with the raw message
 (``keep``: ``raw_json[ingest.UNDO_KEY][item id]``) — the changed rows before and after, the occurrences and reminders
-the edit created. ``undo_edit`` locks the family and checks that each of those rows is still as the edit left it and
-that nothing was added since (the item's ``updated_at`` catches any later change of it — another edit, a button —
-and a reminder that went off or the next instance of a series show in the rows): a stale undo changes nothing. Then
+the edit created, and the other items of the family as the edit left them (``rest``). ``undo_edit`` locks the family
+and checks that each of those rows is still as the edit left it and that nothing was added since (the items'
+``updated_at`` catches any later change of one of them — another edit, a button, a tick of another step that closed
+the parent — and a reminder that went off or the next instance of a series show in the rows): a stale undo changes
+nothing, so it never leaves a checklist that disagrees with its parent. Then
 the created rows are deleted and the changed ones get their old values back; occurrences that move go through a
 parking time first, because UNIQUE(item_id, due_at) is checked row by row. The state is read with column selects,
 fresh from the database (never from objects the session may hold).
@@ -197,6 +199,8 @@ async def undo_edit(session: AsyncSession, raw_id: int, item_id: int, now: datet
         return MISSING
     if snap.get("undone"):
         return ALREADY
+    if set(await _family(session, item_id)) != set(family):  # a step added (or moved away) since
+        return STALE
     if not _as_left(snap, await _read(session, family, known=known)):
         return STALE
     await _put_back(session, snap, now)
@@ -264,6 +268,8 @@ def _diff(item_id: int, family: Sequence[int], before: _State, after: _State) ->
         "item": item_id,
         "family": list(family),
         "items": changed_items,
+        # The rest of the family as the edit left it: a later change of a sibling or the parent makes the undo stale.
+        "rest": {str(i): after.items[i] for i in family if i in after.items and str(i) not in changed_items},
         "occs": _changed(before.occs, after.occs),
         "occs_new": {str(k): v for k, v in sorted(after.occs.items()) if k not in before.occs},
         "rems": _changed(before.rems, after.rems),
@@ -278,11 +284,14 @@ def _changed(before: Mapping[int, Fields], after: Mapping[int, Fields]) -> dict[
 
 
 def _as_left(snap: Mapping[str, Any], now: _State) -> bool:
-    """Every row the edit changed or created is still as it left it, and no occurrence or live reminder was added
-    to the family since."""
+    """Every row the edit changed or created is still as it left it, so is every other item of the family (``rest``;
+    an undo stored before it was kept has none), and no occurrence or live reminder was added to the family since."""
     for part, rows in (("items", now.items), ("occs", now.occs), ("rems", now.rems)):
         if any(rows.get(int(k)) != entry["a"] for k, entry in snap[part].items()):
             return False
+    rest = snap.get("rest")
+    if isinstance(rest, dict) and any(now.items.get(int(k)) != fields for k, fields in rest.items()):
+        return False
     for part, rows in (("occs_new", now.occs), ("rems_new", now.rems)):
         if any(rows.get(int(k)) != fields for k, fields in snap[part].items()):
             return False

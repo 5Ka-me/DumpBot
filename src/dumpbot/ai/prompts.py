@@ -19,6 +19,9 @@ several leads only when asked ("за день и за час"). Role remind no l
 time), so the prompt no longer asks for it.
 v7 (iteration 3, docs/features/iteration-3.md §3): "купил X", "сделал X", "готово: X" about an open task among the
 RELATED CANDIDATES is an edit ``{target: X, action: done}`` (applied at once when exactly one open item matches).
+v8: only when the message just reports that; one that also asks for something new ("купил молоко, хлеба не было —
+купить завтра") is a save, so nothing it says is lost (the code saves the items of an edit too); an example with the
+candidates.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v7"
+PROMPT_VERSION = "v8"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -216,6 +219,10 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
     ("что у меня завтра?", {"intent": "query", "query": {"range": "tomorrow"}}),
     ("когда я записан к стоматологу?", {"intent": "query", "query": {"text": "стоматолог", "answer": "summary"}}),
     (
+        'RELATED CANDIDATES [{"id":40,"kind":"purchase","title":"Купить молоко","date":"2026-10-05"}] | купил молоко',
+        {"intent": "edit", "edit": {"target": "молоко", "action": "done"}},
+    ),
+    (
         "перенеси встречу с Олегом на завтра 16:00",
         {
             "intent": "edit",
@@ -265,7 +272,8 @@ INTENT: save (default) | query = asks about OWN saved data or schedule ("что 
 "какие идеи я сохранял?"); MODE query → always query | edit = changes an EXISTING item ("перенеси", "отмени", \
 "удали", "готово"), with edit.target naming it; REPLYING TO ITEM → always edit (no target).
 Done in the past tense ("купил X", "сделал X", "готово: X") about an open task (in RELATED CANDIDATES) → edit \
-{{target: X, action: done}}; otherwise a past fact.
+{{target: X, action: done}} if the message only reports that (asks for anything new too → save); otherwise a past \
+fact.
 
 ITEMS: split independent things into separate items (one per thing to buy), at most 20; more than 8 things to buy \
 → ONE purchase item with the list in details.

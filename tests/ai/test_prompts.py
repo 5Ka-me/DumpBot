@@ -29,7 +29,7 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v7"
+    assert PROMPT_VERSION == "v8"
 
 
 def test_lead_example_keeps_the_stated_time_in_the_title_and_notifies_before_it():
@@ -111,10 +111,11 @@ def test_static_prompt_size_budget():
     # ~2450 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
     # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60), v5 the 24h-hour and
     # stricter related rules (~35), v6 the notification time and its leads (~80), v7 the past-tense "done" line
-    # (~45); the static prompt is a cacheable prefix.
+    # (~45), v8 its limit to a message that only reports it and an example with the candidates (~60); the static
+    # prompt is a cacheable prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
-    assert estimate < 2465
+    assert estimate < 2530
 
 
 def test_past_tense_done_of_an_open_task_is_an_edit():
@@ -126,6 +127,22 @@ def test_past_tense_done_of_an_open_task_is_an_edit():
     # the shape the line asks for is a valid extraction
     out = Extraction.model_validate({"intent": "edit", "edit": {"target": "Купить молоко", "action": "done"}})
     assert (out.intent, out.edit.target, out.edit.action) == ("edit", "Купить молоко", "done")
+
+
+def test_past_tense_done_is_an_edit_only_when_the_message_says_nothing_else():
+    """v8: "купил молоко, хлеба не было — купить завтра" also asks for something new: a save, so the new task is not
+    lost (an edit carries no items); the example shows the plain report with the open item among the candidates."""
+    line = _line("Done in the past tense")
+    assert "only reports that" in line and "→ save" in line
+    [(src, out)] = [(src, out) for src, out in EXAMPLES if src.endswith("| купил молоко")]
+    assert src.startswith("RELATED CANDIDATES") and '"title":"Купить молоко"' in src
+    extraction = Extraction.model_validate(out)
+    assert (extraction.intent, extraction.edit.target, extraction.edit.action, extraction.items) == (
+        "edit",
+        "молоко",
+        "done",
+        [],
+    )
 
 
 def test_examples_are_valid_extractions_and_rendered():

@@ -965,6 +965,23 @@ async def test_missing_primary_model_is_reported_once_a_day_while_the_fallback_w
     assert len(bot.texts) == 2
 
 
+async def test_missing_fallback_model_is_reported_once_a_day(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:
+    # The primary answers; the fallback answered 404 earlier (it would be no help in the next outage).
+    def on_primary(title: str) -> ExtractOutput:
+        extraction = Extraction.model_validate({"items": [{"kind": "idea", "title": title}]})
+        return ExtractOutput(extraction, "google/gemma", "v1", missing_fallback="Qwen/qwen-gone")
+
+    raws = [await add_raw("идея раз"), await add_raw("идея два")]
+    fake_ai.push(on_primary("Раз"), on_primary("Два"))
+    for raw in raws:
+        await processor.handle_message(ctx, {"raw_id": raw.id})
+        [item] = await items_of_raw(raw.id)
+        assert item.ai_model == "google/gemma"
+    [notice] = bot.texts
+    assert "Qwen/qwen-gone" in notice and "LLM_FALLBACK_MODEL" in notice
+    assert [emoji for _, emoji in bot.reactions] == ["👌", "👌"]
+
+
 # --- unusable AI results (AIBadResponse): no retries ---------------------------------------------------------------
 
 
@@ -1066,3 +1083,100 @@ async def test_on_dead_for_album_and_edit_time(ctx, add_raw, bot, get) -> None:
     await processor.on_dead(ctx, Job(id=2, kind="edit_time", payload={"item_id": 1, "message_id": 9}))
     assert "Не смог применить изменение" in bot.texts[-1]
     assert bot.reactions[-1] == (9, "😢")
+
+
+# --- edits by description: what the item itself is about (review fixes) ---------------------------------------------
+
+MILK_AND_BREAD = {
+    "items": [{"kind": "purchase", "title": "Купить молоко"}, {"kind": "purchase", "title": "Купить хлеб"}]
+}
+
+
+async def milk_and_bread(ctx, add_raw, fake_ai, items_of_raw, bot) -> tuple[Item, Item]:
+    """Two purchases from one message: both keep "купить молоко и хлеб" as their source text."""
+    raw = await add_raw("купить молоко и хлеб")
+    fake_ai.push(MILK_AND_BREAD)
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    milk, bread = await items_of_raw(raw.id)
+    assert milk.source_text == bread.source_text == "купить молоко и хлеб"
+    bot.calls.clear()
+    return milk, bread
+
+
+async def test_bought_x_closes_the_one_item_of_a_shopping_message_at_once(
+    ctx, add_raw, fake_ai, bot, items_of_raw, get
+) -> None:
+    milk, bread = await milk_and_bread(ctx, add_raw, fake_ai, items_of_raw, bot)
+    raw = await add_raw("купил молоко")
+    fake_ai.push({"intent": "edit", "edit": {"target": "молоко", "action": "done"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    [msg] = bot.sent
+    assert msg["text"] == "✅ Закрыл «Купить молоко»"  # not "Какую запись изменить?": bread only shares the message
+    assert [(await get(Item, i.id)).status for i in (milk, bread)] == ["done", "open"]
+
+
+async def test_an_edit_never_lands_on_an_item_that_only_shares_the_message(
+    ctx, add_raw, fake_ai, bot, items_of_raw, get
+) -> None:
+    milk, bread = await milk_and_bread(ctx, add_raw, fake_ai, items_of_raw, bot)
+    async with ctx.sessionmaker() as session:  # milk closed with a button
+        await items.apply_patch(session, milk.id, EditPatch(action="done"), Prefs(), milk.created_at)
+        await session.commit()
+    for text, action in (("закрой молоко", "done"), ("удали молоко", "delete")):
+        raw = await add_raw(text)
+        fake_ai.push({"intent": "edit", "edit": {"target": "молоко", "action": action}})
+        await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert "хлеб" not in " ".join(bot.texts)
+    assert (await get(Item, bread.id)).status == "open"
+    assert (await get(Item, milk.id)).status == "deleted"  # the only item about milk
+
+
+async def test_a_word_inside_another_word_is_no_exact_match(ctx, add_raw, fake_ai, bot, make_items, t0, get) -> None:
+    tea, note = await make_items(
+        {"kind": "purchase", "title": "Купить чай"}, {"kind": "note", "title": "Случайно разбил кружку"}, now=t0
+    )
+    async with ctx.sessionmaker() as session:
+        await items.apply_patch(session, tea.item.id, EditPatch(action="done"), Prefs(), t0)
+        await session.commit()
+    raw = await add_raw("удали чай")
+    fake_ai.push({"intent": "edit", "edit": {"target": "чай", "action": "delete"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.texts == ["🗑 Удалил «Купить чай»"]  # "случайно" holds "чай", but it is not the word
+    assert (await get(Item, note.item.id)).status == "open"
+
+
+async def test_done_does_not_close_an_open_note_instead_of_a_done_task(
+    ctx, add_raw, fake_ai, bot, make_items, t0, get
+) -> None:
+    tea, idea = await make_items(
+        {"kind": "purchase", "title": "Купить чай"}, {"kind": "idea", "title": "Попробовать чай улун"}, now=t0
+    )
+    async with ctx.sessionmaker() as session:
+        await items.apply_patch(session, tea.item.id, EditPatch(action="done"), Prefs(), t0)
+        await session.commit()
+    raw = await add_raw("купил чай")
+    fake_ai.push({"intent": "edit", "edit": {"target": "чай", "action": "done"}})
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    assert bot.texts[0].startswith("✏️ Какую запись изменить?")
+    assert (await get(Item, idea.item.id)).status == "open"
+
+
+async def test_new_items_said_with_an_edit_are_saved_too(ctx, add_raw, fake_ai, bot, make_items, t0, items_of_raw, get):
+    [milk] = await make_items({"kind": "purchase", "title": "Купить молоко"}, now=t0)
+    raw = await add_raw("купил молоко, хлеба не было — купить завтра")
+    fake_ai.push(
+        {
+            "intent": "edit",
+            "edit": {"target": "молоко", "action": "done"},
+            "items": [{"kind": "purchase", "title": "Купить хлеб", "when": {"text": "завтра", "day": "+1"}}],
+        }
+    )
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert bot.texts[0] == "✅ Закрыл «Купить молоко»"
+    assert (await get(Item, milk.item.id)).status == "done"
+    [bread] = await items_of_raw(raw.id)
+    assert (bread.kind, bread.title, bread.status) == ("purchase", "Купить хлеб", "open")
+    assert any("Купить хлеб" in text for text in bot.texts[1:])  # its card
+    assert bot.reactions[-1] == (raw.message_id, "👌")

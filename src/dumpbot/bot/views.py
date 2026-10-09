@@ -24,7 +24,7 @@ Rules:
   in the next morning digest as "🌙 Вчерашний итог (не успел прислать)" (``morning_sections``), a reminder held over
   quiet hours says how late it is from its own time; a reply to a voice note shows what was heard, "🎤 «…»" (§6,
   ``heard_line``, ``with_heard``; cards through ``CardExtras.heard``), and a voice note that gave only notes / ideas
-  gets "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] (``heard_items``).
+  gets "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] for each of them (``heard_item``).
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -660,30 +660,19 @@ def with_heard(view: View, heard: str | None) -> View:
     return fit(f"{line}\n{text}"), kb
 
 
-def heard_items(heard: str, saved: Sequence[Item]) -> MenuView:
+def heard_item(heard: str, item: Item) -> MenuView:
     """A voice note that gave only notes / ideas (normally just 👌): "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить]
-    [🗑 Не то — удалить] (``ItemCb`` edit / del, as on a card), so a garbled transcript shows at once. Several items:
-    a numbered line each and [✏️ N] [🗑 N] (up to ``CANDIDATES_MAX``)."""
-    head = f"🎤 «{q(heard, HEARD_MAX)}» →"
-
-    def label(item: Item) -> str:
-        return f"{_kind_emoji(item.kind)} {esc(_kind_label(item.kind))} «{q(item.title, LIST_TITLE_MAX)}»"
-
-    if len(saved) == 1:
-        [item] = saved
-        kb = markup(
-            [
-                button("✏️ Изменить", ItemCb(a="edit", id=item.id)),
-                button("🗑 Не то — удалить", ItemCb(a="del", id=item.id), style="danger"),
-            ]
-        )
-        return fit(f"{head} {label(item)}"), kb
-    lines = [head, *(f"{n}. {label(item)}" for n, item in enumerate(saved, 1))]
-    rows = [
-        [button(f"✏️ {n}", ItemCb(a="edit", id=item.id)), button(f"🗑 {n}", ItemCb(a="del", id=item.id))]
-        for n, item in enumerate(saved[:CANDIDATES_MAX], 1)
-    ]
-    return fit("\n".join(lines)), markup(*rows)
+    [🗑 Не то — удалить] (``ItemCb`` edit / del, as on a card), so a garbled transcript shows at once. One message
+    per item: the buttons (which turn the message into that item's menu or deleted card) and a reply to it are about
+    that one item."""
+    label = f"{_kind_emoji(item.kind)} {esc(_kind_label(item.kind))} «{q(item.title, LIST_TITLE_MAX)}»"
+    kb = markup(
+        [
+            button("✏️ Изменить", ItemCb(a="edit", id=item.id)),
+            button("🗑 Не то — удалить", ItemCb(a="del", id=item.id), style="danger"),
+        ]
+    )
+    return fit(f"🎤 «{q(heard, HEARD_MAX)}» → {label}"), kb
 
 
 def steps_closed_text(title: str) -> str:
@@ -1141,11 +1130,14 @@ class _Numbered:
     """Collects the numbered lines of a list while it is rendered; the keyboard gets a button for each one that made
     it into the final text (``fit`` may cut a long list)."""
 
-    def __init__(self, kind: str, day: date | None) -> None:
+    def __init__(self, kind: str, day: date | None, lines: ListLines) -> None:
         self.kind = kind
         self.day = day
         self.lines: list[tuple[str, int, Row, str]] = []
         self.unnumbered_open = False
+        # The buttons ran out (more open lines than LIST_BUTTONS_MAX): lines without a number are those past the
+        # first 20. Without that they are only rows added since the list was sent, and get no hint.
+        self.full = any(n is not None and n >= LIST_BUTTONS_MAX for entries in lines.values() for _, n in entries)
 
     def line(self, section: str, entry: ListLine, body: str, glyph: str = "") -> str:
         """ "3. 13:00 · 📌 X", done "3. ✅ 13:00 · 📌 <s>X</s>", without a number "• 13:00 · 📌 X" (``glyph``, e.g.
@@ -1160,7 +1152,8 @@ class _Numbered:
         return text
 
     def hint(self) -> list[str]:
-        if not self.unnumbered_open:
+        """ "Кнопки — у первых 20 дел…" when open lines were left without a button because the buttons ran out."""
+        if not self.unnumbered_open or not self.full:
             return []
         return [TASKS_MORE_HINT if self.kind == LIST_TASKS else LIST_MORE_HINT]
 
@@ -1179,14 +1172,14 @@ def today_list(agenda: Agenda, prefs: Prefs, now: datetime, *, lines: ListLines 
     (``pin_lines``)."""
     if lines is None:
         lines = number_lines(LIST_TODAY, today_sections(agenda))
-    nb = _Numbered(LIST_TODAY, agenda.day)
+    nb = _Numbered(LIST_TODAY, agenda.day, lines)
     title = f"📅 Сегодня, {fmt_date(agenda.day)}"
     open_lines = [nb.line(SEC_OPEN, e, row_line(e[0], prefs, now)) for e in lines.get(SEC_OPEN, [])]
     parts = [_block(title, open_lines, TODAY_EMPTY)]
     if overdue := lines.get(SEC_OVERDUE):
         parts.append(_block("⚠️ Просрочено", [nb.line(SEC_OVERDUE, e, row_line(e[0], prefs, now)) for e in overdue]))
-    if periods := lines.get(SEC_PERIOD):
-        parts.append("\n".join(_period_lines(periods, prefs, now, nb)))
+    if period_lines := _period_lines(lines.get(SEC_PERIOD, []), prefs, now, nb):
+        parts.append("\n".join(period_lines))
     if done := lines.get(SEC_DONE):
         parts.append(_block("✅ Сделано", [f"• {row_line(r, prefs, now)}" for r, _ in done]))
     parts += nb.hint()
@@ -1198,7 +1191,7 @@ def tasks_list(rows: Sequence[Row], prefs: Prefs, now: datetime, *, lines: ListL
     """``/tasks``: the open tasks "1. сегодня 13:00 · 📌 Купить хлеб" with [✅ N] buttons. ``lines``: a re-render."""
     if lines is None:
         lines = number_lines(LIST_TASKS, tasks_sections(rows))
-    nb = _Numbered(LIST_TASKS, None)
+    nb = _Numbered(LIST_TASKS, None, lines)
     body = [nb.line(SEC_OPEN, e, row_line(e[0], prefs, now)) for e in lines.get(SEC_OPEN, [])]
     text = fit("\n\n".join([_block(TASKS_TITLE, body, TASKS_EMPTY), *nb.hint()]))
     return text, _list_markup(nb, text)
@@ -1216,12 +1209,17 @@ def period_sections(rows: Sequence[Row], prefs: Prefs, now: datetime) -> list[st
 
 
 def _period_lines(entries: Sequence[ListLine], prefs: Prefs, now: datetime, nb: _Numbered | None) -> list[str]:
-    """``period_sections`` of list lines, numbered through ``nb``."""
+    """``period_sections`` of list lines, numbered through ``nb``. A numbered line whose item has no span any more
+    (snoozed past its time or given an exact one since the list was sent) keeps its number and button: it follows the
+    spans with its time ("2. сегодня 20:00 · 📌 X")."""
     today = _local(now, prefs.zone).date()
     groups: dict[tuple[str, date], list[ListLine]] = {}
+    loose: list[ListLine] = []
     for entry in entries:
         row = entry[0]
         if row.period_kind is None or row.period_start is None or row.period_end is None:
+            if nb is not None and entry[1] is not None:
+                loose.append(entry)
             continue
         label = period_label(row.period_kind, row.period_start, row.period_end, today)
         groups.setdefault((label, row.period_end), []).append(entry)
@@ -1233,6 +1231,8 @@ def _period_lines(entries: Sequence[ListLine], prefs: Prefs, now: datetime, nb: 
         for entry in group:
             title = _row_title(entry[0])
             lines.append(nb.line(SEC_PERIOD, entry, title) if nb is not None else f"• {title}")
+    if nb is not None:
+        lines += [nb.line(SEC_PERIOD, entry, row_line(entry[0], prefs, now)) for entry in loose]
     return lines
 
 
@@ -1243,7 +1243,7 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
     agenda = data.agenda
     if lines is None:
         lines = number_lines(LIST_MORNING, morning_sections(data))
-    nb = _Numbered(LIST_MORNING, agenda.day)
+    nb = _Numbered(LIST_MORNING, agenda.day, lines)
     head = [f"☀️ <b>Доброе утро!</b> План на сегодня, {fmt_date(agenda.day)}", ""]
     open_lines = [
         nb.line(SEC_OPEN, e, f"{_row_when(e[0], prefs, now, agenda.day) or '—'} · {_row_title(e[0])}")
@@ -1260,9 +1260,9 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
             nb.line(SEC_OVERDUE, e, f"{_row_when(e[0], prefs, now) or '—'} · {_row_title(e[0])}") for e in overdue
         ]
         body += ["", "⚠️ <b>Просрочено</b>", *fit_lines(overdue_lines, budget - used - 30)]
-    if periods := lines.get(SEC_PERIOD):
+    if period_lines := _period_lines(lines.get(SEC_PERIOD, []), prefs, now, nb):
         used = tg_len("\n".join(body))
-        body += ["", *fit_lines(_period_lines(periods, prefs, now, nb), max(budget - used - 30, 60))]
+        body += ["", *fit_lines(period_lines, max(budget - used - 30, 60))]
     if hint := nb.hint():
         body += ["", *hint]
     if data.recurring_today:
@@ -1274,9 +1274,10 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
 def _yesterday_lines(yesterday: Agenda, lines: ListLines, prefs: Prefs, now: datetime, nb: _Numbered) -> list[str]:
     """ "🌙 <b>Вчерашний итог</b> (не успел прислать)", "Сделано 1 из 3", then yesterday's not-done lines numbered
     like the rest of the morning digest ("4. 19:00 · 📌 Купить хлеб"); a line closed by its button since then counts
-    as done. [] when yesterday had nothing to report."""
+    as done (it is among ``yesterday.done`` then too: counted once). [] when yesterday had nothing to report."""
     entries = lines.get(SEC_YESTERDAY, [])
-    done = len(yesterday.done) + sum(row_done(r) for r, _ in entries)
+    listed = {r.occurrence_id for r, _ in entries}
+    done = sum(r.occurrence_id not in listed for r in yesterday.done) + sum(row_done(r) for r, _ in entries)
     left = sum(not row_done(r) for r, _ in entries)
     if not done and not left:
         return []
@@ -1295,7 +1296,7 @@ def evening_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
     agenda = data.agenda
     if lines is None:
         lines = number_lines(LIST_EVENING, evening_sections(agenda, now))
-    nb = _Numbered(LIST_EVENING, agenda.day)
+    nb = _Numbered(LIST_EVENING, agenda.day, lines)
     head = [f"🌙 <b>Итоги дня</b>, {fmt_date(agenda.day)}"]
     done = [r for r, _ in lines.get(SEC_DONE, [])]
     missed, ahead, overdue = (lines.get(s, []) for s in (SEC_MISSED, SEC_AHEAD, SEC_OVERDUE))

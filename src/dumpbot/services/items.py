@@ -101,6 +101,7 @@ __all__ = [
     "set_tags",
     "set_title",
     "snooze",
+    "steps_done_at",
     "stop_recurrence",
     "take_parent_events",
     "toggle_step",
@@ -617,6 +618,13 @@ async def _sync_parent(session: AsyncSession, step: Item, prefs: Prefs | None, n
     elif parent.status == "open" and not parent.rec_active and await _all_steps_done(session, parent.id):
         await _finish(session, parent, now)
         events.closed.append(parent.id)
+
+
+async def steps_done_at(session: AsyncSession, parent_id: int, done_at: datetime) -> int:
+    """How many steps of the checklist are done at exactly ``done_at`` (the parent's: those its «Готово» closed, or
+    the last tick that closed it)."""
+    stmt = select(func.count()).where(Item.parent_id == parent_id, Item.status == "done", Item.done_at == done_at)
+    return int(await session.scalar(stmt) or 0)
 
 
 async def _all_steps_done(session: AsyncSession, parent_id: int) -> bool:

@@ -1,9 +1,12 @@
 """Reminder / recurrence / digest loop (architecture.md §4.16). A DB-polling loop, no APScheduler.
 
 ``tick(now)``:
-0. the time of the tick is stored (``app_state`` "scheduler:last_tick"); a tick that finds the previous one
+0. the time of the tick is stored (``app_state`` "scheduler:last_tick"), and again as the tick goes on when it is a
+   long one (``_progress``: flood control may hold a send for minutes); a tick that finds the last stored time
    ``GAP_AFTER`` (15 min) or more in the past knows the bot was down (the PC slept, Docker stood still) — the first
-   tick after a restart too — and keeps a ``Downtime`` for the notice about it (step 5);
+   tick after a restart too — and keeps a ``Downtime`` for the notice about it (step 5). The open downtime is stored
+   with the tick ("scheduler:downtime") until its notice is handled: a restart before that (a crash right after the
+   PC woke up) picks it up again, so the missed evening digest is still folded and reported;
 1. reminders stuck in ``sending`` for over 2 min (the process died mid-send) -> ``pending``;
 2. claim due ``pending`` reminders (SKIP LOCKED, <= 20): item deleted / occurrence not open -> ``cancelled``;
    older than ``prefs.missed_grace_minutes`` -> ``missed`` (it shows up in the evening digest instead);
@@ -18,8 +21,9 @@
 4. digests: target = ``shift_out_of_quiet(local digest time)``, window [target, target + 3 h), never sent inside
    quiet hours, at most once per kind and day via ``once_keys`` ``digest:{kind}:{YYYY-MM-DD}``; an empty digest is
    not sent. An evening digest the bot was down for (no tick between its target and now) that cannot go out any more
-   (quiet hours, or its window closed) goes into the next morning digest instead: ``digest.folded_key`` marks its
-   day, and that morning digest shows its not-done items as "Вчерашний итог (не успел прислать)";
+   (quiet hours, or its window closed) goes into the next morning digest instead, when that day had something due or
+   done (``digest.has_summary``; overdue items alone show up in the morning digest anyway): ``digest.folded_key``
+   marks its day, and that morning digest shows the day's summary as "Вчерашний итог (не успел прислать)";
 5. after a downtime, once the reminders it delayed are handled: one silent message, only if anything was affected
    (reminders sent late, held for the end of quiet hours or missed; a folded evening digest) — "😴 Меня не было с
    19:00 до 23:19 (компьютер спал?). Опоздало напоминаний: 1. Итог дня — в утреннем дайджесте."
@@ -38,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
@@ -51,7 +56,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from dumpbot import clock
 from dumpbot.bot import sender, views
 from dumpbot.context import AppContext
-from dumpbot.db.models import Item, Occurrence, Reminder
+from dumpbot.db.models import Item, Occurrence, OnceKey, Reminder
 from dumpbot.domain import quiet, timeresolve
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import app_state, digest, items
@@ -60,6 +65,7 @@ from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, tr
 __all__ = [
     "CLAIM_LIMIT",
     "DIGEST_WINDOW",
+    "DOWNTIME_KEY",
     "GAP_AFTER",
     "HOLD_AFTER",
     "LAST_TICK_KEY",
@@ -71,6 +77,7 @@ __all__ = [
 ]
 
 log = logging.getLogger(__name__)
+_monotonic = time.monotonic  # the pace of a tick (tests replace it)
 
 STUCK_AFTER: Final = timedelta(minutes=2)
 CLAIM_LIMIT: Final = 20
@@ -87,6 +94,9 @@ GAP_AFTER: Final = timedelta(minutes=15)
 # A reminder later than this that comes due inside quiet hours waits for their end (and then comes silently).
 HOLD_AFTER: Final = timedelta(minutes=30)
 LAST_TICK_KEY: Final = "scheduler:last_tick"
+DOWNTIME_KEY: Final = "scheduler:downtime"  # {"start", "end"} of the downtime whose notice is not handled yet
+# How often a long tick stores how far it got (a slow tick is no downtime).
+PROGRESS_EVERY: Final = timedelta(minutes=1)
 # Errors that say nothing about the reminder itself: retried until it is sent or missed, never counted.
 TRANSIENT_ERRORS: Final = (
     TelegramNetworkError,
@@ -127,6 +137,12 @@ class Scheduler:
         self._backlog = False  # more due reminders than one claim takes: tick again right away
         self._unsent = False  # a due reminder waits for Telegram (a transient error): so does the downtime notice
         self.downtime: Downtime | None = None  # the last gap, until its notice is sent
+        # The tick going on: its time, and the monotonic moments it started and last stored its progress (None: the
+        # process may have been frozen during it, its progress is not stored any more).
+        self._tick_at: datetime | None = None
+        self._tick_mark = 0.0
+        self._stored_mark: float | None = None
+        self._resumed = False  # the stored downtime of an earlier process was looked at
 
     @property
     def stall_limit_s(self) -> float:
@@ -163,6 +179,7 @@ class Scheduler:
             await self._step("recurring", self._ensure_recurring(now, prefs))
             await self._step("digests", self._digests(now, prefs, since))
             await self._step("downtime", self._report_downtime(now, prefs))
+            await self._progress()
         finally:
             _write_heartbeat(self._ctx.settings.heartbeat_file, now)
 
@@ -185,25 +202,65 @@ class Scheduler:
         return prefs
 
     async def _note_tick(self, now: datetime) -> datetime | None:
-        """Store ``now`` as the last tick; return the tick before it, or the start of the downtime whose notice is
-        still pending (None: unknown, e.g. the first tick ever). A gap of ``GAP_AFTER`` or more opens a
-        ``Downtime``; another one before that notice went out extends it (one notice for both)."""
+        """Store ``now`` as the last tick; return the last stored time before it, or the start of the downtime whose
+        notice is still pending (None: unknown, e.g. the first tick ever). A gap of ``GAP_AFTER`` or more opens a
+        ``Downtime``; another one before that notice went out extends it (one notice for both). The open downtime is
+        stored in the same transaction, and a fresh process takes it over (``DOWNTIME_KEY``)."""
         self._alive()
+        self._tick_at, self._tick_mark = now, _monotonic()
+        self._stored_mark = self._tick_mark
         try:
             async with self._ctx.sessionmaker() as session:
                 stored = await app_state.swap(session, LAST_TICK_KEY, now.isoformat())
+                if not self._resumed:  # the process before this one may not have got to handle its downtime
+                    if (taken := _stored_downtime(await app_state.get(session, DOWNTIME_KEY))) is not None:
+                        self.downtime = taken
+                        log.warning("downtime %s - %s taken over after a restart", taken.start, taken.end)
+                prev = _parse_time(stored)
+                if prev is not None and now - prev >= GAP_AFTER:
+                    log.warning("no scheduler tick from %s to %s: the bot was down", prev.isoformat(), now.isoformat())
+                    if self.downtime is None:
+                        self.downtime = Downtime(start=prev, end=now)
+                    else:
+                        self.downtime.end = now
+                    value = {"start": self.downtime.start.isoformat(), "end": self.downtime.end.isoformat()}
+                    await app_state.put(session, DOWNTIME_KEY, value)
                 await session.commit()
+            self._resumed = True
         except Exception as e:
             log.error("last tick not stored: %s", describe_error(e))
-            stored = None
-        prev = _parse_time(stored)
-        if prev is not None and now - prev >= GAP_AFTER:
-            log.warning("no scheduler tick from %s to %s: the bot was down", prev.isoformat(), now.isoformat())
-            if self.downtime is None:
-                self.downtime = Downtime(start=prev, end=now)
-            else:
-                self.downtime.end = now
+            prev = None
         return self.downtime.start if self.downtime is not None else prev
+
+    async def _progress(self) -> None:
+        """A long tick stores how far it got (at most every ``PROGRESS_EVERY``), so that the next tick measures the
+        gap from there: minutes of flood control are no downtime. A pause of ``GAP_AFTER`` or more since the last
+        stored moment may be a frozen process (the PC slept mid-send): from then on this tick stores nothing, and the
+        next one sees the gap."""
+        if self._tick_at is None or self._stored_mark is None:
+            return
+        mark = _monotonic()
+        if mark - self._stored_mark >= GAP_AFTER.total_seconds():
+            self._stored_mark = None
+            return
+        if mark - self._stored_mark < PROGRESS_EVERY.total_seconds():
+            return
+        reached = self._tick_at + timedelta(seconds=mark - self._tick_mark)
+        try:
+            async with self._ctx.sessionmaker() as session:
+                await app_state.put(session, LAST_TICK_KEY, reached.isoformat())
+                await session.commit()
+        except Exception as e:
+            log.warning("tick progress not stored: %s", describe_error(e))
+            return
+        self._stored_mark = mark
+
+    async def _close_downtime(self) -> None:
+        """The downtime is handled (notice sent, or nothing to tell): forget it, the stored copy too."""
+        self.downtime = None
+        async with self._ctx.sessionmaker() as session:
+            await app_state.delete(session, DOWNTIME_KEY)
+            await session.commit()
 
     def _affect(self, outcome: str, reminder_id: int, fire_at: datetime, until: datetime | None = None) -> None:
         """Count a reminder that was due during the current downtime as ``late`` / ``held`` / ``missed``."""
@@ -234,6 +291,7 @@ class Scheduler:
         self._backlog = len(ids) >= CLAIM_LIMIT
         for n, reminder_id in enumerate(ids):
             self._alive()
+            await self._progress()
             if not await self._deliver(reminder_id, now, prefs):
                 # Telegram is unreachable: the others would fail too (each send may take a minute to time out),
                 # and an immediate backlog tick would spin. They wait for the next regular tick.
@@ -412,7 +470,9 @@ class Scheduler:
     async def _fold_missed_evening(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
         """An evening digest the bot was down for (no tick between ``since`` and its target) that can no longer go
         out (``now`` is in quiet hours, or its window has closed) goes into the next morning digest: its once-key is
-        taken (it is never sent late) and, unless it would be empty, its day is marked with ``digest.folded_key``."""
+        taken (it is never sent late) and, when the day had something due or done (``digest.has_summary``: what the
+        morning digest's "Вчерашний итог" shows), its day is marked with ``digest.folded_key``. A fold done before a
+        restart is found by that key and reported all the same."""
         if since is None or not prefs.digest_evening_enabled:
             return
         tz = prefs.zone
@@ -425,16 +485,16 @@ class Scheduler:
             if now < target + DIGEST_WINDOW and not quiet.in_quiet_hours(now, prefs):
                 continue  # it still goes out now, late
             async with self._ctx.sessionmaker() as session:
-                if not await try_once(session, f"digest:evening:{day.isoformat()}"):
-                    continue  # sent (or found empty) before the bot went down
-                data = await digest.build_digest(session, "evening", prefs, nominal)
-                if data is not None:
-                    await try_once(session, digest.folded_key(day))
+                if await try_once(session, f"digest:evening:{day.isoformat()}"):
+                    folded = digest.has_summary(await digest.day_summary(session, day, prefs))
+                    if folded:
+                        await try_once(session, digest.folded_key(day))
+                    log.info("missed evening digest for %s: %s", day, "folded" if folded else "nothing to report")
+                else:  # sent before the bot went down, or folded already (by the process before a restart)
+                    folded = await session.get(OnceKey, digest.folded_key(day)) is not None
                 await session.commit()
-            if data is None:
-                log.info("missed evening digest for %s: nothing to report", day)
+            if not folded:
                 continue
-            log.info("missed evening digest for %s goes into the next morning digest", day)
             if self.downtime is not None:
                 self.downtime.folded = day
                 self.downtime.morning = _morning_ahead(day + timedelta(days=1), now, prefs)
@@ -447,11 +507,11 @@ class Scheduler:
         if dt is None or self._backlog or self._unsent:
             return
         if not dt.affected:
-            self.downtime = None
+            await self._close_downtime()
             log.info("the downtime %s - %s affected nothing", dt.start.isoformat(), dt.end.isoformat())
             return
         if now - dt.end > timedelta(minutes=prefs.missed_grace_minutes):
-            self.downtime = None
+            await self._close_downtime()
             log.warning("downtime notice dropped: it could not be sent in time")
             return
         text = views.downtime_notice(
@@ -466,7 +526,7 @@ class Scheduler:
             morning=dt.morning,
         )
         await sender.send(self._ctx, text, purpose="notice", silent=True)
-        self.downtime = None
+        await self._close_downtime()
         log.info("downtime notice sent")
 
     async def _sleep_for(self, now: datetime) -> float:
@@ -497,6 +557,14 @@ def _parse_time(value: Any) -> datetime | None:
     except ValueError:
         return None
     return dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def _stored_downtime(value: Any) -> Downtime | None:
+    """A ``Downtime`` stored under ``DOWNTIME_KEY`` (None for anything else)."""
+    if not isinstance(value, dict):
+        return None
+    start, end = _parse_time(value.get("start")), _parse_time(value.get("end"))
+    return Downtime(start=start, end=end) if start is not None and end is not None and start < end else None
 
 
 def _morning_ahead(day: date, now: datetime, prefs: Prefs) -> bool:

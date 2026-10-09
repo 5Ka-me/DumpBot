@@ -10,6 +10,7 @@ from typing import Any
 
 import pytest
 
+from dumpbot.ai.client import AIBadResponse
 from dumpbot.bot import sender
 from dumpbot.bot.cbdata import ItemCb, UndoCb
 from dumpbot.db.models import Item
@@ -81,25 +82,28 @@ async def test_garbled_voice_note_kept_as_a_note_shows_the_transcript(ctx, add_v
     assert [text for text, _ in buttons(msg)] == ["✏️ Изменить", "🗑 Не то — удалить"]
 
 
-async def test_voice_with_two_notes_lists_both(ctx, add_voice, fake_ai, bot, bot_messages, items_of_raw) -> None:
+async def test_voice_with_two_notes_gets_a_message_for_each(
+    ctx, add_voice, fake_ai, bot, bot_messages, items_of_raw
+) -> None:
+    # One message per item: its buttons (and a reply to it) are about that item alone — pressing 🗑 on one cannot
+    # take the other one's buttons away, and a reply edits that item (bot_messages.item_id).
     raw = await add_voice("заметка про отпуск и идея про подкаст")
     fake_ai.push({"items": [{"kind": "note", "title": "Отпуск"}, {"kind": "idea", "title": "Подкаст"}]})
     await processor.handle_message(ctx, {"raw_id": raw.id})
     first, second = await items_of_raw(raw.id)
-    [msg] = bot.sent
-    assert msg["text"].split("\n") == [
-        "🎤 «заметка про отпуск и идея про подкаст» →",
-        "1. 📝 Заметка «Отпуск»",
-        "2. 💡 Идея «Подкаст»",
+    assert [msg["text"] for msg in bot.sent] == [
+        "🎤 «заметка про отпуск и идея про подкаст» → 📝 Заметка «Отпуск»",
+        "🎤 «заметка про отпуск и идея про подкаст» → 💡 Идея «Подкаст»",
     ]
-    assert [data for _, data in buttons(msg)] == [
-        ItemCb(a="edit", id=first.id).pack(),
-        ItemCb(a="del", id=first.id).pack(),
-        ItemCb(a="edit", id=second.id).pack(),
-        ItemCb(a="del", id=second.id).pack(),
+    assert [[data for _, data in buttons(msg)] for msg in bot.sent] == [
+        [ItemCb(a="edit", id=first.id).pack(), ItemCb(a="del", id=first.id).pack()],
+        [ItemCb(a="edit", id=second.id).pack(), ItemCb(a="del", id=second.id).pack()],
     ]
-    [bm] = await bot_messages()
-    assert bm.item_id is None
+    assert [(bm.purpose, bm.item_id) for bm in await bot_messages()] == [
+        (sender.PURPOSE_HEARD, first.id),
+        (sender.PURPOSE_HEARD, second.id),
+    ]
+    assert bot.reactions == [(raw.message_id, "👌")]
 
 
 async def test_voice_with_a_task_and_a_note_gets_only_the_card(ctx, add_voice, fake_ai, bot) -> None:
@@ -187,3 +191,52 @@ async def test_heard_of_an_album_joins_its_voice_parts(add_raw, sessionmaker) ->
         assert await query.heard(session, text.id) is None
         assert await query.heard(session, None) is None
         assert await query.heard(session, 10**12) is None
+
+
+# --- the replies that missed the line (review fix) -----------------------------------------------------------------
+
+
+async def test_voice_split_of_a_typed_item_shows_what_was_heard(ctx, add_voice, fake_ai, bot, make_items, t0) -> None:
+    [created] = await make_items({"kind": "task", "title": "Переезд", "when": {"day": "+3"}}, now=t0)
+    raw = await add_voice("разбей на шаги", reply_item_id=created.item.id)
+    fake_ai.push({"intent": "edit", "edit": {"action": "split"}})
+    fake_ai.splits.append(["Упаковать вещи", "Отдать ключи"])
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": created.item.id})
+    [card] = bot.sent
+    assert "🎤 «разбей на шаги»" in card["text"]
+    assert "Упаковать вещи" in card["text"]
+
+
+async def test_voice_split_of_an_item_from_an_older_voice_note_shows_the_new_transcript(
+    ctx, add_voice, fake_ai, bot, items_of_raw
+) -> None:
+    first = await add_voice("переезд в субботу")
+    fake_ai.push({"items": [{"kind": "task", "title": "Переезд", "when": {"day": "SA"}}]})
+    await processor.handle_message(ctx, {"raw_id": first.id})
+    [item] = await items_of_raw(first.id)
+    bot.calls.clear()
+
+    raw = await add_voice("распиши по шагам", reply_item_id=item.id)
+    fake_ai.push({"intent": "edit", "edit": {"action": "split"}})
+    fake_ai.splits.append(["Упаковать вещи", "Отдать ключи"])
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": item.id})
+    [card] = bot.sent
+    assert "🎤 «распиши по шагам»" in card["text"] and "переезд в субботу" not in card["text"]
+
+
+async def test_voice_note_the_ai_could_not_read_shows_what_was_heard(ctx, add_voice, fake_ai, bot, items_of_raw):
+    raw = await add_voice("ыы пщ ммм кнуп")
+    fake_ai.push(AIBadResponse("no valid extraction"))
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+    [msg] = bot.sent
+    assert msg["text"].split("\n") == ["🎤 «ыы пщ ммм кнуп»", processor.FAILED_MESSAGE_TEXT]
+    [note] = await items_of_raw(raw.id)
+    assert note.title == "ыы пщ ммм кнуп"
+
+
+async def test_voice_edit_the_ai_could_not_read_shows_what_was_heard(ctx, add_voice, fake_ai, bot, make_items, t0):
+    [created] = await make_items({"kind": "idea", "title": "Подкаст"}, now=t0)
+    raw = await add_voice("ыы пщ", reply_item_id=created.item.id)
+    fake_ai.push(AIBadResponse("no valid extraction"))
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": created.item.id})
+    assert bot.sent[0]["text"].split("\n") == ["🎤 «ыы пщ»", processor.FAILED_EDIT_TEXT]

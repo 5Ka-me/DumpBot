@@ -9,12 +9,16 @@ too -> ``AIUnavailable``. A 404 from the fallback never turns a paid primary ans
 ``AIBadResponse``. Images route to vision-capable models (``llm_model`` / ``vision_fallback_model``).
 
 Fast switch to the fallback (docs/features/iteration-3.md §1), for ``extract``, ``split_steps`` and ``answer_query``:
-- a primary model on pause (``ChutesClient.cooldown_left``: a 408 / 429 / 5xx / timeout within ``llm_cooldown_s``) is
-  skipped while the fallback is not paused too: the fallback answers alone, as if the primary had just been
-  unavailable (nothing usable from the fallback -> ``AIUnavailable`` with ``retry_after`` = the rest of the pause);
-- no valid result from the primary within ``llm_hedge_after_s`` -> the fallback (unless paused) is asked in parallel;
-  the first valid result wins, the other call is cancelled (``HEDGE_LOST``, recorded in ``ai_usage``). Without a
-  valid result from either, the errors resolve exactly as in the sequential ladder.
+- a primary model on pause (``ChutesClient.cooldown_left``: a 408 / 429 / 5xx / timeout, or ``LOST_HEDGES_TO_PAUSE``
+  parallel races in a row lost without an answer, within ``llm_cooldown_s``) is skipped while the fallback is neither
+  paused nor missing (404): the fallback stands in for it alone, with the primary's repair retry (nothing usable ->
+  ``AIUnavailable`` with ``retry_after`` = the rest of the pause). A 404 from the fallback there sends the message to
+  the paused primary at once (``ExtractOutput.missing_fallback`` lets the processor tell the owner);
+- no valid result from the primary within ``llm_hedge_after_s`` -> the fallback is asked in parallel (its own pause
+  does not stop that, only a ``Retry-After`` it sent: ``ChutesClient.retry_after_left``); the first valid result
+  wins, the other call is cancelled (``HEDGE_LOST``, recorded in ``ai_usage``; a primary that lost counts towards
+  its pause: ``ChutesClient.note_lost_hedge``). Without a valid result from either, the errors resolve exactly as in
+  the sequential ladder.
 
 ``split_steps`` (docs/features/iteration-2.md §C2) breaks one task into checklist steps by the same ladder.
 
@@ -107,6 +111,7 @@ class ExtractOutput:
     model: str
     prompt_version: str
     missing_model: str | None = None  # the primary model answered 404: ``model`` is the fallback
+    missing_fallback: str | None = None  # the fallback model answered 404 and has not answered since
 
 
 @dataclass
@@ -149,7 +154,10 @@ async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -
         schema=_schema(),
         schema_name="extraction",
     )
-    return _output(ext, inp, model, missing_model=missing)
+    out = _output(ext, inp, model, missing_model=missing)
+    if fallback and fallback != settings.llm_model and client.is_missing(fallback):
+        out.missing_fallback = fallback
+    return out
 
 
 async def split_steps(client: ChutesClient, settings: Settings, inp: SplitInput) -> SplitOutput:
@@ -194,16 +202,19 @@ async def _ladder[M: BaseModel](
     turns a paid primary answer into a config error: the primary's ``AIUnavailable`` is raised if there was one,
     ``AIModelNotFound`` only when both models are missing, else ``AIBadResponse``. A paused primary is skipped, a slow
     one gets the fallback in parallel (``_with_fallback``).
+
+    The repair retry belongs to the model that answers for the message: the primary, or the fallback standing in
+    alone for a paused primary (``lead``); the fallback after or beside a primary attempt gets none.
     """
 
-    def run(model: str, primary: bool) -> Coroutine[Any, Any, M | None]:
+    def run(model: str, lead: bool) -> Coroutine[Any, Any, M | None]:
         return _attempt(
             client,
             settings,
             model,
             messages,
             purpose,
-            retries=1 if primary else 0,
+            retries=1 if lead else 0,
             out_cls=out_cls,
             schema=schema,
             schema_name=schema_name,
@@ -235,24 +246,33 @@ async def _with_fallback[T](
     fallback: str | None,
     what: str,
 ) -> tuple[T, str, str | None]:
-    """``run(model, is_primary)`` with ``settings.llm_model``, then with ``fallback``; returns (result, model, missing
-    primary model or None). ``run`` gives a valid result or None (unusable output) and raises ``AIError``.
+    """``run(model, lead)`` with ``settings.llm_model``, then with ``fallback``; returns (result, model, missing
+    primary model or None). ``run`` gives a valid result or None (unusable output) and raises ``AIError``; ``lead``
+    is true for the model that answers for the message (it gets the repair retry).
 
-    A paused primary (``client.cooldown_left``) is skipped while the fallback is not paused. Without a result from
-    the primary after ``llm_hedge_after_s`` the fallback runs in parallel (unless paused): the first valid result
-    wins and the other call is cancelled; errors are resolved by ``_pick`` as if the calls had run one after another.
-    A bad key / no balance from the primary before the hedge is raised without asking the fallback.
+    A paused primary (``client.cooldown_left``) is skipped while the fallback is neither paused nor missing (404):
+    the fallback answers alone, and a 404 from it sends the message to the primary after all. Without a result from
+    the primary after ``llm_hedge_after_s`` the fallback runs in parallel (not while a ``Retry-After`` of its own
+    asks to wait; its pause alone does not stop it: when the primary fails it is asked anyway): the first valid
+    result wins and the other call is cancelled (a primary that lost counts towards its pause); errors are resolved
+    by ``_pick`` as if the calls had run one after another. A bad key / no balance from the primary before the hedge
+    is raised without asking the fallback.
     """
     primary = settings.llm_model
     if not fallback or fallback == primary:
         return _pick(await _outcome(run(primary, True)), None, primary, "", what)
     paused = client.cooldown_left(primary)
-    if paused and not client.cooldown_left(fallback):
+    if paused and not client.cooldown_left(fallback) and not client.is_missing(fallback):
         log.info("primary model %s is paused for %d s more, asking %s", primary, paused, fallback)
-        skipped: _Outcome[T] = _Outcome(error=AIUnavailable(f"{primary} is paused after errors", retry_after=paused))
-        return _pick(skipped, await _outcome(run(fallback, False)), primary, fallback, what)
+        stand_in = await _outcome(run(fallback, True))
+        if not isinstance(stand_in.error, AIModelNotFound):
+            skipped: _Outcome[T] = _Outcome(error=AIUnavailable(f"{primary} is paused", retry_after=paused))
+            return _pick(skipped, stand_in, primary, fallback, what)
+        # Waiting out the pause would hold every message for minutes while the primary may already work again.
+        log.error("fallback model %s not found (%s), asking the paused %s", fallback, stand_in.error, primary)
+        return _pick(await _outcome(run(primary, True)), stand_in, primary, fallback, what)
 
-    hedge_after = 0.0 if client.cooldown_left(fallback) else settings.llm_hedge_after_s
+    hedge_after = 0.0 if client.retry_after_left(fallback) else settings.llm_hedge_after_s
     first_task = asyncio.create_task(_outcome(run(primary, True)))
     second_task: asyncio.Task[_Outcome[T]] | None = None
     try:
@@ -262,6 +282,8 @@ async def _with_fallback[T](
             log.warning("no valid answer from %s in %g s, asking %s in parallel", primary, hedge_after, fallback)
             second_task = asyncio.create_task(_outcome(run(fallback, False)))
             first, second = await _race(first_task, second_task)
+            if first_task.cancelled():  # the fallback won while the primary still had nothing
+                client.note_lost_hedge(primary)
         else:
             first = await first_task
             if first.value is not None or _owner_error(first.error):
