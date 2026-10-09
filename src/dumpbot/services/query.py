@@ -12,7 +12,8 @@ Checklists and related items (§C): a step shows in the top-level lists (/tasks,
 when it has a time of its own, named after its parent ("(из «Переезд»)"); a parent row counts its steps ("2/5").
 ``related_candidates`` finds earlier open items sharing a subject word (``services.related``) with a new message for
 the "RELATED CANDIDATES" prompt line;
-``card_extras`` loads what an item card shows besides the item (checklist, related items, parent).
+``card_extras`` loads what an item card shows besides the item (checklist, related items, parent, and — iteration 3,
+§6 — the transcript of the voice note it came from, ``heard``).
 
 The Mini App (§D): ``feed`` pages through all items newest first with filters (keyset cursor), ``rows_by_ids`` loads
 the rows an answer named, ``item_images`` / ``image_counts`` find the pictures of the message an item came from.
@@ -52,6 +53,7 @@ __all__ = [
     "card_extras",
     "feed",
     "find_edit_candidates",
+    "heard",
     "image_counts",
     "item_images",
     "items_of_raw",
@@ -100,6 +102,7 @@ RELATED_DAYS: Final = 365  # related candidates are items saved within this many
 RELATED_LIMIT: Final = 5
 FEED_STATUSES: Final = ("any", "open", "done", "deleted")  # any = not deleted; deleted = the trash
 IMAGE_TYPES: Final = ("photo", "image_document")
+_VOICE_TYPES: Final = ("voice", "audio")  # messages whose transcript a card shows ("🎤 «…»")
 # Pictures the Mini App previews (raster formats a browser shows; never SVG from our own origin).
 PREVIEW_MIME: Final = frozenset({"image/jpeg", "image/png", "image/webp", "image/gif"})
 
@@ -342,7 +345,36 @@ async def card_extras(session: AsyncSession, item: Item) -> CardExtras:
     if item.parent_id is not None:
         parent_title = await session.scalar(select(Item.title).where(Item.id == item.parent_id))
     related = await related_refs(session, item.id)
-    return CardExtras(steps=tuple(steps), related=tuple(related), parent_title=parent_title)
+    return CardExtras(
+        steps=tuple(steps),
+        related=tuple(related),
+        parent_title=parent_title,
+        heard=await heard(session, item.raw_message_id),
+    )
+
+
+async def heard(session: AsyncSession, raw_id: int | None) -> str | None:
+    """The transcript of raw message ``raw_id`` when it is a voice note or an audio file (of every such part of its
+    album, in order); None for any other message or an empty transcript."""
+    if raw_id is None:
+        return None
+    cols = (RawMessage.content_type, RawMessage.transcript, RawMessage.media_group_id, RawMessage.chat_id)
+    row = (await session.execute(select(*cols).where(RawMessage.id == raw_id))).one_or_none()
+    if row is None:
+        return None
+    texts: Sequence[str | None] = [row.transcript] if row.content_type in _VOICE_TYPES else []
+    if row.media_group_id:
+        stmt = (
+            select(RawMessage.transcript)
+            .where(
+                RawMessage.media_group_id == row.media_group_id,
+                RawMessage.chat_id == row.chat_id,
+                RawMessage.content_type.in_(_VOICE_TYPES),
+            )
+            .order_by(RawMessage.message_id)
+        )
+        texts = (await session.scalars(stmt)).all()
+    return " ".join(t.strip() for t in texts if t and t.strip()) or None
 
 
 async def _steps(session: AsyncSession, parent_id: int) -> list[Step]:

@@ -27,7 +27,7 @@ Telegram ──long polling──► aiogram Dispatcher
                               │
            Scheduler (asyncio task, тик ≤30 c или wake):
                  напоминания (claim → send → sent, восстановление зависших), повторы (следующее occurrence),
-                 дайджесты (once_keys), heartbeat-файл
+                 дайджесты (once_keys), простой (последний тик в app_state → одно уведомление), heartbeat-файл
                               │
                          PostgreSQL 18
 ```
@@ -35,7 +35,9 @@ Telegram ──long polling──► aiogram Dispatcher
 Один процесс Python: aiogram polling + 2 фоновые задачи (`JobWorker.run`, `Scheduler.run`), стартуют в
 `dp.startup`, отменяются в `dp.shutdown`. Падение фоновой задачи → лог + `os._exit(1)` → Docker перезапустит. Зависание
 (await без ответа, заблокированный event loop) ловит watchdog-поток (`watchdog.py`): цикл, который дольше своего лимита
-не отметился в `ctx.watchdog`, → лог + `os._exit(1)`. Все запросы к БД ограничены `command_timeout` (60 с).
+не отметился в `ctx.watchdog`, → лог + `os._exit(1)`. Сон ПК (замер весь процесс, и поток тоже) зависанием не
+считается: проверка, пришедшая намного позже срока, обнуляет отсчёт всех циклов (итерация 3, §5). Все запросы к БД
+ограничены `command_timeout` (60 с).
 
 Контейнеры: `db` (postgres:18), `migrate` (alembic upgrade head, one-shot), `bot`; необязательный `whisper`
 (compose profile `whisper`, `whisper/app.py`: faster-whisper на CPU, `POST /transcribe`, `GET /health`, модель в томе
@@ -110,6 +112,7 @@ src/dumpbot/
     query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
     related.py             «предметные» лексемы для «🔗 похоже на» (без инфинитивов и общих слов)     [items]
     undo.py                правка описанием: что изменила (разница) и «↩️ Отменить» (итерация 3)      [items]
+    app_state.py           значения, переживающие рестарт (app_state: последний тик планировщика)    [workers]
     ingest.py              Message → RawMessage, постановка в очередь                                [workers]
     processor.py           обработчики задач очереди                                                  [workers]
     digest.py              данные для дайджестов                                                      [workers]
@@ -125,7 +128,8 @@ src/dumpbot/
   web/                     Mini App: server.py (aiohttp, статика, WebServer) auth.py (initData) http.py  [web]
                            api_lists.py api_items.py api_inbox.py files.py (превью, LRU) serialize.py
 migrations/  alembic (0001 initial, 0002 item periods, 0003 subtasks + item_links, 0004 mini app,      [infra]
-             0005 notification time: данные — «за 5 минут» → само время, явные «за …» → время записи)
+             0005 notification time: данные — «за 5 минут» → само время, явные «за …» → время записи,
+             0006 downtime: таблица app_state, reminders.held_from)
 whisper/     app.py Dockerfile requirements.txt — локальный Whisper (compose profile whisper)        [infra]
 tailscale/   serve.json — Funnel для Mini App (compose profile miniapp)                              [infra]
 webapp/      фронтенд Mini App: src/ (api, lib, screens, components) mock/ (мок-API для dev и тестов)   [webapp]
@@ -827,6 +831,13 @@ async def on_dead(ctx: AppContext, job: Job) -> None
    (как при `save` с пустым items), её карточка с «🤷 Не нашёл, что изменить — сохранил как запись.». Пересланный
    пост (forward_origin) — чужие слова, правкой не бывает: сохраняется как при `save` (пустой items → заметка).
 8. `raw.status=done`, `processed_at`. Разбудить планировщик (`ctx.scheduler_wakeup.set()`).
+Итерация 3, §6 — голосовые: любой ответ на голосовое/аудио показывает расшифровку строкой «🎤 «…»» (`views.heard_line`,
+≤ 120 символов, экранируется): карточка — из `CardExtras.heard` (`query.heard`: транскрипт raw записи, у альбома — всех
+голосовых частей; переживает перерисовку), карточка после голосовой правки reply — транскрипт этой правки
+(`cards.patch_card(heard=…)`), ответ на вопрос, уточняющий вопрос, список кандидатов, `edit_applied` — строка сверху
+(`views.with_heard`). Голосовое, давшее только записи без карточек (заметки/идеи; обычно лишь 👌), получает ещё и
+`views.heard_items`: «🎤 «…» → 💡 Идея «…»» с [✏️ Изменить] [🗑 Не то — удалить] (ItemCb edit/del; несколько записей —
+строки «1. …» и [✏️ N] [🗑 N]), `purpose="heard"`, item_id — если запись одна.
 Итоговая реакция (👌/🤔/✍/😢) ставится на все части альбома (capture поставил 👀 на каждую). Все сообщения processor'а
 в тихие часы (`quiet.in_quiet_hours(now)`) уходят без звука (`silent=True`): ночью разбираются отложенные бюджетом
 или недоступностью ИИ сообщения. Бюджет исчерпан → `RetryLater(at=shift_out_of_quiet(next_month_start))`.
@@ -878,9 +889,12 @@ class DigestData:
     kind: Literal["morning", "evening"]
     agenda: Agenda
     recurring_today: int
+    yesterday: Agenda | None = None    # итерация 3, §5: утренний — вчерашний день, если его вечерний итог проспан
 async def build_digest(session, kind: str, prefs: Prefs, now: datetime) -> DigestData | None   # None, если пусто
 async def digest_data(session, kind: str, prefs: Prefs, now: datetime) -> DigestData   # итерация 3: и пустой
                                                                                        # (перерисовка после [✅ N])
+def folded_key(day: date) -> str          # once_key "digest:evening-folded:YYYY-MM-DD": итог day — в утреннем day+1
+async def missed_evening(session, day: date, prefs: Prefs) -> Agenda | None   # повестка day-1, если её итог свёрнут
 ```
 
 ### 4.16 workers/scheduler.py  [workers]
@@ -892,19 +906,29 @@ class Scheduler:
     async def tick(self, now: datetime) -> None
 ```
 
-`tick`: (1) `sending` с `claimed_at < now-2мин` → `pending`; (2) claim pending `fire_at ≤ now` (SKIP LOCKED, ≤20):
+`tick`: (0) итерация 3, §5: время тика → `app_state` `scheduler:last_tick` (`app_state.swap`); предыдущий тик
+`GAP_AFTER` (15 мин) назад и раньше (сон ПК, Docker стоял; в том числе первый тик после рестарта) → `Downtime(start,
+end)` (ещё один разрыв до уведомления продлевает его); (1) `sending` с `claimed_at < now-2мин` → `pending`;
+(2) claim pending `fire_at ≤ now` (SKIP LOCKED, ≤20):
 item deleted / occurrence не open → `cancelled`; `now - fire_at > prefs.missed_grace_minutes` → `missed`;
-`auto` и now в тихих часах (опоздало: бот был выключен) → `pending` с `fire_at = shift_out_of_quiet(now)`, а если это
-дальше grace от исходного fire_at → `missed`; иначе
+now в тихих часах и (`auto` или опоздало больше `HOLD_AFTER` = 30 мин) → `pending` с
+`fire_at = shift_out_of_quiet(now)` и `held_from` = исходное время (grace на конце тихих часов не проверяется: ничего
+не теряется); напоминание с `held_from` уходит беззвучно, «опоздал на …» — от `held_from`; иначе
 `views.reminder_message` → `sender.send(purpose="reminder")` → `sent`, `tg_message_id`; временная ошибка (сеть,
 5xx Telegram, flood control дольше 60 с, обрыв соединения с БД) → `pending` без attempts++, остаток пачки возвращается
 в `pending` до следующего обычного тика (без немедленного повтора): сбой переживается до `missed_grace_minutes`, потом
 `missed`; прочая ошибка отправки → attempts++, `pending` (после 5 попыток → `failed`); (3) `items.ensure_recurring`;
 (4) дайджесты: для morning/evening, если включён:
 целевое время = `shift_out_of_quiet(local digest time)`, окно [цель, цель+3ч), в тихие часы не отправляется (опоздавший
-в них дайджест пропадает, когда окно закроется), ключ `digest:{kind}:{YYYY-MM-DD}` в once_keys
+в них утренний пропадает, когда окно закроется; вечерний — см. ниже), ключ `digest:{kind}:{YYYY-MM-DD}` в once_keys
 (вставка ON CONFLICT DO NOTHING → только вставивший отправляет); `build_digest` → None → не отправлять;
-(5) heartbeat: записать время в `settings.heartbeat_file`.
+итерация 3: перед этим — вечерний итог, проспанный ботом (между прошлым тиком / началом простоя и целью тиков не было),
+который уже нельзя отправить (тихие часы или окно закрылось): его ключ занимается (поздно не придёт), и, если он не
+пуст, `digest.folded_key(day)` — утренний дайджест day+1 показывает «🌙 Вчерашний итог (не успел прислать)»;
+(5) после простоя, когда его напоминания обработаны (нет бэклога и ждущих Telegram): одно беззвучное
+`views.downtime_notice` (`purpose="notice"`), только если что-то задело — опоздавшие (отправлены поздно / ждут
+конца тихих часов), устаревшие (`missed`), свёрнутый итог; не ушло — повтор на следующем тике (в пределах grace);
+(6) heartbeat: записать время в `settings.heartbeat_file`.
 `run` регистрирует `"scheduler"` в `ctx.watchdog` (лимит `max(15 мин, 3 × scheduler_interval_s)`) и отмечается перед
 каждым тиком, шагом и напоминанием.
 
@@ -927,7 +951,8 @@ async def lookup(session, chat_id: int, message_id: int) -> BotMessage | None
 `bot_messages.purpose` сообщений, ждущих ответа (константы `PURPOSE_*`): `ask` (уточняющий вопрос, raw_message_id),
 `pick` (список «Какую запись изменить?», raw_message_id), `search_prompt` / `ask_prompt` (/search и /ask без текста,
 ForceReply). `edited` (итерация 3): ответ на правку описанием с [↩️ Отменить] (item_id — reply правит запись; не
-`card`, чтобы перерисовка чек-листа не превратила его в карточку).
+`card`, чтобы перерисовка чек-листа не превратила его в карточку). `heard` (итерация 3, §6): «🎤 «…» → 💡 Идея «…»»
+голосового без карточек (item_id, если запись одна).
 
 ### 4.18 bot/views.py  [bot]
 
@@ -979,6 +1004,13 @@ def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_be
     # «🕒 Перенёс «…» на завтра 10:00» (+ строка времени карточки, если она говорит больше), «🌙 Отложил «…» на
     # когда-нибудь», «🔔 Напомню о «…» …», «🔁 «…» — каждый пн», «✏️ Переименовал», «🏷 … — теперь идея», «#️⃣ Теги»,
     # «🔕 Выключил напоминания», «⏹ Остановил повтор», предупреждения времени; [↩️ Отменить] (UndoCb raw, item)
+# Итерация 3, §5: downtime_notice(start, end, prefs, *, late, held, held_until, missed, folded, morning) -> str —
+# «😴 Меня не было с 19:00 до 23:19 (компьютер спал?). Опоздало напоминаний: 1 — пришлю в 08:00. Итог дня — в утреннем
+# дайджесте.» (+ «Не прислал устаревших напоминаний: N — эти дела в /today»); morning_sections(data) — разделы утреннего
+# с SEC_YESTERDAY «y» (вчерашнее не сделанное; из «Просрочено» убирается), в morning_digest — «🌙 Вчерашний итог (не
+# успел прислать)», «Сделано X из Y», строки с [✅ N]; напоминание с held_from — «⏰ вчера 20:00 · опоздал на 12 ч».
+# §6: heard_line(text) «🎤 «…»» (≤ HEARD_MAX = 120), item_card — из extras.heard (после тегов), with_heard(view, heard)
+# — строка сверху, heard_items(heard, items) — «🎤 «…» → 💡 Идея «…»» [✏️ Изменить] [🗑 Не то — удалить].
 def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
 def usage_text(summary: UsageSummary) -> str
@@ -1053,10 +1085,14 @@ Scheduler (`add_done_callback` → при исключении лог + `os._exi
 
 ```python
 class Watchdog:                                            # dumpbot/watchdog.py, потокобезопасный
-    def __init__(self, *, check_every_s: float = 15.0, monotonic: Callable[[], float] = time.monotonic) -> None
+    def __init__(self, *, check_every_s: float = 15.0, monotonic: Callable[[], float] = time.monotonic,
+                 suspend_after_s: float = 60.0) -> None
     def watch(self, name: str, limit_s: float) -> None      # с этого момента name должен отмечаться не реже limit_s
     def beat(self, name: str) -> None
     def stalled(self) -> dict[str, float]                   # молчащие дольше лимита → секунды с последней отметки
+    def check(self) -> dict[str, float]                     # проверка потока: stalled(), но если она опоздала больше
+                                                            # suspend_after_s (процесс замирал: сон ПК) — все циклы
+                                                            # начинают отсчёт заново, ничего не сообщается
     def start(self, on_stall: Callable[[dict[str, float]], object]) -> None   # daemon-поток; первый stall → on_stall
     def stop(self) -> None                                  # остановить поток и забыть зарегистрированные циклы
 ```
@@ -1075,4 +1111,5 @@ class Watchdog:                                            # dumpbot/watchdog.py
   Фейк Telegram отклоняет невалидный HTML / слишком длинный текст / callback_data > 64 байт, как настоящий.
 - `tests/test_migration_0005.py` — `alembic upgrade` по-настоящему: своя временная база `<тестовая>_mig0005` на том же
   Postgres, данные на ревизии 0004, затем 0005, `alembic check`, downgrade (no-op) и повторный upgrade.
+  `tests/test_migration_0006.py` — так же для 0006 (`<тестовая>_mig0006`): app_state, held_from, downgrade и снова.
 - Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@127.0.0.1:55432/dump_test uv run pytest`.

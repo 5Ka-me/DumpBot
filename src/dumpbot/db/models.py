@@ -11,6 +11,7 @@ Overview:
 - jobs          — Postgres-backed work queue (FOR UPDATE SKIP LOCKED)
 - ai_usage      — every AI call with tokens and cost (monthly budget)
 - once_keys     — "send at most once" markers (digests per day, budget alerts per month)
+- app_state     — small values that must survive a restart (the scheduler's last tick)
 - user_settings — Prefs JSONB per owner
 - external_refs — links to items in external systems (Google Calendar, Notion...) for future sync
 """
@@ -222,6 +223,9 @@ class Reminder(Base):
     fire_at: Mapped[datetime] = mapped_column(TZ)
     lead_minutes: Mapped[int] = mapped_column(Integer, server_default="0", default=0)  # before due (0: at or after)
     auto: Mapped[bool] = mapped_column(Boolean, server_default=sa_text("false"), default=False)  # obeys quiet hours
+    # Came due late inside quiet hours (the PC slept): its own time, kept while ``fire_at`` waits for the end of quiet
+    # hours; such a reminder is sent silently (docs/features/iteration-3.md §5). NULL for every other reminder.
+    held_from: Mapped[datetime | None] = mapped_column(TZ)
     # pending | sending | sent | missed | cancelled | failed
     status: Mapped[str] = mapped_column(String(16), server_default="pending", default="pending")
     attempts: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
@@ -290,6 +294,17 @@ class OnceKey(Base):
 
     key: Mapped[str] = mapped_column(Text, primary_key=True)  # e.g. "digest:morning:2026-10-06"
     created_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
+
+
+class AppState(Base):
+    """Small values the process keeps across restarts, by key (docs/features/iteration-3.md §5: the scheduler's
+    last tick, to notice that the bot was down)."""
+
+    __tablename__ = "app_state"
+
+    key: Mapped[str] = mapped_column(Text, primary_key=True)  # e.g. "scheduler:last_tick"
+    value: Mapped[Any] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now(), onupdate=func.now())
 
 
 class ExternalRef(Base):

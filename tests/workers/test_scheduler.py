@@ -454,13 +454,23 @@ async def test_late_evening_digest_is_not_sent_in_quiet_hours(ctx, make_items, t
     assert await get(OnceKey, "digest:evening:2026-10-06") is None
 
 
-async def test_late_automatic_reminder_is_not_sent_in_quiet_hours(ctx, no_digests, make_items, t0, bot, get) -> None:
+async def test_late_automatic_reminder_is_not_sent_in_quiet_hours(
+    ctx, no_digests, make_items, t0, bot, local, get
+) -> None:
     [created] = await make_items({"kind": "purchase", "title": "Купить молоко"}, now=t0)  # 19:00, auto
     [reminder] = created.reminders
     assert reminder.auto is True
-    await Scheduler(ctx).tick(reminder.fire_at + timedelta(hours=4, minutes=40))  # 23:40
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(reminder.fire_at + timedelta(hours=4, minutes=40))  # 23:40
     assert bot.sent == []
-    assert (await get(Reminder, reminder.id)).status == "missed"  # 08:00 would be beyond the 6 h grace
+    # Iteration 3, §5: nothing is lost — it waits for 08:00, even though that is beyond the 6 h grace by then
+    stored = await get(Reminder, reminder.id)
+    assert (stored.status, stored.fire_at, stored.held_from) == ("pending", local(2026, 10, 7, 8, 0), reminder.fire_at)
+    await scheduler.tick(local(2026, 10, 7, 8, 0))
+    [msg] = bot.sent
+    assert msg["disable_notification"] is True
+    assert msg["text"].splitlines()[1] == "⏰ вчера 19:00 · опоздал на 13 ч"
+    assert (await get(Reminder, reminder.id)).status == "sent"
 
 
 async def test_late_automatic_reminder_waits_for_the_end_of_short_quiet_hours(

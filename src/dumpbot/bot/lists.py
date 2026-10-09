@@ -71,7 +71,7 @@ async def render(
         return views.today_list(agenda, prefs, now, lines=lines)
     if kind == LIST_MORNING:
         data = await digest.digest_data(session, "morning", prefs, at)
-        lines = await _pinned(session, kind, views.today_sections(data.agenda), refs)
+        lines = await _pinned(session, kind, views.morning_sections(data), refs)
         return views.morning_digest(data, prefs, now, lines=lines)
     if kind == LIST_EVENING:
         data = await digest.digest_data(session, "evening", prefs, at)

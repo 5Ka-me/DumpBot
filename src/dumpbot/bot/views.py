@@ -19,7 +19,12 @@ Rules:
 - iteration 3 (docs/features/iteration-3.md): /today, /tasks and the digests number their open lines with [✅ N]
   buttons (§2, "numbered lists" below); a reminder offers [🌙 Вечером] instead of [⏰ 15 мин] while the evening slot
   is more than an hour away (§4, ``offers_evening``); an edit applied by description is answered with a short line
-  ("✅ Закрыл «…»", "🕒 Перенёс «…» на …", "🗑 Удалил «…»") and [↩️ Отменить] (§3, ``edit_applied``).
+  ("✅ Закрыл «…»", "🕒 Перенёс «…» на …", "🗑 Удалил «…»") and [↩️ Отменить] (§3, ``edit_applied``); after a
+  downtime one silent "😴 Меня не было с 19:00 до 23:19…" (§5, ``downtime_notice``), a missed evening digest shows up
+  in the next morning digest as "🌙 Вчерашний итог (не успел прислать)" (``morning_sections``), a reminder held over
+  quiet hours says how late it is from its own time; a reply to a voice note shows what was heard, "🎤 «…»" (§6,
+  ``heard_line``, ``with_heard``; cards through ``CardExtras.heard``), and a voice note that gave only notes / ideas
+  gets "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] (``heard_items``).
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -122,6 +127,7 @@ HREF_MAX: Final = 1000
 QUESTION_MAX: Final = 300
 CANDIDATES_MAX: Final = 5
 STEP_TITLE_MAX: Final = 80
+HEARD_MAX: Final = 120  # "🎤 «…»": the transcript of a voice note, clipped
 PARENT_TITLE_MAX: Final = 60
 RELATED_SHOWN: Final = 2  # titles named on the card's "🔗 похоже на" line
 RELATED_SENT: Final = 3  # cards sent by [🔗 Похожее]
@@ -615,6 +621,7 @@ def item_card(
         lines.append("✅ сделано")
     lines += checklist_lines(steps, prefs, now)
     lines.append(_tags_line(item))
+    lines += filter(None, [heard_line(extras.heard if extras is not None else None)])
     lines += filter(None, [_source_line(item), _link_line(item)])
     if item.details and clip(item.details, DETAILS_MAX) != clip(item.title, DETAILS_MAX):
         lines.append(f"<i>{q(item.details, DETAILS_MAX)}</i>")
@@ -632,6 +639,51 @@ def item_card(
         related=bool(related),
     )
     return fit("\n".join(lines)), kb
+
+
+# --- voice notes: what the bot heard (docs/features/iteration-3.md §6) --------------------------------------------
+
+
+def heard_line(heard: str | None) -> str | None:
+    """ "🎤 «Купить наушники в обед»": the transcript of a voice note, one line of at most ``HEARD_MAX`` characters;
+    None without one."""
+    text = clip(heard, HEARD_MAX)
+    return f"🎤 «{esc(text)}»" if text else None
+
+
+def with_heard(view: View, heard: str | None) -> View:
+    """A reply to a voice note (an answer, a question, an edit…) with the "🎤 «…»" line on top."""
+    line = heard_line(heard)
+    if line is None:
+        return view
+    text, kb = view
+    return fit(f"{line}\n{text}"), kb
+
+
+def heard_items(heard: str, saved: Sequence[Item]) -> MenuView:
+    """A voice note that gave only notes / ideas (normally just 👌): "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить]
+    [🗑 Не то — удалить] (``ItemCb`` edit / del, as on a card), so a garbled transcript shows at once. Several items:
+    a numbered line each and [✏️ N] [🗑 N] (up to ``CANDIDATES_MAX``)."""
+    head = f"🎤 «{q(heard, HEARD_MAX)}» →"
+
+    def label(item: Item) -> str:
+        return f"{_kind_emoji(item.kind)} {esc(_kind_label(item.kind))} «{q(item.title, LIST_TITLE_MAX)}»"
+
+    if len(saved) == 1:
+        [item] = saved
+        kb = markup(
+            [
+                button("✏️ Изменить", ItemCb(a="edit", id=item.id)),
+                button("🗑 Не то — удалить", ItemCb(a="del", id=item.id), style="danger"),
+            ]
+        )
+        return fit(f"{head} {label(item)}"), kb
+    lines = [head, *(f"{n}. {label(item)}" for n, item in enumerate(saved, 1))]
+    rows = [
+        [button(f"✏️ {n}", ItemCb(a="edit", id=item.id)), button(f"🗑 {n}", ItemCb(a="del", id=item.id))]
+        for n, item in enumerate(saved[:CANDIDATES_MAX], 1)
+    ]
+    return fit("\n".join(lines)), markup(*rows)
 
 
 def steps_closed_text(title: str) -> str:
@@ -836,12 +888,16 @@ def _reminder_context(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) 
 
 def _late_line(reminder: Reminder | None, prefs: Prefs, now: datetime) -> str | None:
     """ "⏰ сегодня 13:00 · опоздал на 5 ч" for a reminder sent more than ``LATE_AFTER`` after its time (the PC slept,
-    the bot was down: the scheduler still sends it within ``missed_grace_minutes``) — without it the owner would read
-    the bare title as "now". None for one on time."""
-    if reminder is None or now - reminder.fire_at <= LATE_AFTER:
+    the bot was down: the scheduler still sends it within ``missed_grace_minutes``; one held over quiet hours counts
+    from its own time, ``held_from``) — without it the owner would read the bare title as "now". None for one on
+    time."""
+    if reminder is None:
         return None
-    minutes = round((now - reminder.fire_at).total_seconds() / 60)
-    return f"⏰ {fmt_dt(reminder.fire_at, prefs.zone, now=now)} · опоздал на {_rough_duration(minutes)}"
+    at = reminder.held_from or reminder.fire_at
+    if now - at <= LATE_AFTER:
+        return None
+    minutes = round((now - at).total_seconds() / 60)
+    return f"⏰ {fmt_dt(at, prefs.zone, now=now)} · опоздал на {_rough_duration(minutes)}"
 
 
 def _rough_duration(minutes: int) -> str:
@@ -876,6 +932,43 @@ def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime
     when = f"{fmt_date(fire.date(), today=_local(now, tz).date())} в {fmt_time(fire.time())}"
     lines = [f"🔔 <b>{q(item.title)}</b>", f"💤 отложено · напомню {when}"]
     return fit("\n".join(lines)), None
+
+
+def downtime_notice(
+    start: datetime,
+    end: datetime,
+    prefs: Prefs,
+    *,
+    late: int = 0,
+    held: int = 0,
+    held_until: datetime | None = None,
+    missed: int = 0,
+    folded: date | None = None,
+    morning: bool = False,
+) -> str:
+    """The one (silent) message after the bot was down (docs/features/iteration-3.md §5): "😴 Меня не было с 19:00 до
+    23:19 (компьютер спал?). Опоздало напоминаний: 1. Итог дня — в утреннем дайджесте." ``late`` counts the reminders
+    of the gap that come late, ``held`` of them wait for the end of quiet hours (``held_until``): "… 1 — пришлю в
+    08:00"; ``missed``: too old to send ("Не прислал устаревших напоминаний: 2 — эти дела в /today"); ``folded``: the
+    day whose evening digest goes into the morning digest (``morning``: it is still to come, else /today has them).
+    Times are local; the start gets its day when it is not the day the bot came back ("с вчера 19:00 до 08:30")."""
+    tz = prefs.zone
+    back = _local(end, tz)
+    since = _local(start, tz)
+    since_text = fmt_time(since.time()) if since.date() == back.date() else fmt_dt(start, tz, now=end)
+    parts = [f"😴 Меня не было с {since_text} до {fmt_time(back.time())} (компьютер спал?)."]
+    if late:
+        line = f"Опоздало напоминаний: {late}"
+        if held and held_until is not None:
+            at = fmt_time(_local(held_until, tz).time())
+            line += f" — пришлю в {at}" if held >= late else f" ({held} пришлю в {at})"
+        parts.append(f"{line}.")
+    if missed:
+        parts.append(f"Не прислал устаревших напоминаний: {missed} — эти дела в /today.")
+    if folded is not None:
+        whose = "Итог дня" if folded == back.date() else "Вчерашний итог"
+        parts.append(f"{whose} — в утреннем дайджесте." if morning else f"{whose} не прислал — несделанное в /today.")
+    return " ".join(parts)
 
 
 # --- lists and digests -------------------------------------------------------------------------------------------
@@ -961,14 +1054,17 @@ SEC_PERIOD: Final = "p"  # the running spans ("🗓 На этой неделе")
 SEC_DONE: Final = "d"  # done that day (never numbered)
 SEC_MISSED: Final = "m"  # evening: not done, already due
 SEC_AHEAD: Final = "a"  # evening: still ahead tonight
+SEC_YESTERDAY: Final = "y"  # morning: not done yesterday, whose evening digest could not be sent (§5)
 # Per list, the sections whose open lines are numbered, in numbering order.
 NUMBERED_SECTIONS: Final[dict[str, tuple[str, ...]]] = {
     LIST_TODAY: (SEC_OPEN, SEC_OVERDUE, SEC_PERIOD),
     LIST_TASKS: (SEC_OPEN,),
-    LIST_MORNING: (SEC_OPEN, SEC_OVERDUE, SEC_PERIOD),
+    LIST_MORNING: (SEC_OPEN, SEC_YESTERDAY, SEC_OVERDUE, SEC_PERIOD),
     LIST_EVENING: (SEC_MISSED, SEC_AHEAD, SEC_OVERDUE),
 }
 TODAY_EMPTY: Final = "На сегодня ничего не запланировано."
+YESTERDAY_TITLE: Final = "Вчерашний итог"
+YESTERDAY_NOTE: Final = "не успел прислать"
 TASKS_TITLE: Final = "📋 Открытые задачи"
 TASKS_EMPTY: Final = "Открытых задач нет 🎉"
 LIST_MORE_HINT: Final = "<i>Кнопки — у первых 20 дел; остальные — в /tasks или в Mini App</i>"
@@ -981,6 +1077,18 @@ type ListLines = dict[str, list[ListLine]]  # section -> its lines, in order
 def today_sections(agenda: Agenda) -> dict[str, list[Row]]:
     """/today and the morning digest (which leaves the done ones out)."""
     return {SEC_OPEN: agenda.open, SEC_OVERDUE: agenda.overdue, SEC_PERIOD: agenda.period_items, SEC_DONE: agenda.done}
+
+
+def morning_sections(data: DigestData) -> dict[str, list[Row]]:
+    """The morning digest: ``today_sections`` and, when yesterday's evening digest went into it (``data.yesterday``,
+    §5), yesterday's not-done rows in a section of their own — and not once more among the overdue."""
+    sections = today_sections(data.agenda)
+    if data.yesterday is not None:
+        rows = list(data.yesterday.open)
+        shown = {r.occurrence_id for r in rows}
+        sections[SEC_YESTERDAY] = rows
+        sections[SEC_OVERDUE] = [r for r in sections[SEC_OVERDUE] if r.occurrence_id not in shown]
+    return sections
 
 
 def evening_sections(agenda: Agenda, now: datetime) -> dict[str, list[Row]]:
@@ -1129,11 +1237,12 @@ def _period_lines(entries: Sequence[ListLine], prefs: Prefs, now: datetime, nb: 
 
 
 def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
-    """Morning plan "☀️ Доброе утро! План на сегодня, пт 9 окт": numbered open items, overdue, the running
-    spans ("🗓 На этой неделе"), recurring count; [✅ N] under them. ``lines``: a re-render."""
+    """Morning plan "☀️ Доброе утро! План на сегодня, пт 9 окт": numbered open items, yesterday's summary when its
+    evening digest could not be sent ("🌙 Вчерашний итог (не успел прислать)", §5), overdue, the running spans
+    ("🗓 На этой неделе"), recurring count; [✅ N] under them. ``lines``: a re-render."""
     agenda = data.agenda
     if lines is None:
-        lines = number_lines(LIST_MORNING, today_sections(agenda))
+        lines = number_lines(LIST_MORNING, morning_sections(data))
     nb = _Numbered(LIST_MORNING, agenda.day)
     head = [f"☀️ <b>Доброе утро!</b> План на сегодня, {fmt_date(agenda.day)}", ""]
     open_lines = [
@@ -1142,6 +1251,9 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
     ] or [TODAY_EMPTY]
     budget = MAX_TEXT - _TAIL_RESERVE - tg_len("\n".join(head))
     body = fit_lines(open_lines, budget)
+    if data.yesterday is not None and (summary := _yesterday_lines(data.yesterday, lines, prefs, now, nb)):
+        used = tg_len("\n".join(body))
+        body += ["", *summary[:2], *fit_lines(summary[2:], max(budget - used - 60, 60))]
     if overdue := lines.get(SEC_OVERDUE):
         used = tg_len("\n".join(body))
         overdue_lines = [
@@ -1157,6 +1269,23 @@ def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
         body += ["", f"🔁 Повторяющихся сегодня: {data.recurring_today}"]
     text = fit("\n".join(head + body))
     return text, _list_markup(nb, text)
+
+
+def _yesterday_lines(yesterday: Agenda, lines: ListLines, prefs: Prefs, now: datetime, nb: _Numbered) -> list[str]:
+    """ "🌙 <b>Вчерашний итог</b> (не успел прислать)", "Сделано 1 из 3", then yesterday's not-done lines numbered
+    like the rest of the morning digest ("4. 19:00 · 📌 Купить хлеб"); a line closed by its button since then counts
+    as done. [] when yesterday had nothing to report."""
+    entries = lines.get(SEC_YESTERDAY, [])
+    done = len(yesterday.done) + sum(row_done(r) for r, _ in entries)
+    left = sum(not row_done(r) for r, _ in entries)
+    if not done and not left:
+        return []
+    score = "Всё сделано 🎉" if not left else f"Сделано {done} из {done + left}"
+    body = [
+        nb.line(SEC_YESTERDAY, e, f"{_row_when(e[0], prefs, now, yesterday.day) or '—'} · {_row_title(e[0])}")
+        for e in entries
+    ]
+    return [f"🌙 <b>{YESTERDAY_TITLE}</b> ({YESTERDAY_NOTE})", score, *body]
 
 
 def evening_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
@@ -1247,6 +1376,8 @@ def help_text() -> str:
             "<b>Что присылать</b>",
             "• текст, голосовые и аудиофайлы (до 5 мин), фото и скриншоты (можно файлом), ссылки, пересланные посты",
             "• кружочки сохраняю без распознавания (с подписью — разберу подпись)",
+            "• в ответе на голосовое — 🎤 «…»: что я расслышал; заметку из голосового показываю коротко"
+            " с кнопкой «🗑 Не то — удалить»",
             "• в одном сообщении может быть несколько дел — разберу на отдельные записи",
             "• «завтра в 15 созвон», «купить молоко», «каждый понедельник в 9 планёрка»",
             "• заметки, идеи, мемы и ссылки отмечаю реакцией 👌, задачи и события — карточкой с кнопками",
@@ -1267,24 +1398,25 @@ def help_text() -> str:
             "• время записи — это время напоминания: «встреча в 15» — напомню в 15:00, «в обед» — в 13:00;"
             " задачи без времени — вечером (19:00)",
             "• «напомни за 30 минут до встречи в 15» — напомню в 14:30, а 15:00 останется в названии;"
-            " «за день и за час» — оба раза, а в плане запись стоит в день встречи",
-            "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00 (и утром первого дня,"
-            " если срок ещё не начался); такие дела каждое утро в плане, пока срок идёт",
+            " «за день и за час» — оба раза",
+            "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00;"
+            " такие дела каждое утро в плане, пока срок идёт",
             "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
             " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
-            "• в напоминании: ✅ Готово, ⏰ отложить на 1 час, 🌙 на вечер (19:00; пока до него больше часа,"
-            " а потом вместо неё — ⏰ 15 мин), 📅 на завтра — запись переезжает на новое время (и в плане на день,"
-            " и в приложении); напоминание заранее (накануне срока, «за день») просто придёт ещё раз — время записи"
-            " остаётся",
+            "• в напоминании: ✅ Готово, ⏰ на 1 час, 🌙 на вечер (19:00; позже — ⏰ 15 мин), 📅 на завтра — запись"
+            " переезжает на новое время (и в плане, и в приложении); напоминание заранее (накануне срока, «за день»)"
+            " просто придёт ещё раз",
             "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",
             "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
             "• в тихие часы приходят только напоминания с явно заданным временем",
+            "• компьютер спал: опоздавшее ночью напоминание придёт утром без звука, итог дня — в утреннем"
+            " дайджесте, и я коротко напишу, что меня не было",
             "• по утрам — план на день, вечером — итоги",
             "",
             "<b>Списки</b>",
             "• в /today, /tasks и дайджестах дела пронумерованы, под списком кнопки ✅ 1 ✅ 2 … (до 20):"
-            " нажал — дело закрыто, строка зачёркнута, кнопка стала ↩️ — отменить; у повторяющихся закрывается"
+            " нажал — дело закрыто, кнопка стала ↩️ — отменить; у повторяющихся закрывается"
             " текущий раз, у задачи с шагами — и шаги",
             "",
             "<b>Шаги и похожее</b>",
@@ -1298,11 +1430,9 @@ def help_text() -> str:
             "• «🔗 похоже на …» — подсказка о похожих старых записях (кнопка «🔗 Похожее»); дубли не объединяю",
             "",
             "<b>Приложение</b>",
-            "• кнопка «📱 Свалка» слева от поля ввода открывает Mini App: сегодня (и «📅 Перенести невыполненное"
-            " на завтра»), лента с поиском и картинками, задачи, карточки со всеми правками и чек-листом,"
-            " «закинуть в свалку», вопросы, настройки и расходы; несохранённый текст в приложении не пропадает",
-            "• кнопка появляется, когда приложение включено (README, раздел «Mini App»); записи из приложения в чат"
-            " не дублируются",
+            "• кнопка «📱 Свалка» слева от поля ввода открывает Mini App: сегодня, лента с поиском и картинками,"
+            " задачи, карточки со всеми правками, «закинуть в свалку», вопросы, настройки и расходы",
+            "• кнопка есть, когда приложение включено (README, «Mini App»); записи из приложения в чат не дублируются",
             "",
             "<b>Команды</b>",
             "/today — план на сегодня",

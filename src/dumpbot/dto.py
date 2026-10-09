@@ -115,11 +115,14 @@ class RelatedRef:
 
 @dataclass(frozen=True)
 class CardExtras:
-    """What an item card shows besides the item itself: its checklist, related items, its parent."""
+    """What an item card shows besides the item itself: its checklist, related items, its parent, and what the bot
+    heard in the voice message the item came from."""
 
     steps: tuple[Step, ...] = ()
     related: tuple[RelatedRef, ...] = ()  # newest first, all of them (the card names two)
     parent_title: str | None = None  # the item is a step of this parent
+    # The transcript of the voice note / audio the item was saved from ("🎤 «…»", docs/features/iteration-3.md §6).
+    heard: str | None = None
 
 
 @dataclass
@@ -155,3 +158,6 @@ class DigestData:
     kind: Literal["morning", "evening"]
     agenda: Agenda
     recurring_today: int = 0
+    # Morning only: the day before, when its evening digest could not be sent (the bot was down) — shown as
+    # "Вчерашний итог (не успел прислать)" (docs/features/iteration-3.md §5).
+    yesterday: Agenda | None = None

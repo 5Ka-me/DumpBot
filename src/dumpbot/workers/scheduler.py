@@ -1,23 +1,34 @@
 """Reminder / recurrence / digest loop (architecture.md §4.16). A DB-polling loop, no APScheduler.
 
 ``tick(now)``:
+0. the time of the tick is stored (``app_state`` "scheduler:last_tick"); a tick that finds the previous one
+   ``GAP_AFTER`` (15 min) or more in the past knows the bot was down (the PC slept, Docker stood still) — the first
+   tick after a restart too — and keeps a ``Downtime`` for the notice about it (step 5);
 1. reminders stuck in ``sending`` for over 2 min (the process died mid-send) -> ``pending``;
 2. claim due ``pending`` reminders (SKIP LOCKED, <= 20): item deleted / occurrence not open -> ``cancelled``;
    older than ``prefs.missed_grace_minutes`` -> ``missed`` (it shows up in the evening digest instead);
-   an automatic one (``auto``) that comes due late, inside quiet hours (the bot was down) -> back to ``pending`` at
-   the end of quiet hours, or ``missed`` if that is beyond the grace;
+   inside quiet hours, one more than ``HOLD_AFTER`` (30 min) late, or an automatic one (``auto``) late at all (the
+   bot was down) -> back to ``pending`` at the end of quiet hours with its own time in ``held_from``: it is sent
+   silently then, whatever the grace says by that time (docs/features/iteration-3.md §5);
    otherwise send ``views.reminder_message`` -> ``sent`` + ``tg_message_id``. A transient send error (network,
    Telegram 5xx or flood control, a dropped DB connection) -> back to ``pending`` without using up an attempt, and
    the rest of the claimed batch waits for the next tick: it is retried every tick until it is sent or missed. Any
    other error -> attempts + 1 and back to ``pending`` (``failed`` after 5);
 3. ``items.ensure_recurring`` (next instances of series);
 4. digests: target = ``shift_out_of_quiet(local digest time)``, window [target, target + 3 h), never sent inside
-   quiet hours (a digest that is late into them is dropped once its window closes), at most once per kind and
-   day via ``once_keys`` ``digest:{kind}:{YYYY-MM-DD}``; an empty digest is not sent;
-5. heartbeat file (its mtime feeds the Docker healthcheck).
+   quiet hours, at most once per kind and day via ``once_keys`` ``digest:{kind}:{YYYY-MM-DD}``; an empty digest is
+   not sent. An evening digest the bot was down for (no tick between its target and now) that cannot go out any more
+   (quiet hours, or its window closed) goes into the next morning digest instead: ``digest.folded_key`` marks its
+   day, and that morning digest shows its not-done items as "Вчерашний итог (не успел прислать)";
+5. after a downtime, once the reminders it delayed are handled: one silent message, only if anything was affected
+   (reminders sent late, held for the end of quiet hours or missed; a folded evening digest) — "😴 Меня не было с
+   19:00 до 23:19 (компьютер спал?). Опоздало напоминаний: 1. Итог дня — в утреннем дайджесте."
+   (``views.downtime_notice``);
+6. heartbeat file (its mtime feeds the Docker healthcheck).
 
 ``run`` registers with ``ctx.watchdog`` and beats before every tick, step and reminder. Silence for
-``stall_limit_s`` means the loop is stuck (no single step legitimately takes that long): the process exits.
+``stall_limit_s`` means the loop is stuck (no single step legitimately takes that long): the process exits. A PC that
+slept is no stall: the watchdog sees that the whole process was frozen and starts every limit afresh.
 
 Delivery is at-least-once: a crash between Telegram's answer and the commit resends after recovery.
 Each step is isolated: a failure is logged and the next step still runs.
@@ -28,9 +39,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from aiogram.exceptions import TelegramEntityTooLarge, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from sqlalchemy import func, select, update
@@ -42,10 +54,21 @@ from dumpbot.context import AppContext
 from dumpbot.db.models import Item, Occurrence, Reminder
 from dumpbot.domain import quiet, timeresolve
 from dumpbot.domain.prefs import Prefs
-from dumpbot.services import digest, items
+from dumpbot.services import app_state, digest, items
 from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, try_once
 
-__all__ = ["CLAIM_LIMIT", "DIGEST_WINDOW", "MAX_SEND_ATTEMPTS", "STALL_AFTER", "STUCK_AFTER", "Scheduler"]
+__all__ = [
+    "CLAIM_LIMIT",
+    "DIGEST_WINDOW",
+    "GAP_AFTER",
+    "HOLD_AFTER",
+    "LAST_TICK_KEY",
+    "MAX_SEND_ATTEMPTS",
+    "STALL_AFTER",
+    "STUCK_AFTER",
+    "Downtime",
+    "Scheduler",
+]
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +82,11 @@ MIN_SLEEP_S: Final = 0.2
 # that may each take 60 s to time out, with flood waits of up to 60 s between them (about 7 min).
 STALL_AFTER: Final = timedelta(minutes=15)
 WATCH_NAME: Final = "scheduler"
+# Wall-clock silence between two ticks (normally <= scheduler_interval_s apart) that means the bot was down.
+GAP_AFTER: Final = timedelta(minutes=15)
+# A reminder later than this that comes due inside quiet hours waits for their end (and then comes silently).
+HOLD_AFTER: Final = timedelta(minutes=30)
+LAST_TICK_KEY: Final = "scheduler:last_tick"
 # Errors that say nothing about the reminder itself: retried until it is sent or missed, never counted.
 TRANSIENT_ERRORS: Final = (
     TelegramNetworkError,
@@ -70,10 +98,35 @@ TRANSIENT_ERRORS: Final = (
 )
 
 
+@dataclass
+class Downtime:
+    """The bot was down from ``start`` (its last tick) to ``end`` (the first tick after it), and what that did — for
+    the one notice about it (docs/features/iteration-3.md §5)."""
+
+    start: datetime
+    end: datetime
+    late: set[int] = field(default_factory=set)  # reminders due in the gap, sent late
+    held: set[int] = field(default_factory=set)  # ... waiting for the end of quiet hours
+    missed: set[int] = field(default_factory=set)  # ... too old by now: not sent (/today lists their items)
+    held_until: datetime | None = None  # when the held ones come
+    folded: date | None = None  # the evening digest of this day goes into the next morning digest
+    morning: bool = False  # ... and that morning digest is still to come (else /today lists the not-done items)
+
+    def covers(self, fire_at: datetime) -> bool:
+        """``fire_at`` fell into the gap: the reminder was due while the bot was down."""
+        return self.start < fire_at <= self.end
+
+    @property
+    def affected(self) -> bool:
+        return bool(self.late or self.held or self.missed or self.folded)
+
+
 class Scheduler:
     def __init__(self, ctx: AppContext) -> None:
         self._ctx = ctx
         self._backlog = False  # more due reminders than one claim takes: tick again right away
+        self._unsent = False  # a due reminder waits for Telegram (a transient error): so does the downtime notice
+        self.downtime: Downtime | None = None  # the last gap, until its notice is sent
 
     @property
     def stall_limit_s(self) -> float:
@@ -101,12 +154,15 @@ class Scheduler:
 
     async def tick(self, now: datetime) -> None:
         self._backlog = False
+        self._unsent = False
         try:
             prefs = await self._load_prefs()
+            since = await self._note_tick(now)
             await self._step("recover", self._recover_stuck(now))
             await self._step("reminders", self._send_due(now, prefs))
             await self._step("recurring", self._ensure_recurring(now, prefs))
-            await self._step("digests", self._digests(now, prefs))
+            await self._step("digests", self._digests(now, prefs, since))
+            await self._step("downtime", self._report_downtime(now, prefs))
         finally:
             _write_heartbeat(self._ctx.settings.heartbeat_file, now)
 
@@ -127,6 +183,38 @@ class Scheduler:
             prefs = await self._ctx.prefs(session)
             await session.commit()
         return prefs
+
+    async def _note_tick(self, now: datetime) -> datetime | None:
+        """Store ``now`` as the last tick; return the tick before it, or the start of the downtime whose notice is
+        still pending (None: unknown, e.g. the first tick ever). A gap of ``GAP_AFTER`` or more opens a
+        ``Downtime``; another one before that notice went out extends it (one notice for both)."""
+        self._alive()
+        try:
+            async with self._ctx.sessionmaker() as session:
+                stored = await app_state.swap(session, LAST_TICK_KEY, now.isoformat())
+                await session.commit()
+        except Exception as e:
+            log.error("last tick not stored: %s", describe_error(e))
+            stored = None
+        prev = _parse_time(stored)
+        if prev is not None and now - prev >= GAP_AFTER:
+            log.warning("no scheduler tick from %s to %s: the bot was down", prev.isoformat(), now.isoformat())
+            if self.downtime is None:
+                self.downtime = Downtime(start=prev, end=now)
+            else:
+                self.downtime.end = now
+        return self.downtime.start if self.downtime is not None else prev
+
+    def _affect(self, outcome: str, reminder_id: int, fire_at: datetime, until: datetime | None = None) -> None:
+        """Count a reminder that was due during the current downtime as ``late`` / ``held`` / ``missed``."""
+        dt = self.downtime
+        if dt is None or not dt.covers(fire_at):
+            return
+        for name in ("late", "held", "missed"):
+            getattr(dt, name).discard(reminder_id)
+        getattr(dt, outcome).add(reminder_id)
+        if until is not None:
+            dt.held_until = until
 
     async def _recover_stuck(self, now: datetime) -> None:
         stmt = (
@@ -150,6 +238,7 @@ class Scheduler:
                 # Telegram is unreachable: the others would fail too (each send may take a minute to time out),
                 # and an immediate backlog tick would spin. They wait for the next regular tick.
                 self._backlog = False
+                self._unsent = True
                 await self._unclaim(ids[n + 1 :])
                 return
 
@@ -207,20 +296,19 @@ class Scheduler:
                 if item.status == "deleted" or occ.status != "open":
                     await self._finish(reminder_id, status="cancelled")
                     return True
-                grace = timedelta(minutes=prefs.missed_grace_minutes)
-                if now - reminder.fire_at > grace:
-                    log.info("reminder %s missed (fire_at %s)", reminder_id, reminder.fire_at.isoformat())
+                fire_at, held = reminder.fire_at, reminder.held_from is not None
+                if now - fire_at > timedelta(minutes=prefs.missed_grace_minutes):
+                    log.info("reminder %s missed (fire_at %s)", reminder_id, fire_at.isoformat())
                     await self._finish(reminder_id, status="missed")
+                    self._affect("missed", reminder_id, fire_at)
                     return True
-                if reminder.auto and quiet.in_quiet_hours(now, prefs):
-                    # Planned outside quiet hours but due late (downtime, a sleeping PC): automatic messages
-                    # wait for the end of quiet hours, unless they would be too stale by then.
+                if not held and quiet.in_quiet_hours(now, prefs) and (reminder.auto or now - fire_at > HOLD_AFTER):
+                    # Due late into quiet hours (downtime, a sleeping PC): it waits for their end and comes silently
+                    # then, without a second look at the grace; an automatic one never rings in quiet hours.
                     later = quiet.shift_out_of_quiet(now, prefs)
-                    if later - reminder.fire_at > grace:
-                        await self._finish(reminder_id, status="missed")
-                    else:
-                        await self._finish(reminder_id, status="pending", fire_at=later)
-                    log.info("automatic reminder %s not sent in quiet hours", reminder_id)
+                    await self._finish(reminder_id, status="pending", fire_at=later, held_from=fire_at)
+                    self._affect("held", reminder_id, fire_at, until=later)
+                    log.info("late reminder %s held until the end of quiet hours", reminder_id)
                     return True
                 parent_title = None
                 if item.parent_id is not None:  # a step of a checklist names its parent
@@ -229,11 +317,13 @@ class Scheduler:
                 item_id, occ_id = item.id, occ.id
             # No transaction is held while waiting for Telegram.
             message_id = await sender.send(
-                self._ctx, text, markup, purpose="reminder", item_id=item_id, occurrence_id=occ_id
+                self._ctx, text, markup, purpose="reminder", item_id=item_id, occurrence_id=occ_id, silent=held
             )
         except Exception as e:
             return await self._send_failed(reminder_id, e)
         await self._finish(reminder_id, status="sent", sent_at=now, tg_message_id=message_id)
+        if now - fire_at > views.LATE_AFTER:
+            self._affect("late", reminder_id, fire_at)
         log.info("reminder %s sent", reminder_id)
         return True
 
@@ -280,7 +370,8 @@ class Scheduler:
         if created:
             log.info("created %d next occurrence(s) of recurring items", created)
 
-    async def _digests(self, now: datetime, prefs: Prefs) -> None:
+    async def _digests(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
+        await self._fold_missed_evening(now, prefs, since)  # before the morning digest that shows it
         tz = prefs.zone
         today = now.astimezone(tz).date()
         for kind in DIGEST_KINDS:
@@ -318,6 +409,66 @@ class Scheduler:
                 raise
         log.info("%s digest for %s sent", kind, day)
 
+    async def _fold_missed_evening(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
+        """An evening digest the bot was down for (no tick between ``since`` and its target) that can no longer go
+        out (``now`` is in quiet hours, or its window has closed) goes into the next morning digest: its once-key is
+        taken (it is never sent late) and, unless it would be empty, its day is marked with ``digest.folded_key``."""
+        if since is None or not prefs.digest_evening_enabled:
+            return
+        tz = prefs.zone
+        today = now.astimezone(tz).date()
+        for day in (today - timedelta(days=1), today):
+            nominal = timeresolve.localize(day, prefs.digest_evening_time, tz).astimezone(UTC)
+            target = quiet.shift_out_of_quiet(nominal, prefs)
+            if not since < target <= now:
+                continue
+            if now < target + DIGEST_WINDOW and not quiet.in_quiet_hours(now, prefs):
+                continue  # it still goes out now, late
+            async with self._ctx.sessionmaker() as session:
+                if not await try_once(session, f"digest:evening:{day.isoformat()}"):
+                    continue  # sent (or found empty) before the bot went down
+                data = await digest.build_digest(session, "evening", prefs, nominal)
+                if data is not None:
+                    await try_once(session, digest.folded_key(day))
+                await session.commit()
+            if data is None:
+                log.info("missed evening digest for %s: nothing to report", day)
+                continue
+            log.info("missed evening digest for %s goes into the next morning digest", day)
+            if self.downtime is not None:
+                self.downtime.folded = day
+                self.downtime.morning = _morning_ahead(day + timedelta(days=1), now, prefs)
+
+    async def _report_downtime(self, now: datetime, prefs: Prefs) -> None:
+        """The one silent notice after a downtime, once the reminders it delayed are handled (none waits for
+        Telegram, no backlog left) and only if something was affected. A failed send is tried again on the next
+        tick, for up to ``missed_grace_minutes`` after the bot came back."""
+        dt = self.downtime
+        if dt is None or self._backlog or self._unsent:
+            return
+        if not dt.affected:
+            self.downtime = None
+            log.info("the downtime %s - %s affected nothing", dt.start.isoformat(), dt.end.isoformat())
+            return
+        if now - dt.end > timedelta(minutes=prefs.missed_grace_minutes):
+            self.downtime = None
+            log.warning("downtime notice dropped: it could not be sent in time")
+            return
+        text = views.downtime_notice(
+            dt.start,
+            dt.end,
+            prefs,
+            late=len(dt.late) + len(dt.held),
+            held=len(dt.held),
+            held_until=dt.held_until,
+            missed=len(dt.missed),
+            folded=dt.folded,
+            morning=dt.morning,
+        )
+        await sender.send(self._ctx, text, purpose="notice", silent=True)
+        self.downtime = None
+        log.info("downtime notice sent")
+
     async def _sleep_for(self, now: datetime) -> float:
         """Seconds until the next pending reminder, capped by ``settings.scheduler_interval_s``.
 
@@ -335,6 +486,25 @@ class Scheduler:
         if nxt is None:
             return interval
         return max(MIN_SLEEP_S, min(interval, (nxt - now).total_seconds()))
+
+
+def _parse_time(value: Any) -> datetime | None:
+    """A stored ISO time as aware UTC; None for anything else."""
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+
+
+def _morning_ahead(day: date, now: datetime, prefs: Prefs) -> bool:
+    """The morning digest of local ``day`` is still to come (or goes out in this very tick): on, its window open."""
+    if not prefs.digest_morning_enabled:
+        return False
+    nominal = timeresolve.localize(day, prefs.digest_morning_time, prefs.zone).astimezone(UTC)
+    return now < quiet.shift_out_of_quiet(nominal, prefs) + DIGEST_WINDOW
 
 
 def _is_transient(error: BaseException) -> bool:

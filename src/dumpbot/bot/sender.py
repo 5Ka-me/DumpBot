@@ -47,6 +47,9 @@ PURPOSE_QUESTION: Final = "ask_prompt"  # /ask without text: the reply is the qu
 # "✅ Закрыл «…»" [↩️ Отменить]: an edit applied by description (item_id: a reply to it edits the item, like a card;
 # not a "card", so a checklist change never redraws it into one).
 PURPOSE_EDITED: Final = "edited"
+# "🎤 «…» → 💡 Идея «…»": a voice note that gave only notes / ideas (iteration 3, §6). item_id when it is one item (a
+# reply to it edits the item); not a "card", so a checklist change never redraws it into one.
+PURPOSE_HEARD: Final = "heard"
 
 _NOT_MODIFIED: Final = "message is not modified"
 _CANT_EDIT: Final[tuple[str, ...]] = (

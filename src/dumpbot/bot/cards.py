@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -51,18 +52,25 @@ async def render_card(
     prefs: Prefs,
     now: datetime,
     warnings: Sequence[str] = (),
+    *,
+    heard: str | None = None,
 ) -> View:
-    """``views.item_card`` with what the card shows besides the item (checklist, related items, parent)."""
+    """``views.item_card`` with what the card shows besides the item (checklist, related items, parent, the transcript
+    of the voice note it came from); ``heard`` replaces that transcript (the card answers another voice note)."""
     extras = await query.card_extras(session, item)
+    if heard is not None:
+        extras = replace(extras, heard=heard)
     return views.item_card(item, occ, reminders, prefs, now, warnings=warnings, extras=extras)
 
 
-async def patch_card(session: AsyncSession, result: PatchResult, prefs: Prefs, now: datetime) -> View:
-    """Card after ``items.apply_patch`` (``deleted_card`` for a deleted item)."""
+async def patch_card(
+    session: AsyncSession, result: PatchResult, prefs: Prefs, now: datetime, *, heard: str | None = None
+) -> View:
+    """Card after ``items.apply_patch`` (``deleted_card`` for a deleted item); ``heard``: see ``render_card``."""
     if result.deleted or result.item.status == "deleted":
         return views.deleted_card(result.item)
     return await render_card(
-        session, result.item, result.occurrence, result.reminders, prefs, now, warnings=result.warnings
+        session, result.item, result.occurrence, result.reminders, prefs, now, warnings=result.warnings, heard=heard
     )
 
 

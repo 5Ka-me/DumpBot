@@ -34,7 +34,9 @@ def test_stalled_reports_only_watched_loops_silent_beyond_their_limit() -> None:
 
 def test_thread_reports_a_stall_once_and_stop_forgets_the_loops() -> None:
     clock = FakeMonotonic()
-    dog = Watchdog(check_every_s=0.01, monotonic=clock)
+    # The fake clock jumps 61 s between two checks 10 ms apart: with the default allowance that would read as a
+    # frozen process (a suspend, see below), so this thread may be late by up to 1000 s.
+    dog = Watchdog(check_every_s=0.01, monotonic=clock, suspend_after_s=1000)
     dog.watch("scheduler", 60)
     calls: list[dict[str, float]] = []
     called = threading.Event()
@@ -66,5 +68,51 @@ def test_beats_keep_a_loop_alive() -> None:
         clock.now += 5
         dog.beat("jobs")
         threading.Event().wait(0.005)
+    dog.stop()
+    assert calls == []
+
+
+def test_a_frozen_process_is_no_stall() -> None:
+    """A PC that slept: the checking thread itself was frozen, so its next check comes hours late — every loop starts
+    its limit afresh instead of being reported (docs/features/iteration-3.md §5)."""
+    clock = FakeMonotonic()
+    dog = Watchdog(check_every_s=15, monotonic=clock)
+    dog.watch("scheduler", 900)
+    dog.watch("jobs", 1800)
+    assert dog.check() == {}  # the first check: nothing to compare with
+
+    clock.now += 4 * 3600  # 19:00 -> 23:19 asleep
+    assert dog.stalled() == {"scheduler": 4 * 3600, "jobs": 4 * 3600}
+    assert dog.check() == {}  # a suspend, not a stall
+    assert dog.stalled() == {}
+
+    for _ in range(60):  # the limits run again from the wake-up, checked on time
+        clock.now += 15
+        dog.beat("jobs")
+        assert dog.check() == {}
+    clock.now += 15
+    assert dog.check() == {"scheduler": 915}  # a loop that stays silent is a stall again
+
+
+def test_a_hung_loop_is_still_reported_while_the_thread_checks_on_time() -> None:
+    clock = FakeMonotonic()
+    dog = Watchdog(check_every_s=15, monotonic=clock)
+    dog.watch("scheduler", 60)
+    dog.check()
+    for _ in range(4):
+        clock.now += 15
+        assert dog.check() == {}
+    clock.now += 15
+    assert dog.check() == {"scheduler": 75}
+
+
+def test_thread_survives_a_suspend() -> None:
+    clock = FakeMonotonic()
+    dog = Watchdog(check_every_s=0.01, monotonic=clock)
+    dog.watch("scheduler", 60)
+    calls: list[dict[str, float]] = []
+    dog.start(calls.append)
+    clock.now += 4 * 3600  # one jump: the whole process slept
+    threading.Event().wait(0.1)
     dog.stop()
     assert calls == []

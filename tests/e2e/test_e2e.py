@@ -373,9 +373,14 @@ async def test_morning_and_evening_digests(e2e: Any) -> None:
     await e2e.tick(local(2026, 10, 7, 9, 5))
     assert len(e2e.tg.sent) == sent_before + 1  # once a day
 
-    # Wed 21:00: the evening digest lists the not-done task and offers to move it
+    # Wed 21:00: the evening digest lists the not-done task and offers to move it. No tick since 09:05: to the
+    # scheduler the bot was down all day, and the 10:00 reminder it never sent gets the one silent notice (§5).
     await e2e.tick(local(2026, 10, 7, 21, 0))
-    [evening] = e2e.tg.sent[sent_before + 1 :]
+    [evening, notice] = e2e.tg.sent[sent_before + 1 :]
+    assert notice.text == (
+        "😴 Меня не было с 09:05 до 21:00 (компьютер спал?). Не прислал устаревших напоминаний: 1 — эти дела в /today."
+    )
+    assert notice.params["disable_notification"] == "true"
     assert evening.text.startswith("🌙 <b>Итоги дня</b>")
     assert "<b>Не сделано</b>" in evening.text and "10:00 · 📌 Позвонить маме" in evening.text
     move = evening.button("d:tmr:20261007")  # the digest's own day travels with the button

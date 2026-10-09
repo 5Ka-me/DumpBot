@@ -31,6 +31,10 @@ the open items is applied at once and answered with what changed and [↩️ О�
 difference with the raw message); with several the owner picks one, and the pick gets the edit already read from the
 message (``EDIT_KEY``, no second AI call).
 
+Voice notes (§6): every reply to one shows what was heard, "🎤 «…»" (cards: ``CardExtras.heard``; answers, questions,
+candidate lists and edits: the line on top). One that gave only notes / ideas (otherwise just 👌) gets the short
+"🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить], so that a garbled transcript shows at once.
+
 Data changes are committed before their cards are sent (a lost card never duplicates items); replies that change
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
 Everything sent in quiet hours is silent (a deferred message can be processed at night); the final reaction goes on
@@ -271,7 +275,7 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         if not await try_once(session, key):
             return  # applied concurrently
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
-        view = await _patch_view(session, result, prefs)
+        view = await _patch_view(session, result, prefs, heard=_heard([raw]))
         fresh = await _reload(session, [raw])
         _finish(fresh, image_text)
         _app_update(fresh, edited=[item_id])
@@ -757,6 +761,21 @@ async def _save(
         if not _is_app(raws):  # the app shows the question from raw_json and answers it with POST …/answer
             await _send_ask(ctx, prefs, raws, ask)
         return
+    heard = _heard(raws)
+    if heard and created and not shown and not _is_app(raws):
+        # Only notes / ideas from a voice note: no card, but the owner sees what was heard (a garbled transcript).
+        saved = [c.item for c in created]
+        text, markup = views.heard_items(heard, saved)
+        await _send(
+            ctx,
+            text,
+            markup,
+            prefs=prefs,
+            reply_to=primary.message_id,
+            purpose=sender.PURPOSE_HEARD,
+            item_id=saved[0].id if len(saved) == 1 else None,
+            raw_message_id=primary.id,
+        )
     for created_item, (text, markup) in shown:
         occ = created_item.occurrence
         await _send(
@@ -791,7 +810,7 @@ async def _cards(
 
 async def _send_ask(ctx: AppContext, prefs: Prefs, raws: list[RawMessage], ask: Ask) -> None:
     primary = raws[0]
-    text, markup = views.ask_message(ask, primary.id)
+    text, markup = views.with_heard(views.ask_message(ask, primary.id), _heard(raws))
     reply_to, raw_id = primary.message_id, primary.id
     await _send(ctx, text, markup, prefs=prefs, reply_to=reply_to, purpose=sender.PURPOSE_ASK, raw_message_id=raw_id)
     await _react(ctx, raws, sender.REACT_ASK)
@@ -818,6 +837,7 @@ async def _reply_query(
         text = views.fit(views.esc(found.text))
     else:
         text, markup = views.rows_list(found.title, found.rows, prefs, clock.utcnow(), empty=NOTHING_FOUND)
+    text, markup = views.with_heard((text, markup), _heard(raws))
     await sender.send(
         ctx,
         text,
@@ -969,6 +989,7 @@ async def _apply_edit(
                 steps_closed=applied.steps_closed,
                 warnings=result.warnings,
             )
+            view = views.with_heard(view, _heard(raws))
         await session.commit()
         events = items_svc.take_parent_events(session)
     if applied is None or view is None:
@@ -1016,7 +1037,7 @@ async def _send_candidates(
     if _is_app(raws):  # the app lists them from raw_json and picks with POST /api/inbox/{raw_id}/pick
         await _mark_done(ctx, raws, image_text)
         return
-    text, markup = views.edit_candidates(rows, primary.id, prefs, clock.utcnow())
+    text, markup = views.with_heard(views.edit_candidates(rows, primary.id, prefs, clock.utcnow()), _heard(raws))
     await sender.send(
         ctx,
         text,
@@ -1030,8 +1051,11 @@ async def _send_candidates(
     await _react(ctx, raws, sender.REACT_ASK)
 
 
-async def _patch_view(session: AsyncSession, result: PatchResult, prefs: Prefs) -> View:
-    return await cards.patch_card(session, result, prefs, clock.utcnow())
+async def _patch_view(session: AsyncSession, result: PatchResult, prefs: Prefs, *, heard: str | None = None) -> View:
+    """The card after an edit; ``heard``: the transcript of a voice edit, shown on the card instead of the item's own
+    ("🎤 «…»", docs/features/iteration-3.md §6)."""
+    view = await cards.patch_card(session, result, prefs, clock.utcnow(), heard=heard)
+    return views.with_heard(view, heard) if result.deleted or result.item.status == "deleted" else view
 
 
 async def _send_patch_card(
@@ -1648,6 +1672,13 @@ async def _react(ctx: AppContext, raws: Sequence[RawMessage], emoji: str) -> Non
 def _clarified_key(raw_id: int) -> str:
     """once_keys marker of an applied clarification (not the job's dedupe key ``clarify:{raw_id}``)."""
     return f"clarify-done:{raw_id}"
+
+
+def _heard(raws: Sequence[RawMessage]) -> str | None:
+    """What the bot heard in the voice notes / audio files among ``raws`` (their transcripts, in order) — the
+    "🎤 «…»" line of every reply to them (docs/features/iteration-3.md §6); None without any."""
+    texts = [r.transcript.strip() for r in raws if r.content_type in VOICE_TYPES and r.transcript]
+    return " ".join(t for t in texts if t) or None
 
 
 def _msg_now(raw: RawMessage) -> datetime:
