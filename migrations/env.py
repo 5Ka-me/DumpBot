@@ -6,6 +6,9 @@ Database URL, first hit wins:
 3. ``DATABASE_URL`` from ``.env`` in the current directory or next to alembic.ini (local dev);
 4. the default of ``dumpbot.config.Settings``.
 
+Like ``Settings``, a ``postgres://`` / ``postgresql://`` URL (as Supabase or Render hand it out) gets the asyncpg
+driver (``dumpbot.db.engine.normalize_url``).
+
 ``Settings`` is never instantiated, so migrations run without BOT_TOKEN / CHUTES_API_KEY.
 A caller may also pass a ready sync connection in ``config.attributes["connection"]``.
 """
@@ -26,6 +29,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from dumpbot.config import Settings
 from dumpbot.db import models  # noqa: F401  (registers all tables on Base.metadata)
 from dumpbot.db.base import Base
+from dumpbot.db.engine import normalize_url
 
 config = context.config
 if config.config_file_name is not None:
@@ -76,6 +80,10 @@ def dotenv_paths() -> list[Path]:
 
 
 def database_url() -> str:
+    return normalize_url(_configured_url())
+
+
+def _configured_url() -> str:
     if explicit := config.get_main_option("sqlalchemy.url"):
         return explicit
     for key in (URL_KEY, URL_KEY.lower()):

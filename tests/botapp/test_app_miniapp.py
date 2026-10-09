@@ -1,11 +1,14 @@
 """The Mini App in the bot's lifecycle (docs/features/iteration-2.md §D): the web server starts with the background
-tasks and stops first at shutdown; the owner's menu button opens the app ("📱 Свалка") or stays the commands menu."""
+tasks and stops first at shutdown; the owner's menu button opens the app ("📱 Свалка") or stays the commands menu.
+The keep-alive ping (``KEEPALIVE_URL``) starts next to the web server, pings its ``/healthz``, stays out of the
+watchdog and stops before the web server."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import socket
+import time
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +19,9 @@ from aiogram.methods import SetChatMenuButton
 from aiogram.types import MenuButtonCommands, MenuButtonWebApp
 
 from dumpbot.bot import app as app_module
-from dumpbot.bot.app import Lifecycle, build_app, build_bot, menu_url
+from dumpbot.bot.app import Lifecycle, build_app, build_bot, default_keepalive, menu_url
 from dumpbot.context import AppContext
+from dumpbot.keepalive import KeepAlive
 from dumpbot.web.server import WebServer
 
 OWNER = 4242
@@ -142,6 +146,96 @@ async def test_build_app_passes_the_web_factory(settings_factory, tg, build) -> 
     assert app.lifecycle.web is not None and app.lifecycle.web.running
     await app.dp.emit_shutdown()
     assert app.lifecycle.web is None
+    await app.cleanup()
+
+
+# --- keep-alive ----------------------------------------------------------------------------------------------------
+
+
+def _free_port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+async def test_keepalive_pings_healthz_and_stops_before_the_web_server(settings_factory, tg, build, caplog) -> None:
+    settings = settings_factory(webapp_enabled=True)
+    bot = build_bot(settings, session=tg)
+    ctx = _ctx(settings, bot)
+    port = _free_port()
+    exits: list[int] = []
+    order: list[str] = []
+
+    def web(c: AppContext) -> WebServer:
+        return WebServer(c, host="127.0.0.1", port=port, static_dir=build)
+
+    def healthz_hits() -> int:
+        return sum(r.getMessage().startswith("GET /healthz 200") for r in caplog.records)
+
+    async with aiohttp.ClientSession() as http:
+        keepalive = KeepAlive(f"http://127.0.0.1:{port}/healthz", http, interval_s=0.02)
+        lifecycle = Lifecycle(ctx, runners=_no_runners, web=web, keepalive=keepalive, exit_func=exits.append)
+        with caplog.at_level(logging.DEBUG, logger="dumpbot"):
+            await lifecycle.startup(bot)
+            assert keepalive.running and lifecycle.web is not None
+            deadline = time.monotonic() + 5
+            while healthz_hits() < 3:
+                assert time.monotonic() < deadline, "no keep-alive pings"
+                await asyncio.sleep(0.01)
+
+            server = lifecycle.web
+            stop_keepalive, stop_web = keepalive.stop, server.stop
+
+            async def recording_keepalive_stop() -> None:
+                order.append("keepalive")
+                await stop_keepalive()
+
+            async def recording_web_stop() -> None:
+                order.append("web")
+                await stop_web()
+
+            keepalive.stop = recording_keepalive_stop  # type: ignore[method-assign]
+            server.stop = recording_web_stop  # type: ignore[method-assign]
+            await lifecycle.shutdown()
+
+    assert order == ["keepalive", "web"]
+    assert not keepalive.running and lifecycle.web is None
+    assert "keep-alive is on: GET 127.0.0.1 every 0 s" in caplog.text
+    assert "keep-alive ping to 127.0.0.1 answered" in caplog.text
+    assert ctx.watchdog._limits == {} and ctx.watchdog._beats == {}  # neither watched nor beating
+    assert exits == []
+
+
+async def test_default_keepalive(settings_factory, caplog) -> None:
+    async with aiohttp.ClientSession() as http:
+        assert default_keepalive(settings_factory(), http) is None
+        settings = settings_factory(keepalive_url=" https://dump-bot.onrender.com/healthz ", keepalive_interval_s=300)
+        keepalive = default_keepalive(settings, http)
+        assert isinstance(keepalive, KeepAlive)
+        assert (keepalive.url, keepalive.host, keepalive.interval_s) == (
+            "https://dump-bot.onrender.com/healthz",
+            "dump-bot.onrender.com",
+            300,
+        )
+        assert keepalive._http is http
+        with caplog.at_level(logging.WARNING):
+            assert default_keepalive(settings_factory(keepalive_url="dump-bot.onrender.com/healthz"), http) is None
+        assert "KEEPALIVE_URL must be an http(s):// address; keep-alive is off" in caplog.text
+
+
+async def test_build_app_gives_keepalive_the_shared_session(settings_factory, tg) -> None:
+    settings = settings_factory(
+        database_url="postgresql+asyncpg://nobody:x@127.0.0.1:1/none",
+        keepalive_url="http://127.0.0.1:1/healthz",  # never reached: the first ping is due in 10 minutes
+    )
+    app = await build_app(settings, bot_session=tg, runners=_no_runners, exit_func=lambda code: None)
+    keepalive = app.lifecycle.keepalive
+    assert keepalive is not None and keepalive.interval_s == 600
+    assert keepalive._http is app.ctx.ai._http
+    await app.dp.emit_startup(bot=app.bot)
+    assert keepalive.running
+    await app.dp.emit_shutdown()
+    assert not keepalive.running and app.ctx.ai._http.closed
     await app.cleanup()
 
 

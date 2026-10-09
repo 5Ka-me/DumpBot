@@ -361,6 +361,7 @@ async def test_build_app_and_cleanup(settings_factory, tg) -> None:
     http = app.ctx.ai._http  # the shared session
     assert http is app.ctx.stt._backends["chutes"]._http and not http.closed
     assert not app.ctx.stt.local_configured  # LOCAL_STT_URL is empty
+    assert app.lifecycle.keepalive is None  # KEEPALIVE_URL is empty
 
     await app.dp.emit_startup(bot=app.bot)
     await _settle()

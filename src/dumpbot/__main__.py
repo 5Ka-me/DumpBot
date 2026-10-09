@@ -1,8 +1,8 @@
 """Entry point: ``python -m dumpbot`` (or the ``dumpbot`` script).
 
-logging -> Settings -> app (engine, shared HTTP session, AI clients, bot, dispatcher) -> long polling until
-SIGTERM / Ctrl+C. Pending updates are never dropped: Telegram keeps them for 24 h and the raw-message table makes
-redelivery idempotent.
+logging -> Settings -> (with ``MIGRATE_ON_START``: ``alembic upgrade head``) -> app (engine, shared HTTP session, AI
+clients, bot, dispatcher) -> long polling until SIGTERM / Ctrl+C. Pending updates are never dropped: Telegram keeps
+them for 24 h and the raw-message table makes redelivery idempotent.
 """
 
 from __future__ import annotations
@@ -17,11 +17,15 @@ from dumpbot import logging_setup
 from dumpbot.config import Settings
 
 if TYPE_CHECKING:
+    from alembic.config import Config
+
     from dumpbot.bot.app import App
 
 log = logging.getLogger("dumpbot")
 
 EXIT_CONFIG_ERROR = 2
+EXIT_MIGRATION_ERROR = 3
+ALEMBIC_INI = "alembic.ini"  # in the working directory: /app in the image, next to migrations/
 
 
 def load_settings() -> Settings:
@@ -51,10 +55,32 @@ async def run(settings: Settings) -> None:
         await app.cleanup()
 
 
+def migrate(log_level: str | int | None, config: Config | None = None) -> None:
+    """``alembic upgrade head`` in-process (``MIGRATE_ON_START``, for hosts without a separate migrate step). The URL
+    comes from ``DATABASE_URL`` as for the ``alembic`` CLI (migrations/env.py). ``config`` defaults to ``alembic.ini``
+    in the working directory; its logging section replaces ours, so ours is set up again afterwards. A failure is
+    logged with its traceback and exits with ``EXIT_MIGRATION_ERROR``: the host shows the error and restarts the
+    service instead of running a bot without its tables."""
+    from alembic import command
+    from alembic.config import Config
+
+    log.info("applying database migrations (alembic upgrade head)")
+    try:
+        command.upgrade(config if config is not None else Config(ALEMBIC_INI), "head")
+    except Exception:
+        logging_setup.setup(log_level)
+        log.critical("database migrations failed; exiting", exc_info=True)
+        raise SystemExit(EXIT_MIGRATION_ERROR) from None
+    logging_setup.setup(log_level)
+    log.info("database migrations are up to date")
+
+
 def main() -> None:
     logging_setup.setup()
     settings = load_settings()
     logging_setup.setup(settings.log_level)
+    if settings.migrate_on_start:
+        migrate(settings.log_level)
     log.info(
         "starting (owner %s, local Whisper %s)", settings.owner_id or "not set", settings.local_stt_url.strip() or "off"
     )

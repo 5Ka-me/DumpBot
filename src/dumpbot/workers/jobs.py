@@ -35,6 +35,7 @@ from typing import Any, Final
 from aiogram.exceptions import TelegramAPIError, TelegramNetworkError
 from sqlalchemy import BigInteger, and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dumpbot import clock
@@ -416,18 +417,36 @@ class JobWorker:
 
 
 def describe_error(e: BaseException) -> str:
-    """``Type: message`` for our own content-free errors, ``Type at file:line`` for everything else."""
+    """``Type: message`` for our own content-free errors, ``Type at file:line`` for everything else; a database
+    error also names the driver's error and its SQLSTATE, still without the message:
+    ``ProgrammingError (UndefinedTableError 42P01) at asyncpg.py:797``."""
     name = type(e).__name__
     # Network errors may quote the request URL, which contains the bot token for Telegram calls.
     if isinstance(e, AIError | RetryLater | TelegramAPIError) and not isinstance(e, TelegramNetworkError):
         text = (e.message if isinstance(e, TelegramAPIError) else str(e)) or ""
         text = _TOKEN_RE.sub("bot<token>", text.strip())
         return f"{name}: {text}"[:_ERROR_MAX] if text else name
+    if isinstance(e, DBAPIError):
+        name += _db_detail(e)
     tb = traceback.extract_tb(e.__traceback__)
     if tb:
         last = tb[-1]
         return f"{name} at {last.filename.replace(chr(92), '/').rsplit('/', 1)[-1]}:{last.lineno}"
     return name
+
+
+def _db_detail(e: DBAPIError) -> str:
+    """`` (UndefinedTableError 42P01)``: the driver's exception type and SQLSTATE tell a missing table from a lost
+    connection or a pooler conflict without the message, which may quote stored values. SQLAlchemy's asyncpg adapter
+    raises its own DB-API error from the asyncpg one, so the type is taken from ``e.orig.__cause__`` when there is
+    one."""
+    orig = e.orig
+    if orig is None:
+        return ""
+    driver = orig.__cause__ if isinstance(orig.__cause__, Exception) else orig
+    code = getattr(driver, "sqlstate", None) or getattr(orig, "sqlstate", None)
+    sqlstate = f" {code}" if isinstance(code, str) and code.isalnum() and len(code) <= 5 else ""
+    return f" ({type(driver).__name__}{sqlstate})"
 
 
 def safe_traceback(e: BaseException) -> str:

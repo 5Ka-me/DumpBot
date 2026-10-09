@@ -15,7 +15,16 @@ import pytest
 from dumpbot import logging_setup
 
 TOKEN = "987654321:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw"
-ENV_KEYS = ("BOT_TOKEN", "CHUTES_API_KEY", "OWNER_ID", "DATABASE_URL", "LOG_LEVEL")
+ENV_KEYS = (
+    "BOT_TOKEN",
+    "CHUTES_API_KEY",
+    "OWNER_ID",
+    "DATABASE_URL",
+    "LOG_LEVEL",
+    "MIGRATE_ON_START",
+    "KEEPALIVE_URL",
+    "KEEPALIVE_INTERVAL_S",
+)
 
 
 @pytest.fixture
@@ -76,6 +85,76 @@ def test_main_runs_the_app_and_handles_ctrl_c(clean_env, monkeypatch: pytest.Mon
     [settings] = seen
     assert settings.bot_token.get_secret_value() == TOKEN
     assert logging.getLogger().level == logging.WARNING
+
+
+@pytest.mark.parametrize(("flag", "migrated"), [("true", True), ("false", False), (None, False)])
+def test_migrate_on_start_runs_before_the_bot(clean_env, monkeypatch: pytest.MonkeyPatch, flag, migrated) -> None:
+    import dumpbot.__main__ as entry
+
+    monkeypatch.setenv("BOT_TOKEN", TOKEN)
+    monkeypatch.setenv("CHUTES_API_KEY", "key")
+    monkeypatch.setenv("LOG_LEVEL", "warning")
+    if flag is not None:
+        monkeypatch.setenv("MIGRATE_ON_START", flag)
+    steps: list[Any] = []
+
+    def fake_migrate(log_level: Any, config: Any = None) -> None:
+        steps.append(("migrate", log_level, config))
+
+    async def fake_run(settings: Any) -> None:
+        steps.append("run")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(entry, "migrate", fake_migrate)
+    monkeypatch.setattr(entry, "run", fake_run)
+    entry.main()
+    assert steps == ([("migrate", "warning", None)] if migrated else []) + ["run"]
+
+
+def test_migrate_uses_alembic_ini_and_restores_our_logging(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import alembic.command
+
+    import dumpbot.__main__ as entry
+
+    monkeypatch.chdir(tmp_path)
+    calls: list[tuple[Any, str]] = []
+
+    def upgrade(config: Any, revision: str) -> None:
+        calls.append((config.config_file_name, revision))
+        root = logging.getLogger()  # what alembic.ini's fileConfig does to the root logger
+        root.handlers[:] = [logging.StreamHandler(io.StringIO())]
+        root.setLevel(logging.WARNING)
+
+    monkeypatch.setattr(alembic.command, "upgrade", upgrade)
+    entry.migrate("debug")
+
+    assert calls == [("alembic.ini", "head")]
+    [handler] = logging.getLogger().handlers
+    assert isinstance(handler.formatter, logging_setup.RedactingFormatter)
+    assert logging.getLogger().level == logging.DEBUG
+
+
+def test_failed_migrations_exit_with_code_3(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+    import alembic.command
+    from alembic.config import Config
+
+    import dumpbot.__main__ as entry
+
+    def upgrade(config: Any, revision: str) -> None:
+        raise RuntimeError("relation already exists")
+
+    events: list[str] = []
+    monkeypatch.setattr(alembic.command, "upgrade", upgrade)
+    # Recorded instead of applied: the real setup would drop pytest's capturing handler from the root logger.
+    monkeypatch.setattr(logging_setup, "setup", lambda level=None: events.append(f"setup {level}"))
+    with caplog.at_level(logging.INFO, logger="dumpbot"), pytest.raises(SystemExit) as exited:
+        entry.migrate("INFO", Config())
+
+    assert exited.value.code == entry.EXIT_MIGRATION_ERROR == 3
+    assert events == ["setup INFO"]  # our logging is back before the failure is logged
+    [critical] = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+    assert critical.getMessage() == "database migrations failed; exiting"
+    assert critical.exc_info is not None and critical.exc_info[0] is RuntimeError  # with the traceback
 
 
 async def test_run_polls_with_resolved_updates_and_always_cleans_up(monkeypatch: pytest.MonkeyPatch, tg) -> None:

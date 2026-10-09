@@ -3,8 +3,10 @@
 ``build_web_app`` assembles the aiohttp application: middlewares (errors as JSON outermost, then the initData check of
 every ``/api`` request), the API routes, and the frontend build from ``webapp_static_dir`` — a file that exists is
 served as it is (``assets/`` cached for a year: their names carry a hash), any other path without a file extension
-gets ``index.html`` (the app's own router). ``WebServer`` runs it with ``AppRunner`` / ``TCPSite`` and is started and
-stopped by ``bot.app.Lifecycle``. The access log is DEBUG only and has no query strings (a search is message text).
+gets ``index.html`` (the app's own router). ``GET /healthz`` answers ``ok`` without auth or a database query: for the
+host's health check and the keep-alive ping (``dumpbot.keepalive``). ``WebServer`` runs it with ``AppRunner`` /
+``TCPSite`` and is started and stopped by ``bot.app.Lifecycle``. The access log is DEBUG only and has no query strings
+(a search is message text).
 """
 
 from __future__ import annotations
@@ -29,6 +31,7 @@ STATIC: Final = web.AppKey("static", Path)
 MAX_BODY: Final = 256 * 1024  # JSON bodies only; the longest is an inbox text of 4096 characters
 SHUTDOWN_TIMEOUT_S: Final = 5.0  # requests still running at shutdown get this long
 ASSETS_CACHE: Final = "public, max-age=31536000, immutable"
+HEALTHZ: Final = "/healthz"
 
 
 class _AccessLog(AbstractAccessLogger):
@@ -48,6 +51,7 @@ def build_web_app(ctx: AppContext, *, static_dir: str | Path | None = None) -> w
     app[files.IMAGES] = files.ImageCache()
     app[STATIC] = Path(static_dir) if static_dir else Path()
     app.add_routes([*api_lists.routes(), *api_items.routes(), *api_inbox.routes(), *files.routes()])
+    app.router.add_get(HEALTHZ, healthz)  # GET and HEAD; before the frontend's catch-all
     app.router.add_get("/{tail:.*}", frontend)
     app.on_response_prepare.append(_headers)
     return app
@@ -60,6 +64,12 @@ async def _headers(request: web.Request, response: web.StreamResponse) -> None:
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     if request.path.startswith(API_PREFIX):
         response.headers.setdefault("Cache-Control", "no-store")
+
+
+async def healthz(request: web.Request) -> web.Response:
+    """``200 ok``: the process is up and its event loop answers. No auth and no database query, so a host's health
+    check or a keep-alive ping every few minutes costs nothing; ``no-store`` keeps every ping going to the process."""
+    return web.Response(text="ok", headers={"Cache-Control": "no-store"})
 
 
 async def frontend(request: web.Request) -> web.FileResponse:

@@ -6,11 +6,13 @@ fake background runners and a fake exit function.
 
 Lifecycle (``dp.startup`` / ``dp.shutdown``): at startup the owner's command menu and menu button are set, the job
 worker and the scheduler start as tasks and, with ``WEBAPP_ENABLED``, the Mini App's web server starts
-(docs/features/iteration-2.md §D; the menu button opens it when ``WEBAPP_URL`` is set, else it is the commands menu).
+(docs/features/iteration-2.md §D; the menu button opens it when ``WEBAPP_URL`` is set, else it is the commands menu),
+and with ``KEEPALIVE_URL`` the keep-alive ping (``dumpbot.keepalive``: free hosts sleep without inbound requests).
 A task that stops unexpectedly is logged and the process exits with code 1 (Docker restarts it). So does a task that
-stops making progress (a hung await, a blocked event loop): ``ctx.watchdog`` watches the loops from a thread. At
-shutdown the web server stops taking requests first, updates still being handled may finish (``InFlight``), the tasks
-are cancelled and awaited, then the resources are closed.
+stops making progress (a hung await, a blocked event loop): ``ctx.watchdog`` watches the loops from a thread (the
+keep-alive ping is not watched and never stops the process). At shutdown the keep-alive ping stops and the web server
+stops taking requests first, updates still being handled may finish (``InFlight``), the tasks are cancelled and
+awaited, then the resources are closed.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from dumpbot.bot.routers.common import FAILED
 from dumpbot.config import Settings
 from dumpbot.context import AppContext
 from dumpbot.db.engine import make_engine, make_sessionmaker
+from dumpbot.keepalive import KeepAlive, url_host
 from dumpbot.workers.jobs import describe_error, safe_traceback
 
 if TYPE_CHECKING:
@@ -98,6 +101,18 @@ def default_web(ctx: AppContext) -> WebServer | None:
     return WebServer(ctx, host=settings.webapp_host, port=settings.webapp_port, static_dir=static_dir)
 
 
+def default_keepalive(settings: Settings, http: aiohttp.ClientSession) -> KeepAlive | None:
+    """The keep-alive ping of ``KEEPALIVE_URL`` on the shared HTTP session, or None when it is empty (or not an
+    http(s):// address: then a warning, and the bot runs without it)."""
+    url = settings.keepalive_url.strip()
+    if not url:
+        return None
+    if url_host(url) is None:
+        log.warning("KEEPALIVE_URL must be an http(s):// address; keep-alive is off")
+        return None
+    return KeepAlive(url, http, interval_s=settings.keepalive_interval_s)
+
+
 def menu_url(settings: Settings) -> str | None:
     """``WEBAPP_URL`` for the menu button: only with ``WEBAPP_ENABLED`` and an https:// address (Telegram opens Mini
     Apps over HTTPS only)."""
@@ -111,8 +126,8 @@ def menu_url(settings: Settings) -> str | None:
 
 
 class Lifecycle:
-    """Startup / shutdown of the background tasks and the Mini App's web server (registered on ``dp.startup`` /
-    ``dp.shutdown``)."""
+    """Startup / shutdown of the background tasks, the Mini App's web server and the keep-alive ping (registered on
+    ``dp.startup`` / ``dp.shutdown``)."""
 
     def __init__(
         self,
@@ -120,12 +135,14 @@ class Lifecycle:
         *,
         runners: RunnerFactory = default_runners,
         web: WebFactory = default_web,
+        keepalive: KeepAlive | None = None,
         cleanup: Cleanup | None = None,
         exit_func: Callable[[int], Any] = os._exit,
     ) -> None:
         self._ctx = ctx
         self._runners = runners
         self._web_factory = web
+        self.keepalive = keepalive
         self._cleanup = cleanup
         self._exit = exit_func
         self._stopping = False
@@ -144,12 +161,16 @@ class Lifecycle:
         self._ctx.watchdog.start(self._on_stall)
         log.info("started background tasks: %s", ", ".join(self.tasks) or "none")
         await self._start_web()
+        if self.keepalive is not None:
+            self.keepalive.start()
 
     async def shutdown(self) -> None:
-        """Stop the web server, let running update handlers finish, stop the background tasks, close the
-        resources."""
+        """Stop the keep-alive ping and the web server, let running update handlers finish, stop the background
+        tasks, close the resources."""
         self._stopping = True
         self._ctx.watchdog.stop()
+        if self.keepalive is not None:
+            await self.keepalive.stop()
         await self._stop_web()
         await self.in_flight.wait_idle(DRAIN_TIMEOUT_S)
         tasks = list(self.tasks.values())
@@ -320,6 +341,13 @@ async def build_app(
     ctx = AppContext(settings=settings, sessionmaker=sessionmaker, bot=bot, ai=ai, stt=stt)
     quiet_requests.install(ctx)
     resources = _Resources(bot=bot, ai=ai, stt=stt, http=http, engine=engine)
-    lifecycle = Lifecycle(ctx, runners=runners, web=web, cleanup=resources.close, exit_func=exit_func)
+    lifecycle = Lifecycle(
+        ctx,
+        runners=runners,
+        web=web,
+        keepalive=default_keepalive(settings, http),
+        cleanup=resources.close,
+        exit_func=exit_func,
+    )
     dp = build_dispatcher(ctx, lifecycle=lifecycle)
     return App(ctx=ctx, dp=dp, bot=bot, lifecycle=lifecycle, cleanup=resources.close)

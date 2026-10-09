@@ -6,7 +6,8 @@
 по сохранённому («что у меня завтра?»).
 
 - Работает только с владельцем (`OWNER_ID`), остальных игнорирует.
-- Long polling: входящие порты не нужны, достаточно Docker на ПК или Raspberry Pi.
+- Long polling: входящие порты не нужны, достаточно Docker на ПК или Raspberry Pi. Можно и бесплатно в облаке:
+  [Render + Supabase](#бесплатный-хостинг-render--supabase).
 - Есть [Mini App](#mini-app-необязательно) «📱 Свалка» внутри Telegram (по желанию, через бесплатный Tailscale Funnel).
 - Всё хранится в вашем PostgreSQL. Сами файлы бот не копирует, хранит только Telegram `file_id`.
 - Расход на ИИ: примерно $0.3–1 в месяц при 30 сообщениях в день. Есть месячный лимит, по умолчанию $5.
@@ -635,6 +636,70 @@ docker compose up -d --build
 
 Часовой пояс системы на Pi роли не играет: контейнеры работают в UTC, а бот берёт пояс из `/settings`.
 
+### Бесплатный хостинг: Render + Supabase
+
+Бот может жить в облаке без ПК: сам бот — бесплатный веб-сервис [Render](https://render.com) (Docker-образ из этого
+репозитория), база — бесплатный Postgres [Supabase](https://supabase.com). Mini App открывается по адресу
+`https://<сервис>.onrender.com`, Tailscale не нужен.
+
+**Supabase.** Создайте проект и пароль базы (проще всего — латиница и цифры: символы `@ : / % # ?` в адресе нужно
+кодировать, `@` → `%40` и т. д.). Кнопка **Connect** → **Session pooler**: адрес вида
+`postgresql://postgres.<ref>:[YOUR-PASSWORD]@aws-0-<регион>.pooler.supabase.com:5432/postgres`. Подставьте пароль —
+это и есть `DATABASE_URL`, вставлять как есть: драйвер asyncpg бот подставит сам.
+
+- не **Direct connection** (`db.<ref>.supabase.co`): он только по IPv6, а Render ходит наружу по IPv4;
+- не **Transaction pooler** (порт `6543`): он не держит prepared statements, на которых работает asyncpg;
+- `?sslmode=require` в конце адреса asyncpg не понимает — уберите его или замените на `?ssl=require`.
+
+**Render.** New → **Web Service** → репозиторий с GitHub, Runtime **Docker**, план **Free**: Render собирает
+`Dockerfile` и пересобирает при каждом push в `main`. **Docker Command** оставьте пустым (запустится
+`python -m dumpbot`): шага pre-deploy на бесплатном плане нет, миграции бот применит сам (`MIGRATE_ON_START`).
+Порт веб-сервера (8080) Render находит сам. **Environment**:
+
+| Переменная | Значение |
+|---|---|
+| `BOT_TOKEN`, `OWNER_ID`, `CHUTES_API_KEY` | как в `.env` |
+| `DATABASE_URL` | адрес Session pooler из Supabase |
+| `MIGRATE_ON_START` | `true` |
+| `WEBAPP_ENABLED` | `true` |
+| `WEBAPP_URL` | `https://<сервис>.onrender.com` |
+| `KEEPALIVE_URL` | `https://<сервис>.onrender.com/healthz` |
+| `LOCAL_STT_URL` | пусто (локального Whisper там нет, голосовые распознаёт chutes) |
+
+С одним токеном может работать только **один** бот: перед запуском на Render остановите локальный
+(`docker compose stop`), иначе в логах будет `409 Conflict`.
+
+**Зачем keep-alive.** Бесплатный сервис Render засыпает через 15 минут без *входящих* HTTP-запросов. Long polling —
+исходящие запросы бота к Telegram, они не считаются: бот засыпает, не отвечает и не присылает напоминания, пока
+кто-нибудь не откроет Mini App (тогда Render его будит, около минуты). Сообщение в чат его не разбудит: сообщения бот
+сам забирает у Telegram, а спящий не забирает; да и напоминания должны приходить вовремя, а не после пробуждения.
+Поэтому сервис не должен засыпать вовсе. С `KEEPALIVE_URL` бот раз в 10 минут (`KEEPALIVE_INTERVAL_S`, от 60 до
+840 с) запрашивает свой `/healthz` по публичному адресу: запрос приходит через Render снаружи и считается входящим.
+В логах при старте — `keep-alive is on: GET <сервис>.onrender.com every 600 s`, через 10 минут —
+`keep-alive ping to … answered`.
+
+Запасной вариант — внешний пингер: [cron-job.org](https://cron-job.org) или [UptimeRobot](https://uptimerobot.com),
+GET `https://<сервис>.onrender.com/healthz` раз в 5–10 минут (ответ `200 ok`, без авторизации и без запросов к базе).
+Он же разбудит сервис, если тот всё-таки уснул (например, после перезапуска на стороне Render).
+
+**Лимит:** 750 бесплатных часов в месяц на аккаунт — это ровно один сервис, работающий круглосуточно. Второй
+постоянно работающий бесплатный сервис на том же аккаунте исчерпает их раньше конца месяца.
+
+**Перенос данных с ПК.** Порядок: схема → данные → запуск на Render. Схему создают миграции — с ПК
+(`DATABASE_URL='<адрес Session pooler>' uv run alembic upgrade head`, в PowerShell — `$env:DATABASE_URL = '…'`
+отдельной командой) или первым стартом на Render с `MIGRATE_ON_START=true` (тогда сразу приостановите сервис:
+Settings → Suspend). Данные — дампом без схемы, одной транзакцией:
+
+```bash
+docker compose up -d db
+docker compose exec db sh -c "pg_dump -U dump -d dump --data-only --column-inserts --exclude-table=alembic_version -f /tmp/data.sql"
+docker compose exec db sh -c "psql '<адрес Session pooler>' -v ON_ERROR_STOP=1 --single-transaction -c 'SET session_replication_role = replica' -f /tmp/data.sql"
+```
+
+`session_replication_role = replica` отключает проверку внешних ключей на время загрузки (порядок таблиц в дампе может
+им не соответствовать). При ошибке не запишется ничего; если бот уже успел поработать с новой базой, мешают его строки —
+очистите их (`TRUNCATE app_state, user_settings`) и повторите.
+
 ---
 
 ## Разработка
@@ -703,6 +768,8 @@ autogenerate не видит, их нужно писать вручную.
 | В логах `409 Conflict: terminated by other getUpdates request` | Два экземпляра бота с одним токеном (Docker и локальный запуск, ПК и Pi). Остановите лишний |
 | Бот молчит | Проверьте `OWNER_ID` и `docker compose logs bot`. После правки `.env` нужен `docker compose up -d`, а не `restart` |
 | Бот не стартует, `migrate` завершился с ошибкой | `docker compose logs migrate`. Бот ждёт успешной миграции |
+| В логах `ProgrammingError (UndefinedTableError 42P01)` | В базе нет таблиц: миграции не применены. В Docker Compose — `docker compose logs migrate`; на Render — `MIGRATE_ON_START=true` |
+| Бот на Render перестаёт отвечать через 15 минут | Сервис уснул. Проверьте `KEEPALIVE_URL` и строки `keep-alive` в логах, добавьте внешний пингер — [Render + Supabase](#бесплатный-хостинг-render--supabase) |
 | Голосовые не распознаются | Включите `STT_CONVERT_WAV=true` и выполните `docker compose up -d`. Если в логах `503 No instances available`, Whisper-chute на chutes временно не работает: сообщение ждёт в очереди (✍) и обработается позже. Чтобы не ждать, включите [локальный Whisper](#локальный-whisper-необязательно) |
 | В логах бота `local STT unreachable` | Контейнер `whisper` не запущен (запускайте с `--profile whisper`) или `LOCAL_STT_URL` указан неверно. Голосовые пока распознаёт chutes |
 | `local STT HTTP 503` | Локальный Whisper не смог загрузить модель (нет интернета при первом запуске, мало памяти). `docker compose logs whisper`; при нехватке памяти увеличьте `WHISPER_MEM_LIMIT` или возьмите модель поменьше |

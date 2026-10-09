@@ -1,5 +1,6 @@
 """The web server around the API: picture previews from Telegram (fake bot) with the in-memory LRU, the frontend
-build with the index.html fallback, JSON errors for unknown API paths and for crashes (without their text)."""
+build with the index.html fallback, JSON errors for unknown API paths and for crashes (without their text), the
+``/healthz`` probe (no auth, no database)."""
 
 from __future__ import annotations
 
@@ -10,6 +11,7 @@ import pytest
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.methods import GetFile
 
+from dumpbot.context import AppContext
 from dumpbot.web import api_lists
 from dumpbot.web.files import ImageCache
 
@@ -188,6 +190,31 @@ async def test_without_a_build_only_the_api_answers(ctx, frozen) -> None:
     try:
         async with client.get("/") as response:
             assert response.status == 404
+    finally:
+        await client.close()
+
+
+async def test_healthz_needs_no_auth_and_no_database(settings_factory, bot, static_dir) -> None:
+    from aiohttp.test_utils import TestClient, TestServer
+
+    from dumpbot.web.server import build_web_app
+
+    def no_database() -> None:
+        raise AssertionError("/healthz must not open a database session")
+
+    ctx = AppContext(settings=settings_factory(), sessionmaker=no_database, bot=bot, ai=None, stt=None)  # type: ignore[arg-type]
+    client = TestClient(TestServer(build_web_app(ctx, static_dir=static_dir), host="127.0.0.1"))
+    await client.start_server()
+    try:
+        async with client.get("/healthz") as response:  # not the frontend's index.html
+            assert (response.status, await response.text()) == (200, "ok")
+            assert response.content_type == "text/plain"
+            assert response.headers["Cache-Control"] == "no-store"
+            assert response.headers["X-Content-Type-Options"] == "nosniff"
+        async with client.head("/healthz") as response:
+            assert response.status == 200
+        async with client.post("/healthz") as response:
+            assert response.status == 405
     finally:
         await client.close()
 

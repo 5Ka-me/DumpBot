@@ -6,8 +6,15 @@ User-editable preferences (timezone, slot times, quiet hours, budget...) live in
 
 from __future__ import annotations
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from dumpbot.db.engine import normalize_url
+
+# Render's free web service spins down after 15 minutes without inbound HTTP requests: a keep-alive ping must come
+# more often than that.
+KEEPALIVE_MIN_S = 60.0
+KEEPALIVE_MAX_S = 840.0
 
 
 class Settings(BaseSettings):
@@ -18,7 +25,8 @@ class Settings(BaseSettings):
     # 0 = not configured yet: the bot answers /start from anyone with their Telegram ID.
     owner_id: int = 0
 
-    # Database (async SQLAlchemy URL, asyncpg driver)
+    # Database (async SQLAlchemy URL, asyncpg driver). postgres:// and postgresql:// (as Supabase / Render hand them
+    # out) are switched to the asyncpg driver; everything else in the URL stays as given.
     database_url: str = "postgresql+asyncpg://dump:dump@127.0.0.1:5432/dump"
 
     # chutes.ai (OpenAI-compatible chat API)
@@ -66,3 +74,18 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     heartbeat_file: str = "/tmp/heartbeat"
     scheduler_interval_s: float = 30.0
+
+    # Free hosting (README, "Бесплатный хостинг: Render + Supabase").
+    # Apply Alembic migrations before starting (hosts without a separate migrate step, e.g. Render's free tier).
+    # Docker Compose keeps it off: its one-shot "migrate" service does this.
+    migrate_on_start: bool = False
+    # GET this address every keepalive_interval_s from inside the process ("" = off), e.g.
+    # https://<service>.onrender.com/healthz: the request comes back through the host's edge as inbound traffic, so a
+    # free web service that sleeps without inbound requests stays awake (long polling is outbound only).
+    keepalive_url: str = ""
+    keepalive_interval_s: float = Field(600.0, ge=KEEPALIVE_MIN_S, le=KEEPALIVE_MAX_S)
+
+    @field_validator("database_url")
+    @classmethod
+    def _asyncpg_driver(cls, value: str) -> str:
+        return normalize_url(value)

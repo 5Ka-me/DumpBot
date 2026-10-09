@@ -91,6 +91,7 @@ src/dumpbot/
   logging_setup.py                                                                                    [bot]
   config.py  clock.py  context.py  dto.py                                                              [foundation ✔]
   watchdog.py              отметки живости фоновых циклов, проверка из потока                          [bot]
+  keepalive.py             KEEPALIVE_URL: самопинг, чтобы бесплатный хостинг (Render) не усыплял бота  [bot]
   domain/
     kinds.py  prefs.py                                                                                [foundation ✔]
     timeresolve.py         When → UTC, план напоминаний, диапазоны запросов                          [domain]
@@ -1126,6 +1127,16 @@ Scheduler (`add_done_callback` → при исключении лог + `os._exi
 цикл молчит дольше лимита → лог + `logging_setup.flush()` + `os._exit(1)`), shutdown: остановка watchdog, ожидание
 обрабатываемых апдейтов (до `DRAIN_TIMEOUT_S` = 10 с), отмена задач, закрытие клиентов, `engine.dispose()`
 (`stop_grace_period: 30s` в compose.yaml покрывает это до SIGKILL).
+
+Бесплатный хостинг (README, «Бесплатный хостинг: Render + Supabase»): `MIGRATE_ON_START` — `main()` до старта
+выполняет `alembic upgrade head` в процессе (`alembic.ini` в рабочей папке; ошибка → лог с traceback и выход с кодом
+3; после миграций логирование настраивается заново: `fileConfig` из alembic.ini его заменяет). `KEEPALIVE_URL` —
+`KeepAlive` (`dumpbot/keepalive.py`) на общей aiohttp-сессии раз в `KEEPALIVE_INTERVAL_S` (60–840 с) делает GET
+своего публичного `/healthz`: Render усыпляет бесплатный сервис после 15 минут без входящих запросов, а long polling
+— исходящий. `Lifecycle` запускает его рядом с веб-сервером и останавливает перед ним; в watchdog он не входит, ошибки —
+WARNING не чаще раза в час, только тип ошибки или HTTP-статус. `DATABASE_URL` вида `postgres://` / `postgresql://`
+получает драйвер asyncpg (`db.engine.normalize_url`, в `Settings` и в migrations/env.py); ошибки БД в логах —
+`ProgrammingError (UndefinedTableError 42P01) at …` (тип ошибки драйвера и SQLSTATE, без текста).
 
 ```python
 class Watchdog:                                            # dumpbot/watchdog.py, потокобезопасный

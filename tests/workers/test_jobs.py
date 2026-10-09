@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import timedelta
 from typing import Any
 
+import asyncpg
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import exc as sa_exc
+from sqlalchemy import select, text, update
+from sqlalchemy.dialects.postgresql.asyncpg import AsyncAdapt_asyncpg_dbapi
 
 from dumpbot.ai.client import AIConfigError, AIUnavailable
 from dumpbot.db.models import Job, RawMessage
@@ -354,6 +358,64 @@ def test_describe_error_is_content_free() -> None:
     assert "молоко" not in text
     assert jobs.describe_error(AIUnavailable("x bot123:ABC-def y")) == "AIUnavailable: x bot<token> y"
     assert jobs.describe_error(RetryLater(reason="budget exhausted")) == "RetryLater: budget exhausted"
+
+
+def _db_error(statement: str, params: Any, orig: BaseException) -> sa_exc.DBAPIError:
+    """The error SQLAlchemy raises around a driver error, raised here so it has a traceback."""
+    try:
+        raise sa_exc.DBAPIError.instance(statement, params, orig, AsyncAdapt_asyncpg_dbapi.Error) from orig
+    except sa_exc.DBAPIError as e:
+        return e
+
+
+def test_describe_error_names_the_database_error_without_its_text() -> None:
+    # As SQLAlchemy's asyncpg adapter does it: its own DB-API error with the SQLSTATE, raised from asyncpg's error.
+    driver = asyncpg.exceptions.UndefinedTableError('relation "Купить молоко" does not exist')
+    try:
+        raise AsyncAdapt_asyncpg_dbapi.ProgrammingError(f"{type(driver)}: {driver}") from driver
+    except AsyncAdapt_asyncpg_dbapi.ProgrammingError as adapted:
+        adapted.sqlstate = driver.sqlstate
+        orig = adapted
+    e = _db_error('SELECT * FROM "Купить молоко" WHERE title = $1', ("у Оли",), orig)
+    assert isinstance(e, sa_exc.ProgrammingError)
+
+    described = jobs.describe_error(e)
+    assert re.fullmatch(r"ProgrammingError \(UndefinedTableError 42P01\) at test_jobs\.py:\d+", described), described
+    assert "молоко" not in described and "Оли" not in described and "relation" not in described
+
+
+def _adapted(cls: type[Exception], message: str, *, sqlstate: Any, cause: BaseException | None) -> BaseException:
+    try:
+        raise cls(message) from cause
+    except cls as e:
+        e.sqlstate = sqlstate  # type: ignore[attr-defined]
+        return e
+
+
+def test_describe_error_of_other_database_errors() -> None:
+    dbapi = AsyncAdapt_asyncpg_dbapi
+    # The server went away: the code is on the adapter's error.
+    shutdown = _adapted(dbapi.InternalServerError, "terminating connection", sqlstate="57P01", cause=None)
+    assert jobs.describe_error(_db_error("SELECT 1", None, shutdown)).startswith(
+        "InternalError (InternalServerError 57P01) at test_jobs.py:"
+    )
+    # A client-side asyncpg error has no SQLSTATE.
+    busy = asyncpg.exceptions.InterfaceError("cannot perform operation: another operation is in progress")
+    adapted = _adapted(dbapi.InterfaceError, str(busy), sqlstate=None, cause=busy)
+    assert jobs.describe_error(_db_error("SELECT 1", None, adapted)).startswith(
+        "InterfaceError (InterfaceError) at test_jobs.py:"
+    )
+    # Only a real five-character code is shown.
+    odd = _adapted(dbapi.Error, "x", sqlstate="42P01; DROP TABLE items", cause=None)
+    assert jobs.describe_error(_db_error("SELECT 1", None, odd)).startswith("DBAPIError (Error) at test_jobs.py:")
+
+
+async def test_describe_error_of_a_real_missing_table(session) -> None:
+    with pytest.raises(sa_exc.DBAPIError) as caught:
+        await session.execute(text("SELECT * FROM no_such_table_молоко"))
+    described = jobs.describe_error(caught.value)
+    assert described.startswith("ProgrammingError (UndefinedTableError 42P01) at "), described
+    assert "no_such_table" not in described
 
 
 def test_backoff_is_capped() -> None:

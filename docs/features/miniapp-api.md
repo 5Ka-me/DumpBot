@@ -8,10 +8,12 @@ TypeScript-типы этого контракта — [`webapp/src/api/types.ts`
 ## Общее
 
 - Веб-сервер живёт в процессе бота (aiohttp), включается `WEBAPP_ENABLED=true`, слушает `WEBAPP_HOST:WEBAPP_PORT`
-  (`0.0.0.0:8080`). Наружу его публикует Tailscale Funnel: `https://dump.<tailnet>.ts.net` → `http://bot:8080`.
-- Всё, что не `/api/*`, — статика фронтенда из `WEBAPP_STATIC_DIR` (`/app/webapp`): существующий файл отдаётся как есть
-  (`assets/*` — `Cache-Control: public, max-age=31536000, immutable`, остальное — `no-cache`), любой другой путь без
-  расширения файла — `index.html` (роутинг SPA), путь с расширением, которого нет, — 404.
+  (`0.0.0.0:8080`). Наружу его публикует Tailscale Funnel: `https://dump.<tailnet>.ts.net` → `http://bot:8080` (на
+  Render — сам хостинг: `https://<сервис>.onrender.com`).
+- `GET /healthz` — проверка живости без авторизации (см. [ниже](#get-healthz)).
+- Всё остальное, что не `/api/*`, — статика фронтенда из `WEBAPP_STATIC_DIR` (`/app/webapp`): существующий файл
+  отдаётся как есть (`assets/*` — `Cache-Control: public, max-age=31536000, immutable`, остальное — `no-cache`), любой
+  другой путь без расширения файла — `index.html` (роутинг SPA), путь с расширением, которого нет, — 404.
 - **Аутентификация каждого `/api` запроса**: заголовок `Authorization: tma <initData>`, где `initData` —
   `Telegram.WebApp.initData` как есть (строка query-параметров). Сервер проверяет подпись по алгоритму Telegram
   (data-check-string из всех полей, кроме `hash`, отсортированных по ключу, через `\n`; ключ —
@@ -364,3 +366,10 @@ label, calls, usd}]}` — расходы на ИИ за текущий меся�
 `?size=thumb` — миниатюра для строк списков: наименьший размер фото, у которого длинная сторона ≥ 160 px, или
 миниатюра, которую Telegram сделал для картинки-файла (JPEG); если такой нет — сама картинка. Другое значение — 400
 `size`.
+
+### `GET /healthz`
+
+Проверка живости процесса, вне `/api`: без авторизации и без запросов к базе, `HEAD` тоже (регистрируется раньше
+catch-all статики, так что `index.html` здесь не отдаётся). → `200`, `text/plain` `ok`, `Cache-Control: no-store`.
+Нужен для health check хостинга, keep-alive пинга самого бота (`KEEPALIVE_URL`, `src/dumpbot/keepalive.py`) и
+внешнего пингера (README, «Бесплатный хостинг: Render + Supabase»).
