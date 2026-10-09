@@ -16,6 +16,8 @@ the "RELATED CANDIDATES" prompt line;
 
 The Mini App (§D): ``feed`` pages through all items newest first with filters (keyset cursor), ``rows_by_ids`` loads
 the rows an answer named, ``item_images`` / ``image_counts`` find the pictures of the message an item came from.
+
+Iteration 3 (§2): ``list_rows`` reads the numbered lines of a list message (its [✅ N] buttons) as they are now.
 """
 
 from __future__ import annotations
@@ -39,7 +41,7 @@ from dumpbot.domain import recurrence, timeresolve
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, CardExtras, RelatedRef, Row, Step, UsageSummary
-from dumpbot.services.items import current_occurrence_order
+from dumpbot.services.items import current_occurrence, current_occurrence_order
 from dumpbot.services.related import lexeme_query, subject_lexemes
 
 __all__ = [
@@ -53,6 +55,7 @@ __all__ = [
     "image_counts",
     "item_images",
     "items_of_raw",
+    "list_rows",
     "open_tasks",
     "recent",
     "recurring",
@@ -216,6 +219,43 @@ async def recurring(session: AsyncSession) -> list[Row]:
         .order_by(occ.c.due_at.asc().nulls_last(), Item.id)
     )
     return await _item_rows(session, stmt)
+
+
+async def list_rows(session: AsyncSession, refs: Sequence[tuple[int | None, int]]) -> list[Row | None]:
+    """The numbered lines of a list message as they are now (docs/features/iteration-3.md §2), one per
+    ``(occurrence id | None, item id)``, in order: the item with that occurrence — or, when it is gone (cancelled:
+    moved onto another instance, the item became "когда-нибудь") or there was none, with the item's current one
+    (none when that is cancelled too: the line is the item itself). None for a missing or deleted item."""
+    if not refs:
+        return []
+    item_ids = {item_id for _, item_id in refs}
+    stmt = select(Item).where(Item.id.in_(item_ids), Item.status != "deleted").options(defer(Item.search_tsv))
+    found = {item.id: item for item in (await session.scalars(stmt)).all()}
+    occ_ids = {occ_id for occ_id, _ in refs if occ_id}
+    occs: dict[int, Occurrence] = {}
+    if occ_ids:
+        occs = {o.id: o for o in (await session.scalars(select(Occurrence).where(Occurrence.id.in_(occ_ids)))).all()}
+    rows: list[Row | None] = []
+    for occ_id, item_id in refs:
+        item = found.get(item_id)
+        if item is None:
+            rows.append(None)
+            continue
+        occ = occs.get(occ_id) if occ_id else None
+        if occ is None or occ.item_id != item.id or occ.status == "cancelled":
+            occ = await current_occurrence(session, item.id)
+            if occ is not None and occ.status == "cancelled":
+                occ = None
+        rows.append(
+            _row(
+                item,
+                occurrence_id=occ.id if occ is not None else None,
+                due_at=occ.due_at if occ is not None else None,
+                occ_status=occ.status if occ is not None else None,
+            )
+        )
+    await _with_family(session, [row for row in rows if row is not None])
+    return rows
 
 
 async def items_of_raw(session: AsyncSession, raw_ids: Sequence[int]) -> list[Row]:

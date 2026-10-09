@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import pytest
 
-from dumpbot.ai.schemas import QuerySpec
+from dumpbot.ai.schemas import EditPatch, QuerySpec, When
 from dumpbot.db.models import AiUsage
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Row
@@ -405,3 +405,63 @@ async def test_rows_carry_snippet_and_urls(session, make, now):
     assert by_title["Статья"].snippet.endswith("…")
     assert by_title["Короткая"].snippet is None
     assert same.item.source_text == "Короткая"
+
+
+# --- list_rows: the numbered lines of a list message (iteration 3, §2) ----------------------------------------
+
+
+async def test_list_rows_show_each_line_as_it_is_now(session, make, local, now, prefs):
+    [done, deleted, someday, plain] = await make(
+        {"kind": "task", "title": "Сделано", "when": {"time": "12:00"}},
+        {"kind": "task", "title": "Удалено", "when": {"time": "13:00"}},
+        {"kind": "task", "title": "Потом", "when": {"time": "14:00"}},
+        {"kind": "task", "title": "Обычное", "when": {"time": "15:00"}},
+        now=now,
+    )
+    await items.mark_done(session, done.occurrence.id, now, prefs)
+    await items.delete_item(session, deleted.item.id, now)
+    await items.apply_patch(
+        session, someday.item.id, EditPatch(when=When(text="когда-нибудь", period="someday")), prefs, now
+    )
+    await session.flush()
+
+    refs = [
+        (done.occurrence.id, done.item.id),
+        (deleted.occurrence.id, deleted.item.id),
+        (someday.occurrence.id, someday.item.id),  # its occurrence was cancelled: the line is the item itself
+        (None, plain.item.id),  # a line without an occurrence: the item's current one
+        (plain.occurrence.id, done.item.id),  # an occurrence of another item is not trusted
+        (None, 10**9),  # gone
+    ]
+    rows = await query.list_rows(session, refs)
+    assert rows[1] is None and rows[5] is None
+    assert (rows[0].title, rows[0].occurrence_id, rows[0].occ_status) == ("Сделано", done.occurrence.id, "done")
+    assert (rows[2].title, rows[2].occurrence_id, rows[2].due_at, rows[2].someday) == ("Потом", None, None, True)
+    assert (rows[3].occurrence_id, rows[3].due_at) == (plain.occurrence.id, local(2026, 10, 6, 15, 0))
+    assert (rows[4].item_id, rows[4].occurrence_id) == (done.item.id, done.occurrence.id)
+    assert await query.list_rows(session, []) == []
+
+
+async def test_list_rows_of_a_series_keep_the_listed_instance(session, make, local, prefs):
+    [series] = await make({**DAILY_9, "when": {"time": "12:00"}}, now=local(2026, 10, 6, 10, 0))
+    await items.mark_done(session, series.occurrence.id, local(2026, 10, 6, 12, 5), prefs)  # the next one is created
+    await session.flush()
+    [row] = await query.list_rows(session, [(series.occurrence.id, series.item.id)])
+    assert (row.occurrence_id, row.occ_status, row.rrule) == (series.occurrence.id, "done", "FREQ=DAILY")
+    [current] = await query.list_rows(session, [(None, series.item.id)])
+    assert (current.occ_status, current.due_at) == ("open", local(2026, 10, 7, 12, 0))
+
+
+async def test_list_rows_count_the_steps_of_a_parent(session, make, now):
+    [parent] = await make(
+        {
+            "kind": "task",
+            "title": "Переезд",
+            "when": {"day": "SA"},
+            "steps": [{"title": "Упаковать"}, {"title": "Ключи"}],
+        },
+        now=now,
+    )
+    await session.flush()
+    [row] = await query.list_rows(session, [(parent.occurrence.id, parent.item.id)])
+    assert (row.steps_done, row.steps_total) == (0, 2)

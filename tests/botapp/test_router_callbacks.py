@@ -9,7 +9,7 @@ from sqlalchemy import select
 
 from dumpbot.ai.schemas import When
 from dumpbot.bot import views
-from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, OccCb, PickCb
+from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, ListCb, OccCb, PickCb
 from dumpbot.bot.keyboards import button, markup
 from dumpbot.db.models import Item, Occurrence, Reminder
 from dumpbot.domain.prefs import Prefs
@@ -105,7 +105,8 @@ async def test_undone_on_a_reminder_shows_the_reminder_again(feed, updates, seed
 
     [edit] = tg.edits
     assert edit.text.startswith("🔔 <b>Купить наушники</b>")
-    assert ("⏰ 15 мин", OccCb(a="s15", id=created.occurrence.id).pack()) in get_buttons(edit.reply_markup)
+    # 10:00: the evening is still far, so [🌙 Вечером] instead of [⏰ 15 мин]
+    assert ("🌙 Вечером", OccCb(a="eve", id=created.occurrence.id).pack()) in get_buttons(edit.reply_markup)
 
 
 @pytest.mark.parametrize(("action", "delta"), [("s15", timedelta(minutes=15)), ("s60", timedelta(hours=1))])
@@ -123,6 +124,41 @@ async def test_snooze_minutes_moves_the_time(feed, updates, seed, tg, frozen, ct
     assert "💤 отложено" in tg.edits[0].text
     assert tg.edits[0].reply_markup is None  # no [✅ Готово]: the snoozed reminder comes with its own buttons
     assert ctx.scheduler_wakeup.is_set()
+
+
+async def test_snooze_to_this_evening_moves_the_time(feed, updates, seed, tg, frozen, ctx) -> None:
+    # [🌙 Вечером] (iteration 3, §4): the 10:30 reminder at 10:31 -> the item is due today at 19:00
+    created = await seed.item(when=When(text="сегодня в 10:30", time="10:30"))
+    evening = frozen.now + timedelta(hours=9)  # Tue 19:00 (the clock starts at 10:00)
+    frozen.advance(minutes=31)
+
+    await feed(updates.callback(OccCb(a="eve", id=created.occurrence.id)))
+
+    occ = await _occ(seed, created.occurrence.id)
+    assert (occ.due_at, occ.status) == (evening, "open")
+    [reminder] = await _pending(seed, occ.id)
+    assert reminder.fire_at == occ.due_at
+    assert tg.toasts == ["🌙 Напомню сегодня 19:00"]
+    [edit] = tg.edits
+    assert edit.text == "🔔 <b>Купить наушники</b>\n💤 отложено · напомню сегодня в 19:00"
+    assert edit.reply_markup is None
+    assert ctx.scheduler_wakeup.is_set()
+
+
+async def test_evening_pressed_after_the_evening_offers_the_other_buttons(
+    feed, updates, seed, tg, frozen, get_buttons
+) -> None:
+    created = await seed.item(when=When(text="сегодня в 10:30", time="10:30"))
+    await seed.bot_message(903, purpose="reminder", item_id=created.item.id, occurrence_id=created.occurrence.id)
+    frozen.advance(hours=9, minutes=30)  # 19:30: [🌙 Вечером] of the morning's reminder
+
+    await feed(updates.callback(OccCb(a="eve", id=created.occurrence.id), message_id=903))
+
+    assert (await _occ(seed, created.occurrence.id)).due_at == created.occurrence.due_at
+    assert tg.toasts == ["🌙 Вечер уже наступил — выбери другое время"]
+    [edit] = tg.edits
+    assert edit.text.startswith("🔔 <b>Купить наушники</b>")
+    assert [label for label, _ in get_buttons(edit.reply_markup)] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
 
 
 async def test_snooze_to_tomorrow(feed, updates, seed, tg, frozen) -> None:
@@ -426,7 +462,13 @@ async def test_digest_moves_not_done_to_tomorrow(feed, updates, seed, tg, frozen
     async with seed.sessionmaker() as s:
         data = await digest.build_digest(s, "evening", Prefs(), evening)
     text, kb = views.evening_digest(data, Prefs(), evening)
-    assert get_buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261006").pack())]
+    assert get_buttons(kb) == [
+        (
+            "✅ 1",
+            ListCb(a="done", k="e", d="20261006", s="m", n=1, o=open_today.occurrence.id, i=open_today.item.id).pack(),
+        ),
+        ("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261006").pack()),
+    ]
 
     await feed(updates.callback(DigestCb(a="tmr"), text=text, date=evening, reply_markup=kb))
 

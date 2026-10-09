@@ -11,13 +11,17 @@ from dumpbot.bot.cbdata import (
     ALL_CALLBACKS,
     DIGEST_ACTIONS,
     ITEM_ACTIONS,
+    LIST_ACTIONS,
+    LIST_KINDS,
     OCC_ACTIONS,
+    SNOOZE_ACTIONS,
     SNOOZE_MINUTES,
     STEP_ACTIONS,
     AskCb,
     DigestCb,
     ItemCb,
     KindCb,
+    ListCb,
     OccCb,
     PickCb,
     SetCb,
@@ -38,7 +42,7 @@ def _roundtrip(cb: CallbackData) -> str:
 
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
-    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c"]  # "l" (LeadCb) is retired: never reuse it
+    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld"]  # "l" (LeadCb) is retired: never reuse it
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -77,8 +81,26 @@ def test_occurrence_actions(action: str):
 
 
 def test_snooze_minutes_cover_snooze_actions():
-    assert set(SNOOZE_MINUTES) == OCC_ACTIONS - {"done", "undone"}
+    assert SNOOZE_ACTIONS == OCC_ACTIONS - {"done", "undone"}
     assert SNOOZE_MINUTES == {"s15": 15, "s60": 60, "tmr": None}
+    assert SNOOZE_ACTIONS - set(SNOOZE_MINUTES) == {"eve"}  # 🌙 today's evening slot
+
+
+@pytest.mark.parametrize("action", sorted(LIST_ACTIONS))
+@pytest.mark.parametrize("kind", sorted(LIST_KINDS))
+def test_list_lines_fit_with_huge_ids(action: str, kind: str):
+    assert LIST_ACTIONS == {"done", "undo"} and LIST_KINDS == {"t", "k", "m", "e"}
+    packed = _roundtrip(ListCb(a=action, k=kind, d="20261009", s="v", n=20, o=BIG * 1000, i=BIG * 1000))
+    assert packed == f"ld:{action}:{kind}:20261009:v:20:{BIG * 1000}:{BIG * 1000}"
+    assert _roundtrip(ListCb(a=action, k=kind, d="", s="o", n=1, o=0, i=5)) == f"ld:{action}:{kind}::o:1:0:5"
+
+
+async def test_list_buttons_match_only_the_list_filter():
+    # "ld:…" is neither "l:…" (the retired LeadCb, answered as stale) nor "d:…" (DigestCb)
+    data = "ld:done:t:20261009:o:1:0:5"
+    assert await ListCb.filter()(_query(data)) == {"callback_data": ListCb.unpack(data)}
+    assert await DigestCb.filter()(_query(data)) is False
+    assert await ListCb.filter()(_query("d:tmr:20261009")) is False
 
 
 @pytest.mark.parametrize("kind", KINDS)

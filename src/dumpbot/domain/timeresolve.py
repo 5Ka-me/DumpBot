@@ -346,6 +346,13 @@ def tomorrow(now: datetime, prefs: Prefs) -> date:
     return local.date() if local.time() < prefs.night_cutoff else local.date() + timedelta(days=1)
 
 
+def tonight(now: datetime, prefs: Prefs) -> datetime:
+    """This evening: ``prefs.slot_evening`` of the local date of ``now`` (aware UTC). [🌙 Вечером] of a reminder
+    moves the item there (docs/features/iteration-3.md §4); it may already be past."""
+    local = _as_utc(now).astimezone(prefs.zone)
+    return localize(local.date(), prefs.slot_evening, prefs.zone).astimezone(UTC)
+
+
 def period_bounds(period: str, now: datetime, prefs: Prefs) -> tuple[date, date]:
     """Local dates [start, end] (both inclusive) of a fuzzy span at ``now``.
 

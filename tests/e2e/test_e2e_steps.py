@@ -98,8 +98,8 @@ async def test_move_checklist_to_all_steps_done(e2e: Any) -> None:
     command(e2e, "/tasks")
     await e2e.wait(lambda: len(e2e.tg.sent) > count, "/tasks")
     tasks = e2e.tg.sent[-1].text
-    assert "• чт 8 окт 15:00 · 📌 Заказать машину (из «Переезд»)" in tasks
-    assert "• сб 10 окт 10:00 · 📌 Переезд (0/4)" in tasks
+    assert "1. чт 8 окт 15:00 · 📌 Заказать машину (из «Переезд»)" in tasks
+    assert "2. сб 10 окт 10:00 · 📌 Переезд (0/4)" in tasks
     assert "Упаковать" not in tasks and "Отдать ключи" not in tasks
 
     # tick a step on the card: the card is redrawn in place

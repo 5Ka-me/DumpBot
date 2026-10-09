@@ -10,6 +10,10 @@ card; whenever a commit closed a parent by its last step (whatever button did it
 [🪄 Разбить на шаги] queues job "split" (one at a time per item; nothing with the month's AI budget spent);
 [🔗 Похожее] sends the cards of the related items.
 
+Iteration 3 (docs/features/iteration-3.md): [✅ N] / [↩️ N] under /today, /tasks and the digests (``ListCb``) close or
+reopen that line without the AI and re-render the list from its buttons (``bot.lists``); [🌙 Вечером] of a reminder
+(``OccCb`` ``eve``) moves the item to this evening's ``slot_evening`` like the other snooze buttons.
+
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
 
@@ -27,17 +31,22 @@ from aiogram.types import CallbackQuery, Message
 
 from dumpbot import clock
 from dumpbot.ai.schemas import EditPatch
-from dumpbot.bot import cards, sender, views
+from dumpbot.bot import cards, lists, sender, views
 from dumpbot.bot.cbdata import (
     DIGEST_ACTIONS,
     DIGEST_DAY_FMT,
+    LIST_ACTIONS,
+    LIST_KINDS,
     OCC_ACTIONS,
+    SNOOZE_ACTIONS,
+    SNOOZE_EVENING,
     SNOOZE_MINUTES,
     STEP_ACTIONS,
     AskCb,
     DigestCb,
     ItemCb,
     KindCb,
+    ListCb,
     OccCb,
     PickCb,
     SubCb,
@@ -45,7 +54,8 @@ from dumpbot.bot.cbdata import (
 from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
 from dumpbot.db.models import Occurrence, RawMessage
-from dumpbot.domain.fmt import fmt_date, fmt_dt
+from dumpbot.domain import timeresolve
+from dumpbot.domain.fmt import fmt_date, fmt_dt, plural_ru
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
 from dumpbot.services import digest, items, processor, query
 from dumpbot.workers import jobs
@@ -60,6 +70,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 MAX_ASK_OPTIONS: Final = 8
+LIST_TOAST_TITLE_MAX: Final = 60
+EVENING_PASSED: Final = "🌙 Вечер уже наступил — выбери другое время"
 SPLITTING: Final = "Уже разбиваю на шаги…"
 # Digest buttons sent before the digest day was part of the callback data ("d:tmr").
 OLD_DIGEST_DATA: Final = frozenset(f"{DigestCb.__prefix__}:{a}" for a in DIGEST_ACTIONS)
@@ -88,6 +100,7 @@ def make_router() -> Router:
     router.callback_query.register(on_ask, AskCb.filter())
     router.callback_query.register(on_pick, PickCb.filter())
     router.callback_query.register(on_step, SubCb.filter())
+    router.callback_query.register(on_list, ListCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     # Buttons of an older version (the removed "⏱ Напомнить за…" menu: ItemCb "lead", "l:…"), garbage data.
@@ -138,7 +151,7 @@ async def on_occ(callback: CallbackQuery, callback_data: OccCb, ctx: AppContext)
         if item.status == "deleted":
             return Outcome(views.deleted_card(item), common.DELETED)
         # Snooze buttons exist only on reminders; done/undone also on cards (told apart by bot_messages).
-        on_reminder = action in SNOOZE_MINUTES or await common.purpose_of(session, ctx, message_id) == "reminder"
+        on_reminder = action in SNOOZE_ACTIONS or await common.purpose_of(session, ctx, message_id) == "reminder"
         if action == "done":
             return await _done(session, item, occ, prefs, now, on_reminder=on_reminder)
         if action == "undone":
@@ -152,16 +165,22 @@ async def _done(
     session: AsyncSession, item: Item, occ: Occurrence, prefs: Prefs, now: datetime, *, on_reminder: bool
 ) -> Outcome:
     occ = await items.mark_done(session, occ.id, now, prefs)
-    toast = "✅ Готово"
-    if item.rec_active and item.rrule:
-        nxt = await items.current_occurrence(session, item.id)
-        if nxt is not None and nxt.status == "open" and nxt.id != occ.id:
-            toast += f" · следующий раз {fmt_dt(nxt.due_at, prefs.zone, now=now)}"
+    toast = "✅ Готово" + await _next_time(session, item, occ.id, prefs, now)
     if on_reminder:
         view = views.reminder_done(item, occ, prefs, now)
     else:
         view = await cards.render_card(session, item, occ, [], prefs, now)
     return Outcome(view, toast, wake_scheduler=True)
+
+
+async def _next_time(session: AsyncSession, item: Item, done_id: int | None, prefs: Prefs, now: datetime) -> str:
+    """ " · следующий раз завтра 09:00" once an instance of a series is done ("" for other items)."""
+    if not (item.rec_active and item.rrule):
+        return ""
+    nxt = await items.current_occurrence(session, item.id)
+    if nxt is None or nxt.status != "open" or nxt.id == done_id:
+        return ""
+    return f" · следующий раз {fmt_dt(nxt.due_at, prefs.zone, now=now)}"
 
 
 async def _undone(
@@ -187,9 +206,18 @@ async def _snooze(
         return Outcome(views.reminder_done(item, occ, prefs, now), "Уже сделано")
     if occ.status != "open":
         return Outcome(None, "Напоминание уже неактуально")
-    minutes = SNOOZE_MINUTES[action]
-    reminder = await items.snooze(session, occ.id, minutes=minutes, tomorrow=minutes is None, prefs=prefs, now=now)
-    toast = f"⏰ Напомню {fmt_dt(reminder.fire_at, prefs.zone, now=now)}"
+    if action == SNOOZE_EVENING:
+        tonight = timeresolve.tonight(now, prefs)
+        if tonight <= now:  # an old reminder pressed after the evening slot: the other buttons instead
+            parent_title = await _parent_title(session, item)
+            view = views.reminder_message(item, occ, None, prefs, now, parent_title=parent_title)
+            return Outcome(view, EVENING_PASSED)
+        reminder = await items.snooze(session, occ.id, at=tonight, prefs=prefs, now=now)
+        toast = f"🌙 Напомню {fmt_dt(reminder.fire_at, prefs.zone, now=now)}"
+    else:
+        minutes = SNOOZE_MINUTES[action]
+        reminder = await items.snooze(session, occ.id, minutes=minutes, tomorrow=minutes is None, prefs=prefs, now=now)
+        toast = f"⏰ Напомню {fmt_dt(reminder.fire_at, prefs.zone, now=now)}"
     # The item's time moved there. No buttons on the snoozed message: the snoozed reminder (of tomorrow's instance,
     # if a series instance was merged into it) comes again with its own.
     return Outcome(views.reminder_snoozed(item, reminder, prefs, now), toast, wake_scheduler=True)
@@ -364,6 +392,57 @@ async def on_step(callback: CallbackQuery, callback_data: SubCb, ctx: AppContext
         return Outcome(await common.card_view(session, parent, prefs, now), toast, wake_scheduler=True)
 
     await run(callback, ctx, op)
+
+
+# --- numbered lists: [✅ N] / [↩️ N] under /today, /tasks and the digests ----------------------------------------
+
+
+async def on_list(callback: CallbackQuery, callback_data: ListCb, ctx: AppContext) -> None:
+    """[✅ N] closes the line's occurrence (the current instance of a series; a parent together with its open steps;
+    the item itself when the line has none), [↩️ N] takes that back — no AI. The list is re-rendered in place from
+    its buttons (``bot.lists``): the line struck through with [↩️ N], or open again with [✅ N]. A line already in
+    the wanted state, deleted or gone only gets a toast (and the list as it is now)."""
+    if callback_data.a not in LIST_ACTIONS or callback_data.k not in LIST_KINDS:
+        await common.answer(callback, common.STALE)
+        return
+    refs = lists.snapshot(callback.message)
+    day = _digest_day(callback_data.d)
+
+    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
+        toast, changed = await _toggle_line(session, callback_data, prefs, now)
+        await session.flush()
+        view = await lists.render(session, callback_data.k, day, prefs, now, refs)
+        return Outcome(view, toast, wake_scheduler=changed)
+
+    await run(callback, ctx, op)
+
+
+async def _toggle_line(session: AsyncSession, cb: ListCb, prefs: Prefs, now: datetime) -> tuple[str, bool]:
+    """Close / reopen one list line; returns (toast, whether anything changed)."""
+    [row] = await query.list_rows(session, [(cb.o or None, cb.i)])
+    if row is None:
+        return (common.DELETED if await items.get_item(session, cb.i) is not None else common.NOT_FOUND), False
+    title = views.clip(row.title, LIST_TOAST_TITLE_MAX)
+    done = views.row_done(row)
+    if cb.a == "done":
+        if done:
+            return f"Уже сделано: «{title}»", False
+        if row.occurrence_id is not None:
+            await items.mark_done(session, row.occurrence_id, now, prefs)
+        else:
+            await items.apply_patch(session, row.item_id, EditPatch(action="done"), prefs, now)
+        toast = f"✅ Закрыл «{title}»"
+        if (steps := row.steps_total - row.steps_done) > 0:  # a parent: its open steps are closed with it
+            toast += f" и {steps} {plural_ru(steps, 'шаг', 'шага', 'шагов')}"
+        item = await common.get_item(session, row.item_id)
+        return toast + await _next_time(session, item, row.occurrence_id, prefs, now), True
+    if not done:
+        return f"Уже открыто: «{title}»", False
+    if row.occurrence_id is not None:
+        await items.mark_undone(session, row.occurrence_id, prefs=prefs, now=now)
+    else:
+        await items.apply_patch(session, row.item_id, EditPatch(action="undone"), prefs, now)
+    return f"↩️ Снова открыто: «{title}»", True
 
 
 # --- clarifying questions and edit candidates (queue a job) ------------------------------------------------------

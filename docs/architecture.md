@@ -119,6 +119,7 @@ src/dumpbot/
     app.py                 build_bot(), build_dispatcher(), on_startup/on_shutdown                    [bot]
     middlewares.py  cbdata.py  keyboards.py  states.py  views.py  sender.py                           [bot]
     cards.py               карточка + CardExtras (чек-лист, похожие, родитель), 🎉 после закрытия шагов   [bot]
+    lists.py               списки с [✅ N]: /today, /tasks, дайджесты; перерисовка по кнопкам сообщения     [bot]
     routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
   web/                     Mini App: server.py (aiohttp, статика, WebServer) auth.py (initData) http.py  [web]
                            api_lists.py api_items.py api_inbox.py files.py (превью, LRU) serialize.py
@@ -515,8 +516,9 @@ async def mark_done(session, occurrence_id: int, now: datetime, prefs: Prefs) ->
     Повторяющаяся → гарантировать следующее open-повторение (с напоминаниями)."""
 async def mark_undone(session, occurrence_id: int) -> Occurrence   # обратно open; item.status=open
 async def snooze(session, occurrence_id: int, *, minutes: int | None = None, tomorrow: bool = False,
-                 prefs: Prefs, now: datetime) -> Reminder
-    """[⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра] ПЕРЕНОСЯТ время записи (2026-10-07): now+minutes, либо «завтра»
+                 at: datetime | None = None, prefs: Prefs, now: datetime) -> Reminder
+    """[⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра] / [🌙 Вечером] (итерация 3: `at` = `timeresolve.tonight`, сегодня в
+    `slot_evening`, только впереди) ПЕРЕНОСЯТ время записи (2026-10-07): now+minutes, либо «завтра»
     (`timeresolve.tomorrow`: до night_cutoff — уже начавшийся день; если этот момент прошёл — день спустя) в то же
     локальное время суток, что и due_at. Occurrence получает этот due (`/today`, дайджесты, Mini App показывают новое
     время; `_move`: в ежедневной серии сливается с уже созданным завтрашним), все его pending → cancelled, остаётся
@@ -688,6 +690,11 @@ def rows_for_llm(rows: list[Row], prefs: Prefs) -> list[dict]      # компа�
 новых первыми с keyset-курсором `(created_at, id)`; `rows_by_ids`; `item_images(session, item)` / `image_counts` —
 картинки сообщения записи (все части альбома; фото и JPEG/PNG/WebP/GIF файлом) для превью.
 
+Итерация 3, §2 ([features/iteration-3.md](features/iteration-3.md)): `list_rows(session, refs)` — строки
+пронумерованного списка (`(occurrence_id | None, item_id)` из его кнопок) как они есть сейчас: это occurrence записи,
+а если оно отменено (переехало, «когда-нибудь») или его не было — текущее (отменённое → строка без времени, сама
+запись); удалённая / пропавшая запись → None.
+
 ### 4.12 workers/jobs.py  [workers]
 
 ```python
@@ -826,6 +833,8 @@ class DigestData:
     agenda: Agenda
     recurring_today: int
 async def build_digest(session, kind: str, prefs: Prefs, now: datetime) -> DigestData | None   # None, если пусто
+async def digest_data(session, kind: str, prefs: Prefs, now: datetime) -> DigestData   # итерация 3: и пустой
+                                                                                       # (перерисовка после [✅ N])
 ```
 
 ### 4.16 workers/scheduler.py  [workers]
@@ -900,7 +909,8 @@ def kind_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 9 к
 def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime)
     # "🔔 <b>Купить наушники</b>" (+ «🗓 на этой неделе (до вс 11 окт)» / «⏳ срок: завтра»; без «через 5 мин»;
     # пришедшее позже своего времени больше чем на 2 мин — «⏰ сегодня 13:00 · опоздал на 5 ч»)
-    # [✅ Готово] [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
+    # [✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]; итерация 3, §4: пока до `slot_evening` больше часа
+    # (`offers_evening`) — [✅ Готово] / [⏰ 1 час] [🌙 Вечером] [📅 Завтра]
 def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
 def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> tuple[str, None]
     # после [⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра]: "🔔 <b>…</b>\n💤 отложено · напомню сегодня в 13:15" без кнопок
@@ -911,6 +921,10 @@ def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> tuple[str, 
     # вечерний: сделано / не сделано (уже наступило) / «Ещё сегодня» (due > now, не считается в «Сделано X из Y»)
     # / просрочено + [📅 Перенести невыполненное на завтра] (DigestCb с днём дайджеста), если есть что переносить
 def rows_list(title: str, rows: Sequence[Row], prefs: Prefs, now: datetime, *, empty: str = "Пусто")
+# Итерация 3, §2: today_list(agenda, …) (/today), tasks_list(rows, …) (/tasks), morning_digest, evening_digest —
+# открытые строки пронумерованы «1. 13:00 · 📌 Купить хлеб», под списком [✅ 1] [✅ 2] … (ListCb, по 5 в ряд, ≤ 20;
+# остальные — «•» и подсказка); закрытая строка — «1. ✅ 13:00 · 📌 <s>Купить хлеб</s>» с [↩️ 1]. Kwarg `lines`
+# (pin_lines: номера и разделы из кнопок сообщения + новые строки без номера) — перерисовка после нажатия.
 def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
 def usage_text(summary: UsageSummary) -> str
@@ -947,6 +961,12 @@ def help_text() -> str
 перенос невыполненного (DigestCb: день дайджеста D из данных кнопки, у старых кнопок `d:tmr` — дата сообщения;
 переносятся open-повторения дня D с due ≤ now и просроченные, на D+1 — `move_to_tomorrow(day=D+1, keep_ahead=True)`;
 то, что ещё впереди вечером, и то, чьё названное время впереди, не трогается), настройки (SetCb). Изменения → `edit` текущего сообщения (карточки) + `answer()` с тостом.
+Итерация 3: OccCb `eve` [🌙 Вечером] — `snooze(at=tonight)`; нажатое после `slot_evening` — тост «🌙 Вечер уже
+наступил…» и напоминание с [⏰ 15 мин]. ListCb `ld:<a>:<k>:<d>:<s>:<n>:<o>:<i>` ([✅ N] / [↩️ N] под /today, /tasks,
+дайджестами): `done` — `mark_done` occurrence строки (у серии — этот раз, у родителя — и открытые шаги; без occurrence —
+`apply_patch(done)`), `undo` — `mark_undone` / `apply_patch(undone)`, без ИИ; затем список (`bot.lists.render`)
+перерисовывается по кнопкам сообщения (`lists.snapshot`): те же номера и разделы, состояние — текущее. Уже
+закрытое / открытое / удалённое — только тост (+ перерисовка); сообщение без кнопок (недоступное) — свежий список.
 Кнопки убранного «⏱ Напомнить за…» в старых сообщениях (ItemCb `lead`, `LeadCb` `l:…`, SetCb `lead`, `ask`
 `lead_minutes`) отвечают «Кнопка устарела» и ничего не меняют.
 

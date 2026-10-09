@@ -15,15 +15,20 @@ Rules:
   19:00", "⏳ до пт 9 окт · 🔔 чт 19:00, пт 10:00", "🌙 когда-нибудь";
 - checklists and related items (§C): a parent's card lists its steps "☐ 1. Упаковать вещи" with a [☐ 1] / [☑ 1]
   toggle each; a step's card and reminder name the parent; list rows read "📌 Заказать машину (из «Переезд»)" and
-  "📌 Переезд (2/5)"; "🔗 похоже на: «Купить наушники Sony» (12 сен)" with a [🔗 Похожее] button.
+  "📌 Переезд (2/5)"; "🔗 похоже на: «Купить наушники Sony» (12 сен)" with a [🔗 Похожее] button;
+- iteration 3 (docs/features/iteration-3.md): /today, /tasks and the digests number their open lines with [✅ N]
+  buttons (§2, "numbered lists" below); a reminder offers [🌙 Вечером] instead of [⏰ 15 мин] while the evening slot
+  is more than an hour away (§4, ``offers_evening``).
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
   pending reminders (a done occurrence shows "✅ сделано" and [↩️ Не сделано]);
 - reminder message after ``OccCb done`` -> ``reminder_done`` (alias ``done_text``); after ``undone`` ->
-  ``reminder_message(item, occ, None, ...)``; after ``s15``/``s60``/``tmr`` -> ``reminder_snoozed`` with the new
-  reminder returned by ``items.snooze`` (no buttons: the snoozed reminder brings its own);
-- after ``ItemCb del`` -> ``deleted_card``; after ``undel`` -> ``item_card``.
+  ``reminder_message(item, occ, None, ...)``; after ``s15``/``s60``/``tmr``/``eve`` -> ``reminder_snoozed`` with the
+  new reminder returned by ``items.snooze`` (no buttons: the snoozed reminder brings its own);
+- after ``ItemCb del`` -> ``deleted_card``; after ``undel`` -> ``item_card``;
+- a list after ``ListCb`` -> ``today_list`` / ``tasks_list`` / ``morning_digest`` / ``evening_digest`` with the
+  ``lines`` of ``pin_lines`` (``bot.lists``): the same numbers, each line as it is now.
 
 Settings callbacks (``SetCb(key, v)``) emitted by the settings menus:
 
@@ -55,7 +60,7 @@ from __future__ import annotations
 
 import html
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any, Final, NamedTuple
 from urllib.parse import urlsplit
@@ -63,19 +68,31 @@ from zoneinfo import ZoneInfo
 
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import AskCb, ItemCb, KindCb, PickCb, SetCb
+from dumpbot.bot.cbdata import (
+    LIST_EVENING,
+    LIST_MORNING,
+    LIST_TASKS,
+    LIST_TODAY,
+    AskCb,
+    ItemCb,
+    KindCb,
+    PickCb,
+    SetCb,
+)
 from dumpbot.bot.keyboards import (
     BACK,
     back_to_card_row,
     button,
     chunked,
     clip_label,
-    digest_move_keyboard,
+    digest_move_row,
     item_card_keyboard,
+    list_buttons,
     markup,
     reminder_keyboard,
     undone_keyboard,
 )
+from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS, KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import SLOT_LABELS, SLOT_NAMES, Prefs
@@ -84,7 +101,7 @@ from dumpbot.domain.recurrence import describe_rrule_ru
 if TYPE_CHECKING:
     from dumpbot.ai.schemas import Ask
     from dumpbot.db.models import Item, Occurrence, Reminder
-    from dumpbot.dto import CardExtras, DigestData, RelatedRef, Row, Step, UsageSummary
+    from dumpbot.dto import Agenda, CardExtras, DigestData, RelatedRef, Row, Step, UsageSummary
 
 View = tuple[str, InlineKeyboardMarkup | None]
 MenuView = tuple[str, InlineKeyboardMarkup]
@@ -136,6 +153,8 @@ _SEASON_WORDS: Final[dict[int, tuple[str, str]]] = {
 }
 NEEDS_CONFIRM_HINT: Final = "проверь, правильно ли я понял"
 LATE_AFTER: Final = timedelta(minutes=2)  # a reminder sent later than this after its time says so
+# A reminder offers [🌙 Вечером] (instead of [⏰ 15 мин]) while the evening slot is more than this far away.
+EVENING_OFFER_BEFORE: Final = timedelta(hours=1)
 
 # --- text helpers ------------------------------------------------------------------------------------------------
 
@@ -673,8 +692,9 @@ def reminder_message(
 ) -> MenuView:
     """Reminder: "🔔 <b>Купить наушники</b>" (the item's time is this notification, so no time line), then for a span
     "🗓 на этой неделе (до вс 11 окт)", for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00"; a reminder
-    that comes noticeably late (``_late_line``) says when it was for; then [✅ Готово] / [⏰ 15 мин] [⏰ 1 час]
-    [📅 Завтра]. A step of a checklist names its parent (``parent_title``): "↳ шаг из «Переезд»".
+    that comes noticeably late (``_late_line``) says when it was for; then [✅ Готово] / [⏰ 1 час] [🌙 Вечером]
+    [📅 Завтра] while this evening is more than an hour away (``offers_evening``), later [✅ Готово] / [⏰ 15 мин]
+    [⏰ 1 час] [📅 Завтра]. A step of a checklist names its parent (``parent_title``): "↳ шаг из «Переезд»".
 
     ``reminder`` is the one being sent (None when the message is re-rendered, e.g. after "↩️ Не сделано").
     """
@@ -689,7 +709,13 @@ def reminder_message(
             _details_line(item),
         ],
     )
-    return fit("\n".join(lines)), reminder_keyboard(occ.id)
+    return fit("\n".join(lines)), reminder_keyboard(occ.id, evening=offers_evening(prefs, now))
+
+
+def offers_evening(prefs: Prefs, now: datetime) -> bool:
+    """[🌙 Вечером] on a reminder: this evening (``Prefs.slot_evening``) is more than ``EVENING_OFFER_BEFORE`` away
+    (docs/features/iteration-3.md §4)."""
+    return now < timeresolve.tonight(now, prefs) - EVENING_OFFER_BEFORE
 
 
 def _reminder_context(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> str | None:
@@ -756,7 +782,8 @@ def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime
 # --- lists and digests -------------------------------------------------------------------------------------------
 
 
-def _row_done(row: Row) -> bool:
+def row_done(row: Row) -> bool:
+    """A list row is done: its occurrence (the item itself when it has none)."""
     return row.occ_status == "done" if row.occ_status is not None else row.status == "done"
 
 
@@ -764,7 +791,7 @@ def _row_title(row: Row) -> str:
     """ "📌 Купить наушники" (struck through when done); a step "(из «Переезд»)", a parent its progress "(2/5)",
     a series "🔁"."""
     title = q(row.title, LIST_TITLE_MAX)
-    body = f"{_kind_emoji(row.kind)} {f'<s>{title}</s>' if _row_done(row) else title}"
+    body = f"{_kind_emoji(row.kind)} {f'<s>{title}</s>' if row_done(row) else title}"
     if row.parent_title:
         body += f" (из «{q(row.parent_title, PARENT_TITLE_MAX)}»)"
     elif row.steps_total:
@@ -792,13 +819,17 @@ def row_line(row: Row, prefs: Prefs, now: datetime) -> str:
     return f"{when} · {_row_title(row)}" if when else _row_title(row)
 
 
+def _block(title: str, lines: Sequence[str], empty: str = "Пусто") -> str:
+    """Header (plain text, escaped here) + ``lines`` (as many as fit), or ``empty`` under it."""
+    header = f"<b>{q(title)}</b>"
+    if not lines:
+        return f"{header}\n{q(empty, 500)}"
+    return "\n".join([header, *fit_lines(lines, MAX_TEXT - tg_len(header) - 1)])
+
+
 def rows_list(title: str, rows: Sequence[Row], prefs: Prefs, now: datetime, *, empty: str = "Пусто") -> View:
     """Header (plain text, escaped here) + compact lines "• сегодня 13:00 · 🛒 Купить наушники"."""
-    header = f"<b>{q(title)}</b>"
-    if not rows:
-        return f"{header}\n{q(empty, 500)}", None
-    lines = fit_lines([f"• {row_line(r, prefs, now)}" for r in rows], MAX_TEXT - tg_len(header) - 1)
-    return fit("\n".join([header, *lines])), None
+    return fit(_block(title, [f"• {row_line(r, prefs, now)}" for r in rows], empty)), None
 
 
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime) -> MenuView:
@@ -816,77 +847,260 @@ def ask_message(ask: Ask, raw_id: int) -> MenuView:
     return f"🤔 {q(ask.q, QUESTION_MAX)}", markup(*buttons)
 
 
+# --- numbered lists: [✅ N] / [↩️ N] (docs/features/iteration-3.md §2) -------------------------------------------
+#
+# /today, /tasks and the digests number their open lines "1. 13:00 · 📌 Купить хлеб" and put [✅ 1] [✅ 2] … under
+# them (``LIST_BUTTONS_PER_ROW`` a row, at most ``LIST_BUTTONS_MAX``; the lines past them keep "•" and get a hint).
+# A pressed line turns "1. ✅ 13:00 · 📌 <s>Купить хлеб</s>" with [↩️ 1]. A list is a few sections (``ListCb.s``):
+# ``*_sections`` split the fresh data into them, ``number_lines`` numbers a first render, ``pin_lines`` keeps the
+# numbers of a re-render (``bot.lists``), and the renderers take the result as ``lines``.
+
+LIST_BUTTONS_MAX: Final = 20
+SEC_OPEN: Final = "o"  # due today (/today, morning) / the open tasks (/tasks)
+SEC_OVERDUE: Final = "v"  # overdue
+SEC_PERIOD: Final = "p"  # the running spans ("🗓 На этой неделе")
+SEC_DONE: Final = "d"  # done that day (never numbered)
+SEC_MISSED: Final = "m"  # evening: not done, already due
+SEC_AHEAD: Final = "a"  # evening: still ahead tonight
+# Per list, the sections whose open lines are numbered, in numbering order.
+NUMBERED_SECTIONS: Final[dict[str, tuple[str, ...]]] = {
+    LIST_TODAY: (SEC_OPEN, SEC_OVERDUE, SEC_PERIOD),
+    LIST_TASKS: (SEC_OPEN,),
+    LIST_MORNING: (SEC_OPEN, SEC_OVERDUE, SEC_PERIOD),
+    LIST_EVENING: (SEC_MISSED, SEC_AHEAD, SEC_OVERDUE),
+}
+TODAY_EMPTY: Final = "На сегодня ничего не запланировано."
+TASKS_TITLE: Final = "📋 Открытые задачи"
+TASKS_EMPTY: Final = "Открытых задач нет 🎉"
+LIST_MORE_HINT: Final = "<i>Кнопки — у первых 20 дел; остальные — в /tasks или в Mini App</i>"
+TASKS_MORE_HINT: Final = "<i>Кнопки — у первых 20 дел; остальные — в Mini App</i>"
+
+type ListLine = tuple[Row, int | None]  # a row and the number of its [✅ N] / [↩️ N] (None: "•", no button)
+type ListLines = dict[str, list[ListLine]]  # section -> its lines, in order
+
+
+def today_sections(agenda: Agenda) -> dict[str, list[Row]]:
+    """/today and the morning digest (which leaves the done ones out)."""
+    return {SEC_OPEN: agenda.open, SEC_OVERDUE: agenda.overdue, SEC_PERIOD: agenda.period_items, SEC_DONE: agenda.done}
+
+
+def evening_sections(agenda: Agenda, now: datetime) -> dict[str, list[Row]]:
+    """Done; not done and already due (or without a time); still ahead tonight; overdue."""
+    return {
+        SEC_DONE: agenda.done,
+        SEC_MISSED: [r for r in agenda.open if r.due_at is None or r.due_at <= now],
+        SEC_AHEAD: [r for r in agenda.open if r.due_at is not None and r.due_at > now],
+        SEC_OVERDUE: agenda.overdue,
+    }
+
+
+def tasks_sections(rows: Sequence[Row]) -> dict[str, list[Row]]:
+    return {SEC_OPEN: list(rows)}
+
+
+def number_lines(kind: str, sections: Mapping[str, Sequence[Row]]) -> ListLines:
+    """A first render: the open rows of the list's numbered sections get 1, 2, … in order, up to
+    ``LIST_BUTTONS_MAX``; every other row none."""
+    lines: ListLines = {s: [(r, None) for r in rows] for s, rows in sections.items()}
+    n = 0
+    for section in NUMBERED_SECTIONS[kind]:
+        entries = lines.get(section, [])
+        for i, (row, _) in enumerate(entries):
+            if n < LIST_BUTTONS_MAX and not row_done(row):
+                n += 1
+                entries[i] = (row, n)
+    return lines
+
+
+def pin_lines(kind: str, sections: Mapping[str, Sequence[Row]], pinned: Sequence[tuple[str, int, Row]]) -> ListLines:
+    """A re-render after a press: the numbered lines of the message (``pinned``: section, number, the row as it is
+    now) keep their sections and numbers, in number order; the rows of the fresh ``sections`` that are not among them
+    (added since, past the first 20) follow without a number. /tasks tells rows apart by item (a series' next
+    instance is the same line), the day lists by occurrence."""
+
+    def key(row: Row) -> tuple[int, int | None]:
+        return (row.item_id, None) if kind == LIST_TASKS else (row.item_id, row.occurrence_id)
+
+    taken = {key(row) for _, _, row in pinned}
+    lines: ListLines = {s: [] for s in sections}
+    for section, n, row in sorted(pinned, key=lambda p: p[1]):
+        lines.setdefault(section, []).append((row, n))
+    for section, rows in sections.items():
+        lines[section] += [(r, None) for r in rows if key(r) not in taken]
+    return lines
+
+
+class _Numbered:
+    """Collects the numbered lines of a list while it is rendered; the keyboard gets a button for each one that made
+    it into the final text (``fit`` may cut a long list)."""
+
+    def __init__(self, kind: str, day: date | None) -> None:
+        self.kind = kind
+        self.day = day
+        self.lines: list[tuple[str, int, Row, str]] = []
+        self.unnumbered_open = False
+
+    def line(self, section: str, entry: ListLine, body: str, glyph: str = "") -> str:
+        """ "3. 13:00 · 📌 X", done "3. ✅ 13:00 · 📌 <s>X</s>", without a number "• 13:00 · 📌 X" (``glyph``, e.g.
+        "⬜", stands for "•" and marks an open numbered line)."""
+        row, n = entry
+        if n is None:
+            self.unnumbered_open |= not row_done(row)
+            return f"{glyph or '•'} {body}"
+        mark = "✅ " if row_done(row) else f"{glyph} " if glyph else ""
+        text = f"{n}. {mark}{body}"
+        self.lines.append((section, n, row, text))
+        return text
+
+    def hint(self) -> list[str]:
+        if not self.unnumbered_open:
+            return []
+        return [TASKS_MORE_HINT if self.kind == LIST_TASKS else LIST_MORE_HINT]
+
+    def rows(self, text: str) -> list[list[InlineKeyboardButton]]:
+        shown = set(text.split("\n"))
+        return list_buttons(
+            self.kind,
+            self.day,
+            [(s, n, r.occurrence_id, r.item_id, row_done(r)) for s, n, r, line in self.lines if line in shown],
+        )
+
+
+def today_list(agenda: Agenda, prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
+    """``/today``: today's not-done occurrences, then overdue ones, the running spans ("🗓 На этой неделе") and done
+    ones (sections only when non-empty); the open lines are numbered, with [✅ N] buttons. ``lines``: a re-render
+    (``pin_lines``)."""
+    if lines is None:
+        lines = number_lines(LIST_TODAY, today_sections(agenda))
+    nb = _Numbered(LIST_TODAY, agenda.day)
+    title = f"📅 Сегодня, {fmt_date(agenda.day)}"
+    open_lines = [nb.line(SEC_OPEN, e, row_line(e[0], prefs, now)) for e in lines.get(SEC_OPEN, [])]
+    parts = [_block(title, open_lines, TODAY_EMPTY)]
+    if overdue := lines.get(SEC_OVERDUE):
+        parts.append(_block("⚠️ Просрочено", [nb.line(SEC_OVERDUE, e, row_line(e[0], prefs, now)) for e in overdue]))
+    if periods := lines.get(SEC_PERIOD):
+        parts.append("\n".join(_period_lines(periods, prefs, now, nb)))
+    if done := lines.get(SEC_DONE):
+        parts.append(_block("✅ Сделано", [f"• {row_line(r, prefs, now)}" for r, _ in done]))
+    parts += nb.hint()
+    text = fit("\n\n".join(parts))
+    return text, _list_markup(nb, text)
+
+
+def tasks_list(rows: Sequence[Row], prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
+    """``/tasks``: the open tasks "1. сегодня 13:00 · 📌 Купить хлеб" with [✅ N] buttons. ``lines``: a re-render."""
+    if lines is None:
+        lines = number_lines(LIST_TASKS, tasks_sections(rows))
+    nb = _Numbered(LIST_TASKS, None)
+    body = [nb.line(SEC_OPEN, e, row_line(e[0], prefs, now)) for e in lines.get(SEC_OPEN, [])]
+    text = fit("\n\n".join([_block(TASKS_TITLE, body, TASKS_EMPTY), *nb.hint()]))
+    return text, _list_markup(nb, text)
+
+
+def _list_markup(nb: _Numbered, text: str, *extra: Sequence[InlineKeyboardButton]) -> InlineKeyboardMarkup | None:
+    rows = [*nb.rows(text), *extra]
+    return markup(*rows) if any(rows) else None
+
+
 def period_sections(rows: Sequence[Row], prefs: Prefs, now: datetime) -> list[str]:
     """Items of the running spans, one section per span: "🗓 <b>На этой неделе</b> (до вс 11 окт)" then
     "• 📌 Посмотреть Raspberry Pi" lines; sections are separated by an empty line."""
+    return _period_lines([(r, None) for r in rows], prefs, now, None)
+
+
+def _period_lines(entries: Sequence[ListLine], prefs: Prefs, now: datetime, nb: _Numbered | None) -> list[str]:
+    """``period_sections`` of list lines, numbered through ``nb``."""
     today = _local(now, prefs.zone).date()
-    groups: dict[tuple[str, date], list[Row]] = {}
-    for row in rows:
+    groups: dict[tuple[str, date], list[ListLine]] = {}
+    for entry in entries:
+        row = entry[0]
         if row.period_kind is None or row.period_start is None or row.period_end is None:
             continue
         label = period_label(row.period_kind, row.period_start, row.period_end, today)
-        groups.setdefault((label, row.period_end), []).append(row)
+        groups.setdefault((label, row.period_end), []).append(entry)
     lines: list[str] = []
     for (label, end), group in groups.items():
         if lines:
             lines.append("")
         lines.append(f"🗓 <b>{label[:1].upper()}{label[1:]}</b> (до {_span_end(end, today)})")
-        lines += [f"• {_row_title(r)}" for r in group]
+        for entry in group:
+            title = _row_title(entry[0])
+            lines.append(nb.line(SEC_PERIOD, entry, title) if nb is not None else f"• {title}")
     return lines
 
 
-def morning_digest(data: DigestData, prefs: Prefs, now: datetime) -> View:
+def morning_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
     """Morning plan "☀️ Доброе утро! План на сегодня, пт 9 окт": numbered open items, overdue, the running
-    spans ("🗓 На этой неделе"), recurring count."""
+    spans ("🗓 На этой неделе"), recurring count; [✅ N] under them. ``lines``: a re-render."""
     agenda = data.agenda
+    if lines is None:
+        lines = number_lines(LIST_MORNING, today_sections(agenda))
+    nb = _Numbered(LIST_MORNING, agenda.day)
     head = [f"☀️ <b>Доброе утро!</b> План на сегодня, {fmt_date(agenda.day)}", ""]
-    if agenda.open:
-        open_lines = [
-            f"{i}. {_row_when(r, prefs, now, agenda.day) or '—'} · {_row_title(r)}"
-            for i, r in enumerate(agenda.open, 1)
-        ]
-    else:
-        open_lines = ["На сегодня ничего не запланировано."]
+    open_lines = [
+        nb.line(SEC_OPEN, e, f"{_row_when(e[0], prefs, now, agenda.day) or '—'} · {_row_title(e[0])}")
+        for e in lines.get(SEC_OPEN, [])
+    ] or [TODAY_EMPTY]
     budget = MAX_TEXT - _TAIL_RESERVE - tg_len("\n".join(head))
     body = fit_lines(open_lines, budget)
-    if agenda.overdue:
+    if overdue := lines.get(SEC_OVERDUE):
         used = tg_len("\n".join(body))
-        overdue = [f"• {_row_when(r, prefs, now) or '—'} · {_row_title(r)}" for r in agenda.overdue]
-        body += ["", "⚠️ <b>Просрочено</b>", *fit_lines(overdue, budget - used - 30)]
-    if agenda.period_items:
+        overdue_lines = [
+            nb.line(SEC_OVERDUE, e, f"{_row_when(e[0], prefs, now) or '—'} · {_row_title(e[0])}") for e in overdue
+        ]
+        body += ["", "⚠️ <b>Просрочено</b>", *fit_lines(overdue_lines, budget - used - 30)]
+    if periods := lines.get(SEC_PERIOD):
         used = tg_len("\n".join(body))
-        body += ["", *fit_lines(period_sections(agenda.period_items, prefs, now), max(budget - used - 30, 60))]
+        body += ["", *fit_lines(_period_lines(periods, prefs, now, nb), max(budget - used - 30, 60))]
+    if hint := nb.hint():
+        body += ["", *hint]
     if data.recurring_today:
         body += ["", f"🔁 Повторяющихся сегодня: {data.recurring_today}"]
-    return fit("\n".join(head + body)), None
+    text = fit("\n".join(head + body))
+    return text, _list_markup(nb, text)
 
 
-def evening_digest(data: DigestData, prefs: Prefs, now: datetime) -> View:
-    """Evening "🌙 Итоги дня": done (struck through), not done (already due), still ahead tonight, overdue;
-    [📅 Перенести…] only when something already due is open (the button leaves tonight's later items alone)."""
+def evening_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
+    """Evening "🌙 Итоги дня": done (struck through), not done (already due), still ahead tonight, overdue — the not
+    done ones numbered, with [✅ N]; [📅 Перенести…] only when something already due is open (the button leaves
+    tonight's later items alone). ``lines``: a re-render (a line closed by its button counts as done)."""
     agenda = data.agenda
+    if lines is None:
+        lines = number_lines(LIST_EVENING, evening_sections(agenda, now))
+    nb = _Numbered(LIST_EVENING, agenda.day)
     head = [f"🌙 <b>Итоги дня</b>, {fmt_date(agenda.day)}"]
-    ahead = [r for r in agenda.open if r.due_at is not None and r.due_at > now]
-    missed = [r for r in agenda.open if r.due_at is None or r.due_at <= now]
-    total = len(agenda.done) + len(missed)
-    if not total and not ahead and not agenda.overdue:
+    done = [r for r, _ in lines.get(SEC_DONE, [])]
+    missed, ahead, overdue = (lines.get(s, []) for s in (SEC_MISSED, SEC_AHEAD, SEC_OVERDUE))
+    if not done and not missed and not ahead and not overdue:
         return "\n".join([*head, "Сегодня задач не было."]), None
+    missed_open = [r for r, _ in missed if not row_done(r)]
+    ahead_open = [r for r, _ in ahead if not row_done(r)]
+    done_count = len(done) + sum(row_done(r) for r, _ in (*missed, *ahead, *overdue))
+    total = done_count + len(missed_open)
     if total:
-        head.append("Всё сделано 🎉" if not missed and not ahead else f"Сделано {len(agenda.done)} из {total}")
+        head.append("Всё сделано 🎉" if not missed_open and not ahead_open else f"Сделано {done_count} из {total}")
     budget = MAX_TEXT - _TAIL_RESERVE - tg_len("\n".join(head))
-    body: list[str] = []
+    day = agenda.day
+
+    def body_of(row: Row, of_day: date | None = day) -> str:
+        return f"{_row_when(row, prefs, now, of_day) or '—'} · {_row_title(row)}"
+
     sections = [
-        ("<b>Сделано</b>", [f"✅ {_row_title(r)}" for r in agenda.done]),
-        ("<b>Не сделано</b>", [f"⬜ {_row_when(r, prefs, now, agenda.day) or '—'} · {_row_title(r)}" for r in missed]),
-        ("<b>Ещё сегодня</b>", [f"🕒 {_row_when(r, prefs, now, agenda.day)} · {_row_title(r)}" for r in ahead]),
-        ("<b>Просрочено</b>", [f"⬜ {_row_when(r, prefs, now) or '—'} · {_row_title(r)}" for r in agenda.overdue]),
+        ("<b>Сделано</b>", [f"✅ {_row_title(r)}" for r in done]),
+        ("<b>Не сделано</b>", [nb.line(SEC_MISSED, e, body_of(e[0]), "⬜") for e in missed]),
+        ("<b>Ещё сегодня</b>", [nb.line(SEC_AHEAD, e, body_of(e[0]), "🕒") for e in ahead]),
+        ("<b>Просрочено</b>", [nb.line(SEC_OVERDUE, e, body_of(e[0], None), "⬜") for e in overdue]),
     ]
-    for header, lines in sections:
-        if lines:
+    body: list[str] = []
+    for header, section_lines in sections:
+        if section_lines:
             room = budget - tg_len("\n".join(body)) - 40
-            body += ["", header, *fit_lines(lines, max(room, 60))]
-    kb = digest_move_keyboard(agenda.day) if missed or agenda.overdue else None
-    return fit("\n".join(head + body)), kb
+            body += ["", header, *fit_lines(section_lines, max(room, 60))]
+    if hint := nb.hint():
+        body += ["", *hint]
+    text = fit("\n".join(head + body))
+    move = bool(missed_open) or any(not row_done(r) for r, _ in overdue)
+    return text, _list_markup(nb, text, digest_move_row(day) if move else [])
 
 
 # --- usage / help ------------------------------------------------------------------------------------------------
@@ -958,13 +1172,19 @@ def help_text() -> str:
             "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
             " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
-            "• в напоминании: ✅ Готово, ⏰ отложить на 15 мин / 1 час, 📅 на завтра — запись переезжает"
-            " на новое время (и в плане на день, и в приложении); напоминание заранее (накануне срока, «за день»)"
-            " просто придёт ещё раз — время записи остаётся",
+            "• в напоминании: ✅ Готово, ⏰ отложить на 1 час, 🌙 на вечер (19:00; пока до него больше часа,"
+            " а потом вместо неё — ⏰ 15 мин), 📅 на завтра — запись переезжает на новое время (и в плане на день,"
+            " и в приложении); напоминание заранее (накануне срока, «за день») просто придёт ещё раз — время записи"
+            " остаётся",
             "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",
             "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
             "• в тихие часы приходят только напоминания с явно заданным временем",
             "• по утрам — план на день, вечером — итоги",
+            "",
+            "<b>Списки</b>",
+            "• в /today, /tasks и дайджестах дела пронумерованы, под списком кнопки ✅ 1 ✅ 2 … (до 20):"
+            " нажал — дело закрыто, строка зачёркнута, кнопка стала ↩️ — отменить; у повторяющихся закрывается"
+            " текущий раз, у задачи с шагами — и шаги",
             "",
             "<b>Шаги и похожее</b>",
             "• «переезд в субботу, распиши по шагам» — задача с чек-листом; или кнопка «🪄 Разбить на шаги» в карточке,"

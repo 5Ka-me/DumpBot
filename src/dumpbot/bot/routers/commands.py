@@ -22,9 +22,9 @@ from aiogram.filters import Command
 from aiogram.types import BotCommand, ForceReply, Message
 
 from dumpbot import clock
-from dumpbot.bot import sender, views
+from dumpbot.bot import lists, sender, views
+from dumpbot.bot.cbdata import LIST_TASKS, LIST_TODAY
 from dumpbot.bot.routers import common
-from dumpbot.domain.fmt import fmt_date
 from dumpbot.services import ingest, query
 
 if TYPE_CHECKING:
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
 
     from dumpbot.context import AppContext
     from dumpbot.domain.prefs import Prefs
-    from dumpbot.dto import Agenda
 
 log = logging.getLogger(__name__)
 
@@ -118,16 +117,19 @@ async def cmd_cancel(message: Message, ctx: AppContext, state: FSMContext) -> No
 
 
 async def cmd_today(message: Message, ctx: AppContext) -> None:
+    """Today's plan, its open lines numbered with [✅ N] (``bot.lists``)."""
+
     async def load(session: AsyncSession, prefs: Prefs, now: datetime) -> views.View:
-        return today_view(await query.agenda(session, prefs, now), prefs, now)
+        return await lists.render(session, LIST_TODAY, None, prefs, now)
 
     await _send_list(ctx, load)
 
 
 async def cmd_tasks(message: Message, ctx: AppContext) -> None:
+    """The open tasks, numbered with [✅ N] (``bot.lists``)."""
+
     async def load(session: AsyncSession, prefs: Prefs, now: datetime) -> views.View:
-        rows = await query.open_tasks(session, prefs, now, limit=LIST_LIMIT)
-        return views.rows_list("📋 Открытые задачи", rows, prefs, now, empty="Открытых задач нет 🎉")
+        return await lists.render(session, LIST_TASKS, None, prefs, now)
 
     await _send_list(ctx, load)
 
@@ -213,20 +215,6 @@ async def cmd_unknown(message: Message) -> None:
 
 
 # --- rendering -----------------------------------------------------------------------------------------------------
-
-
-def today_view(agenda: Agenda, prefs: Prefs, now: datetime) -> views.View:
-    """``/today``: today's not-done occurrences, then overdue ones, the running spans ("🗓 На этой неделе") and done
-    ones (sections only when non-empty)."""
-    title = f"📅 Сегодня, {fmt_date(agenda.day)}"
-    parts = [views.rows_list(title, agenda.open, prefs, now, empty="На сегодня ничего не запланировано.")[0]]
-    if agenda.overdue:
-        parts.append(views.rows_list("⚠️ Просрочено", agenda.overdue, prefs, now)[0])
-    if agenda.period_items:
-        parts.append("\n".join(views.period_sections(agenda.period_items, prefs, now)))
-    if agenda.done:
-        parts.append(views.rows_list("✅ Сделано", agenda.done, prefs, now)[0])
-    return views.fit("\n\n".join(parts)), None
 
 
 Loader = Callable[["AsyncSession", "Prefs", datetime], Awaitable[views.View]]

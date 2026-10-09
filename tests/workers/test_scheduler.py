@@ -11,7 +11,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError, Telegra
 from aiogram.methods import SendMessage
 from sqlalchemy import update
 
-from dumpbot.bot.cbdata import DigestCb, OccCb
+from dumpbot.bot.cbdata import DigestCb, ListCb, OccCb
 from dumpbot.db.models import Item, Occurrence, OnceKey, Reminder
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items
@@ -85,7 +85,7 @@ async def test_due_reminder_is_sent_with_buttons_and_marked_sent(
     assert msg["text"] == "🔔 <b>Созвон</b>"  # no "через 5 мин": it comes at the item's time
     occ_id = meeting.occurrence.id
     assert OccCb(a="done", id=occ_id).pack() in buttons(msg)
-    assert OccCb(a="s15", id=occ_id).pack() in buttons(msg)
+    assert OccCb(a="eve", id=occ_id).pack() in buttons(msg)  # 10:55: [🌙 Вечером] rather than [⏰ 15 мин]
     stored = await get(Reminder, reminder.id)
     assert (stored.status, stored.sent_at, stored.tg_message_id, stored.claimed_at) == ("sent", now, 9001, None)
     [bm] = await bot_messages()
@@ -265,7 +265,7 @@ async def test_disabled_digest_is_not_sent(ctx, set_prefs, make_items, t0, bot, 
 
 
 async def test_evening_digest_with_done_and_open(ctx, make_items, t0, bot, sessionmaker, local, get) -> None:
-    done, _ = await make_items(
+    done, call = await make_items(
         {"kind": "task", "title": "Отчёт", "when": {"time": "12:00"}},
         {"kind": "task", "title": "Звонок", "when": {"time": "14:00"}},  # its reminder is over the 6 h grace at 21:00
         now=t0,
@@ -276,7 +276,10 @@ async def test_evening_digest_with_done_and_open(ctx, make_items, t0, bot, sessi
     await Scheduler(ctx).tick(local(2026, 10, 6, 21, 0))
     [digest] = bot.sent
     assert "Итоги дня" in digest["text"] and "Сделано 1 из 2" in digest["text"]
-    assert buttons(digest) == [DigestCb(a="tmr", d="20261006").pack()]
+    assert buttons(digest) == [  # [✅ 1] for the not-done call, then the move button
+        ListCb(a="done", k="e", d="20261006", s="m", n=1, o=call.occurrence.id, i=call.item.id).pack(),
+        DigestCb(a="tmr", d="20261006").pack(),
+    ]
     assert await get(OnceKey, "digest:evening:2026-10-06") is not None
 
 

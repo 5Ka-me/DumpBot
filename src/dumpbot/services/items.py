@@ -763,11 +763,13 @@ async def snooze(
     *,
     minutes: int | None = None,
     tomorrow: bool = False,
+    at: datetime | None = None,
     prefs: Prefs,
     now: datetime,
 ) -> Reminder:
-    """[⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра]: move the item's time to ``now + minutes``, or tomorrow (relative to now;
-    before ``night_cutoff`` that is the day that has just started) at the local time of day of ``due_at`` — the
+    """[⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра] / [🌙 Вечером]: move the item's time to ``now + minutes``, or tomorrow
+    (relative to now; before ``night_cutoff`` that is the day that has just started) at the local time of day of
+    ``due_at``, or to the moment ``at`` (this evening, ``timeresolve.tonight``; it must be ahead of ``now``) — the
     occurrence is due then (``/today``, the digests and the Mini App show the new time) and has exactly one pending
     reminder, at that time (auto=False). A one-off item's explicit leads go with the old time; a span ("на этой
     неделе") or a time the bot chose becomes this exact time. An instance of a series moves alone (merging into an
@@ -778,8 +780,8 @@ async def snooze(
     yet — the item keeps its time; the snooze replaces the reminders up to then, the later ones stay. The returned
     reminder's ``occurrence_id`` is the occurrence it now belongs to.
     """
-    if (minutes is None) == (not tomorrow):
-        raise ValueError("snooze needs exactly one of minutes / tomorrow")
+    if [minutes is not None, tomorrow, at is not None].count(True) != 1:
+        raise ValueError("snooze needs exactly one of minutes / tomorrow / at")
     now = _utc(now)
     occ = await _get_occ(session, occurrence_id)
     item = await _get_item(session, occ.item_id)
@@ -787,6 +789,10 @@ async def snooze(
         if minutes <= 0:
             raise ValueError(f"snooze minutes must be positive: {minutes}")
         fire = now + timedelta(minutes=minutes)
+    elif at is not None:
+        fire = _utc(at)
+        if fire <= now:
+            raise ValueError(f"snooze moment must be ahead: {fire.isoformat()}")
     else:
         tz = prefs.zone
         day, clock_time = timeresolve.tomorrow(now, prefs), occ.due_at.astimezone(tz).time()

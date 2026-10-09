@@ -32,7 +32,7 @@ async def test_tasks_leave_someday_items_out(feed, updates, seed, tg) -> None:
     await feed(updates.message("/tasks"))
 
     [text] = tg.texts
-    assert "• на этой неделе · 📌 Посмотреть Raspberry Pi" in text
+    assert "1. на этой неделе · 📌 Посмотреть Raspberry Pi" in text
     assert "испанский" not in text
 
 
@@ -44,5 +44,5 @@ async def test_today_shows_the_running_week(feed, updates, seed, tg) -> None:
 
     [text] = tg.texts
     assert "На сегодня ничего не запланировано." in text
-    assert "🗓 <b>На этой неделе</b> (до вс 11 окт)\n• 📌 Посмотреть Raspberry Pi" in text
+    assert "🗓 <b>На этой неделе</b> (до вс 11 окт)\n1. 📌 Посмотреть Raspberry Pi" in text
     assert "Шины" not in text

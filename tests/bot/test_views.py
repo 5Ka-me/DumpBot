@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import re
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 
 import pytest
 
 from dumpbot.ai.schemas import Ask
 from dumpbot.bot import views
-from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, OccCb, PickCb, SetCb
+from dumpbot.bot.cbdata import AskCb, DigestCb, ItemCb, KindCb, ListCb, OccCb, PickCb, SetCb
 from dumpbot.domain.kinds import KINDS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, DigestData, UsageSummary
@@ -349,11 +349,43 @@ def test_reminder_message(prefs, at, make_item, make_occ, make_reminder, check_v
     occ = make_occ(due, id=BIG)
     text, kb = check_view(views.reminder_message(make_item(), occ, make_reminder(occ), prefs, due - delta))
     assert lines(text) == ["🔔 <b>Купить наушники</b>"]
+    # 13:00: the evening (19:00) is more than an hour away -> [🌙 Вечером] instead of [⏰ 15 мин]
     assert buttons(kb) == [
         ("✅ Готово", f"o:done:{BIG}"),
-        ("⏰ 15 мин", f"o:s15:{BIG}"),
         ("⏰ 1 час", f"o:s60:{BIG}"),
+        ("🌙 Вечером", f"o:eve:{BIG}"),
         ("📅 Завтра", f"o:tmr:{BIG}"),
+    ]
+    assert [len(row) for row in kb.inline_keyboard] == [1, 3]
+
+
+@pytest.mark.parametrize(
+    ("hour", "minute", "evening"),
+    [(0, 30, True), (10, 0, True), (17, 59, True), (18, 0, False), (18, 30, False), (19, 0, False), (23, 0, False)],
+)
+def test_reminder_offers_the_evening_until_an_hour_before_it(
+    prefs, at, make_item, make_occ, make_reminder, buttons, hour, minute, evening
+):
+    now = at(2026, 10, 6, hour, minute)
+    occ = make_occ(now, id=BIG)
+    _, kb = views.reminder_message(make_item(), occ, make_reminder(occ), prefs, now)
+    labels = [label for label, _ in buttons(kb)]
+    if evening:
+        assert labels == ["✅ Готово", "⏰ 1 час", "🌙 Вечером", "📅 Завтра"]
+    else:
+        assert labels == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
+    assert views.offers_evening(prefs, now) is evening
+
+
+def test_reminder_evening_follows_the_evening_slot(prefs, at, make_item, make_occ, buttons):
+    late_evening = Prefs(slot_evening=time(21, 0))
+    now = at(2026, 10, 6, 19, 30)  # 19:30: an hour and a half before a 21:00 evening
+    occ = make_occ(now)
+    assert "🌙 Вечером" in [
+        label for label, _ in buttons(views.reminder_message(make_item(), occ, None, late_evening, now)[1])
+    ]
+    assert "🌙 Вечером" not in [
+        label for label, _ in buttons(views.reminder_message(make_item(), occ, None, prefs, now)[1])
     ]
 
 
@@ -479,18 +511,28 @@ def _agenda(**kw) -> Agenda:
     return Agenda(**values)
 
 
-def test_morning_digest(prefs, at, make_row, check_view):
+def _done_cb(n: int, item: int, occ: int | None = None, *, kind: str = "m", s: str = "o", d: str = "20261009") -> str:
+    return ListCb(a="done", k=kind, d=d, s=s, n=n, o=occ or 0, i=item).pack()
+
+
+def test_morning_digest(prefs, at, make_row, check_view, buttons):
     now = at(2026, 10, 9, 9, 0)
     agenda = _agenda(
         open=[
-            make_row(title="Позвонить маме", due_at=at(2026, 10, 9, 9, 30)),
-            make_row(kind="purchase", title="Купить <хлеб>", due_at=at(2026, 10, 9, 19, 0), rrule="FREQ=DAILY"),
+            make_row(item_id=1, occurrence_id=11, title="Позвонить маме", due_at=at(2026, 10, 9, 9, 30)),
+            make_row(
+                item_id=2,
+                occurrence_id=12,
+                kind="purchase",
+                title="Купить <хлеб>",
+                due_at=at(2026, 10, 9, 19, 0),
+                rrule="FREQ=DAILY",
+            ),
         ],
-        overdue=[make_row(title="Сдать отчёт", due_at=at(2026, 10, 8, 19, 0))],
+        overdue=[make_row(item_id=3, occurrence_id=13, title="Сдать отчёт", due_at=at(2026, 10, 8, 19, 0))],
     )
     data = DigestData(kind="morning", agenda=agenda, recurring_today=1)
     text, kb = check_view(views.morning_digest(data, prefs, now))
-    assert kb is None
     assert lines(text) == [
         "☀️ <b>Доброе утро!</b> План на сегодня, пт 9 окт",
         "",
@@ -498,9 +540,15 @@ def test_morning_digest(prefs, at, make_row, check_view):
         "2. 19:00 · 🛒 Купить &lt;хлеб&gt; 🔁",
         "",
         "⚠️ <b>Просрочено</b>",
-        "• вчера 19:00 · 📌 Сдать отчёт",
+        "3. вчера 19:00 · 📌 Сдать отчёт",
         "",
         "🔁 Повторяющихся сегодня: 1",
+    ]
+    # the overdue line is numbered too; the button knows its list, day, section, line and occurrence
+    assert buttons(kb) == [
+        ("✅ 1", _done_cb(1, 1, 11)),
+        ("✅ 2", _done_cb(2, 2, 12)),
+        ("✅ 3", _done_cb(3, 3, 13, s="v")),
     ]
 
 
@@ -509,7 +557,7 @@ def test_morning_digest_only_overdue(prefs, at, make_row, check_view):
     agenda = _agenda(overdue=[make_row(title="Старое", due_at=at(2026, 10, 1, 19, 0))])
     text, _ = check_view(views.morning_digest(DigestData(kind="morning", agenda=agenda), prefs, now))
     assert "На сегодня ничего не запланировано." in text
-    assert "• чт 1 окт 19:00 · 📌 Старое" in text
+    assert "1. чт 1 окт 19:00 · 📌 Старое" in text
     assert "Повторяющихся" not in text
 
 
@@ -517,8 +565,8 @@ def test_evening_digest(prefs, at, make_row, check_view, buttons):
     now = at(2026, 10, 9, 21, 0)
     agenda = _agenda(
         done=[make_row(title="Купить наушники", kind="purchase", occ_status="done", due_at=at(2026, 10, 9, 13, 0))],
-        open=[make_row(title="Позвонить маме", due_at=at(2026, 10, 9, 19, 0))],
-        overdue=[make_row(title="Сдать отчёт", due_at=at(2026, 10, 7, 19, 0))],
+        open=[make_row(item_id=2, occurrence_id=22, title="Позвонить маме", due_at=at(2026, 10, 9, 19, 0))],
+        overdue=[make_row(item_id=3, occurrence_id=23, title="Сдать отчёт", due_at=at(2026, 10, 7, 19, 0))],
     )
     text, kb = check_view(views.evening_digest(DigestData(kind="evening", agenda=agenda), prefs, now))
     assert lines(text) == [
@@ -529,12 +577,17 @@ def test_evening_digest(prefs, at, make_row, check_view, buttons):
         "✅ 🛒 <s>Купить наушники</s>",
         "",
         "<b>Не сделано</b>",
-        "⬜ 19:00 · 📌 Позвонить маме",
+        "1. ⬜ 19:00 · 📌 Позвонить маме",
         "",
         "<b>Просрочено</b>",
-        "⬜ ср 7 окт 19:00 · 📌 Сдать отчёт",
+        "2. ⬜ ср 7 окт 19:00 · 📌 Сдать отчёт",
     ]
-    assert buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261009").pack())]
+    assert buttons(kb) == [
+        ("✅ 1", _done_cb(1, 2, 22, kind="e", s="m")),
+        ("✅ 2", _done_cb(2, 3, 23, kind="e", s="v")),
+        ("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261009").pack()),
+    ]
+    assert [len(row) for row in kb.inline_keyboard] == [2, 1]
 
 
 def test_evening_digest_keeps_items_still_ahead_tonight_apart(prefs, at, make_row, check_view, buttons):
@@ -542,8 +595,8 @@ def test_evening_digest_keeps_items_still_ahead_tonight_apart(prefs, at, make_ro
     agenda = _agenda(
         done=[make_row(title="Отчёт", occ_status="done", due_at=at(2026, 10, 9, 13, 0))],
         open=[
-            make_row(title="Позвонить маме", due_at=at(2026, 10, 9, 19, 0)),
-            make_row(title="Таблетки", due_at=at(2026, 10, 9, 22, 0), rrule="FREQ=DAILY"),
+            make_row(item_id=2, title="Позвонить маме", due_at=at(2026, 10, 9, 19, 0)),
+            make_row(item_id=3, title="Таблетки", due_at=at(2026, 10, 9, 22, 0), rrule="FREQ=DAILY"),
         ],
     )
     text, kb = check_view(views.evening_digest(DigestData(kind="evening", agenda=agenda), prefs, now))
@@ -555,24 +608,28 @@ def test_evening_digest_keeps_items_still_ahead_tonight_apart(prefs, at, make_ro
         "✅ 📌 <s>Отчёт</s>",
         "",
         "<b>Не сделано</b>",
-        "⬜ 19:00 · 📌 Позвонить маме",
+        "1. ⬜ 19:00 · 📌 Позвонить маме",
         "",
         "<b>Ещё сегодня</b>",
-        "🕒 22:00 · 📌 Таблетки 🔁",
+        "2. 🕒 22:00 · 📌 Таблетки 🔁",
     ]
-    assert buttons(kb) == [("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261009").pack())]
+    assert buttons(kb) == [
+        ("✅ 1", _done_cb(1, 2, kind="e", s="m")),
+        ("✅ 2", _done_cb(2, 3, kind="e", s="a")),
+        ("📅 Перенести невыполненное на завтра", DigestCb(a="tmr", d="20261009").pack()),
+    ]
 
 
-def test_evening_digest_with_only_items_ahead_has_no_button(prefs, at, make_row, check_view):
+def test_evening_digest_with_only_items_ahead_has_no_move_button(prefs, at, make_row, check_view, buttons):
     now = at(2026, 10, 9, 21, 0)
     agenda = _agenda(
         done=[make_row(title="Отчёт", occ_status="done", due_at=at(2026, 10, 9, 13, 0))],
-        open=[make_row(title="Таблетки", due_at=at(2026, 10, 9, 22, 0))],
+        open=[make_row(item_id=2, title="Таблетки", due_at=at(2026, 10, 9, 22, 0))],
     )
     text, kb = check_view(views.evening_digest(DigestData(kind="evening", agenda=agenda), prefs, now))
     assert lines(text)[1] == "Сделано 1 из 1"
     assert "<b>Ещё сегодня</b>" in text and "Не сделано" not in text
-    assert kb is None
+    assert buttons(kb) == [("✅ 1", _done_cb(1, 2, kind="e", s="a"))]
 
 
 def test_evening_digest_all_done_has_no_button(prefs, at, make_row, check_view):
@@ -589,15 +646,147 @@ def test_evening_digest_empty(prefs, at, check_view):
     assert kb is None
 
 
-def test_digests_truncate(prefs, at, make_row, check_view):
+def test_digests_truncate(prefs, at, make_row, check_view, buttons):
     now = at(2026, 10, 9, 9, 0)
     many = [make_row(title="задача & " * 12, due_at=at(2026, 10, 9, 12, 0)) for _ in range(300)]
     old = [make_row(title="старое & " * 12, due_at=at(2026, 10, 1, 12, 0)) for _ in range(300)]
     data = DigestData(kind="morning", agenda=_agenda(open=many, overdue=old, done=many), recurring_today=3)
-    text, _ = check_view(views.morning_digest(data, prefs, now))
+    text, kb = check_view(views.morning_digest(data, prefs, now))
     assert "… и ещё" in text and text.endswith("🔁 Повторяющихся сегодня: 3")
+    assert views.LIST_MORE_HINT in text
+    assert [label for label, _ in buttons(kb)] == [f"✅ {n}" for n in range(1, 21)]
     text, kb = check_view(views.evening_digest(data, prefs, now))
     assert "… и ещё" in text and kb is not None
+
+
+# --- numbered lists: [✅ N] / [↩️ N] (iteration 3, §2) ----------------------------------------------------------
+
+
+def test_today_list_numbers_the_open_lines(prefs, at, make_row, check_view, buttons):
+    now = at(2026, 10, 9, 12, 0)
+    agenda = _agenda(
+        open=[
+            make_row(item_id=1, occurrence_id=11, title="Купить хлеб", due_at=at(2026, 10, 9, 13, 0)),
+            make_row(item_id=2, occurrence_id=12, title="Позвонить", due_at=at(2026, 10, 9, 15, 0)),
+        ],
+        overdue=[make_row(item_id=3, occurrence_id=13, title="Отчёт", due_at=at(2026, 10, 8, 19, 0))],
+        done=[make_row(item_id=4, occurrence_id=14, title="Зарядка", occ_status="done", due_at=at(2026, 10, 9, 9))],
+    )
+    text, kb = check_view(views.today_list(agenda, prefs, now))
+    assert lines(text) == [
+        "<b>📅 Сегодня, пт 9 окт</b>",
+        "1. сегодня 13:00 · 📌 Купить хлеб",
+        "2. сегодня 15:00 · 📌 Позвонить",
+        "",
+        "<b>⚠️ Просрочено</b>",
+        "3. вчера 19:00 · 📌 Отчёт",
+        "",
+        "<b>✅ Сделано</b>",
+        "• сегодня 09:00 · 📌 <s>Зарядка</s>",
+    ]
+    assert buttons(kb) == [
+        ("✅ 1", _done_cb(1, 1, 11, kind="t")),
+        ("✅ 2", _done_cb(2, 2, 12, kind="t")),
+        ("✅ 3", _done_cb(3, 3, 13, kind="t", s="v")),
+    ]
+
+
+def test_today_list_without_open_lines_has_no_buttons(prefs, at, make_row, check_view):
+    agenda = _agenda(done=[make_row(title="Зарядка", occ_status="done", due_at=at(2026, 10, 9, 9))])
+    text, kb = check_view(views.today_list(agenda, prefs, at(2026, 10, 9, 12, 0)))
+    assert "На сегодня ничего не запланировано." in text
+    assert kb is None
+
+
+def test_tasks_list_at_most_20_buttons_5_a_row(prefs, now, make_row, check_view, buttons):
+    rows = [make_row(item_id=100 + i, occurrence_id=None, title=f"Задача {i}") for i in range(25)]
+    text, kb = check_view(views.tasks_list(rows, prefs, now))
+    assert lines(text)[:3] == ["<b>📋 Открытые задачи</b>", "1. 📌 Задача 0", "2. 📌 Задача 1"]
+    assert "20. 📌 Задача 19" in lines(text) and "• 📌 Задача 20" in lines(text)
+    assert lines(text)[-1] == views.TASKS_MORE_HINT
+    assert [len(row) for row in kb.inline_keyboard] == [5, 5, 5, 5]
+    assert buttons(kb)[0] == ("✅ 1", ListCb(a="done", k="k", d="", s="o", n=1, o=0, i=100).pack())
+    assert buttons(kb)[-1][0] == "✅ 20"
+
+
+def test_tasks_list_empty(prefs, now, check_view):
+    assert check_view(views.tasks_list([], prefs, now)) == ("<b>📋 Открытые задачи</b>\nОткрытых задач нет 🎉", None)
+
+
+def test_list_buttons_fit_64_bytes_with_huge_ids(prefs, at, make_row, check_view):
+    rows = [make_row(item_id=BIG + i, occurrence_id=BIG + i, due_at=at(2026, 10, 9, 13)) for i in range(20)]
+    for view in (
+        views.tasks_list(rows, prefs, at(2026, 10, 9, 12)),
+        views.today_list(_agenda(open=rows), prefs, at(2026, 10, 9, 12)),
+        views.evening_digest(DigestData(kind="evening", agenda=_agenda(overdue=rows)), prefs, at(2026, 10, 9, 21)),
+    ):
+        _, kb = check_view(view)
+        datas = [b.callback_data for row in kb.inline_keyboard for b in row]
+        assert len(datas) >= 20 and all(len(d.encode()) <= 64 for d in datas)
+
+
+def test_a_done_numbered_line_is_struck_through_with_an_undo_button(prefs, at, make_row, check_view, buttons):
+    now = at(2026, 10, 9, 21, 0)
+    milk = make_row(item_id=1, occurrence_id=11, title="Молоко", due_at=at(2026, 10, 9, 13, 0))
+    mom = make_row(item_id=2, occurrence_id=12, title="Маме", due_at=at(2026, 10, 9, 19, 0), occ_status="done")
+    pills = make_row(item_id=3, occurrence_id=13, title="Таблетки", due_at=at(2026, 10, 9, 22, 0), occ_status="done")
+    lines_ = {views.SEC_DONE: [], views.SEC_MISSED: [(milk, 1), (mom, 2)], views.SEC_AHEAD: [(pills, 3)]}
+    data = DigestData(kind="evening", agenda=_agenda())
+    text, kb = check_view(views.evening_digest(data, prefs, now, lines=lines_))
+    assert lines(text) == [
+        "🌙 <b>Итоги дня</b>, пт 9 окт",
+        "Сделано 2 из 3",
+        "",
+        "<b>Не сделано</b>",
+        "1. ⬜ 13:00 · 📌 Молоко",
+        "2. ✅ 19:00 · 📌 <s>Маме</s>",
+        "",
+        "<b>Ещё сегодня</b>",
+        "3. ✅ 22:00 · 📌 <s>Таблетки</s>",
+    ]
+    assert [label for label, _ in buttons(kb)] == ["✅ 1", "↩️ 2", "↩️ 3", "📅 Перенести невыполненное на завтра"]
+    assert buttons(kb)[1][1] == ListCb(a="undo", k="e", d="20261009", s="m", n=2, o=12, i=2).pack()
+
+
+def test_pin_lines_keeps_the_numbers_and_appends_new_rows(make_row):
+    a = make_row(item_id=1, occurrence_id=11, title="A")
+    b_done = make_row(item_id=2, occurrence_id=12, title="B", occ_status="done")
+    c = make_row(item_id=3, occurrence_id=13, title="C")
+    new = make_row(item_id=4, occurrence_id=14, title="New")
+    fresh = {views.SEC_OPEN: [a, c, new], views.SEC_OVERDUE: [], views.SEC_DONE: [b_done]}
+    pinned = [(views.SEC_OPEN, 1, a), (views.SEC_OPEN, 2, b_done), (views.SEC_OVERDUE, 3, c)]
+    lines_ = views.pin_lines("t", fresh, pinned)
+    # B keeps its place (not moved to "done"), C stays overdue, the new row has no number
+    assert lines_[views.SEC_OPEN] == [(a, 1), (b_done, 2), (new, None)]
+    assert lines_[views.SEC_OVERDUE] == [(c, 3)]
+    assert lines_[views.SEC_DONE] == []
+    # /tasks tells lines apart by item: a series' next instance is the same line
+    nxt = make_row(item_id=1, occurrence_id=99, title="A")
+    assert views.pin_lines("k", {views.SEC_OPEN: [nxt]}, [(views.SEC_OPEN, 1, a)])[views.SEC_OPEN] == [(a, 1)]
+
+
+def test_number_lines_skips_done_rows_and_stops_at_20(make_row):
+    rows = [make_row(item_id=i, title=str(i)) for i in range(22)]
+    rows[0] = make_row(item_id=0, title="done", occ_status="done")
+    numbered = views.number_lines("k", {views.SEC_OPEN: rows})[views.SEC_OPEN]
+    assert [n for _, n in numbered] == [None, *range(1, 21), None]
+
+
+def test_period_lines_are_numbered_after_today_and_overdue(prefs, at, make_row, check_view, buttons):
+    now = at(2026, 10, 9, 12, 0)
+    week = make_row(
+        item_id=5,
+        occurrence_id=15,
+        title="Raspberry Pi",
+        period_kind="week",
+        period_start=date(2026, 10, 5),
+        period_end=date(2026, 10, 11),
+        due_at=at(2026, 10, 9, 19, 0),
+    )
+    agenda = _agenda(open=[make_row(item_id=1, due_at=at(2026, 10, 9, 13))], period_items=[week])
+    text, kb = check_view(views.today_list(agenda, prefs, now))
+    assert "🗓 <b>На этой неделе</b> (до вс 11 окт)\n2. 📌 Raspberry Pi" in text
+    assert buttons(kb)[1] == ("✅ 2", _done_cb(2, 5, 15, kind="t", s="p"))
 
 
 # --- usage / help ------------------------------------------------------------------------------------------------
@@ -638,6 +827,7 @@ def test_help_text_lists_all_commands(check_view):
         assert f"\n{command} " in text
     assert "«?»" in text and "reply" in text
     assert "аудиофайлы (до 5 мин)" in text and "кружочки сохраняю без распознавания" in text
+    assert "🌙 на вечер" in text and "✅ 1 ✅ 2" in text and "↩️" in text  # iteration 3: §4 and §2
 
 
 # --- settings ----------------------------------------------------------------------------------------------------
@@ -839,6 +1029,6 @@ def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_remind
     ]
     for view in built:
         check_view(view)
-    occ_cbs = {OccCb(a=a, id=BIG).pack() for a in ("done", "s15", "s60", "tmr")}
+    occ_cbs = {OccCb(a=a, id=BIG).pack() for a in ("done", "s60", "eve", "tmr")}
     reminder_kb = built[5][1]
     assert {b.callback_data for row in reminder_kb.inline_keyboard for b in row} == occ_cbs

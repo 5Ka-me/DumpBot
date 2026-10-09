@@ -13,7 +13,7 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import DigestData
 from dumpbot.services import items, query
 
-__all__ = ["DigestData", "build_digest", "day_moment", "move_not_done"]
+__all__ = ["DigestData", "build_digest", "day_moment", "digest_data", "move_not_done"]
 
 DigestKind = Literal["morning", "evening"]
 
@@ -25,15 +25,20 @@ async def build_digest(session: AsyncSession, kind: str, prefs: Prefs, now: date
     evening: done / not done today + overdue (skipped if all are empty).
     ``recurring_today`` counts today's occurrences (open or done) of active series.
     """
-    if kind not in ("morning", "evening"):
-        raise ValueError(f"unknown digest kind: {kind}")
-    agenda = await query.agenda(session, prefs, now)
+    data = await digest_data(session, kind, prefs, now)
+    agenda = data.agenda
     if kind == "morning":
         empty = not agenda.open and not agenda.overdue and not agenda.period_items
     else:
         empty = not agenda.open and not agenda.done and not agenda.overdue
-    if empty:
-        return None
+    return None if empty else data
+
+
+async def digest_data(session: AsyncSession, kind: str, prefs: Prefs, now: datetime) -> DigestData:
+    """``build_digest`` without the emptiness check: a digest whose [✅ N] closed all of it is still re-rendered."""
+    if kind not in ("morning", "evening"):
+        raise ValueError(f"unknown digest kind: {kind}")
+    agenda = await query.agenda(session, prefs, now)
     recurring_today = sum(1 for row in (*agenda.open, *agenda.done) if row.rrule)
     return DigestData(kind=cast(DigestKind, kind), agenda=agenda, recurring_today=recurring_today)
 

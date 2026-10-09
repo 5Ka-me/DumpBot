@@ -11,6 +11,7 @@ from sqlalchemy import select
 
 from dumpbot.ai.schemas import EditPatch
 from dumpbot.db.models import Reminder
+from dumpbot.domain import timeresolve
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import items, query
 from dumpbot.services.settings_repo import save_prefs
@@ -150,6 +151,40 @@ async def test_snooze_tomorrow_uses_due_time_of_day(session, make, local, now, p
     reminder = await items.snooze(session, c.occurrence.id, tomorrow=True, prefs=prefs, now=local(2026, 10, 6, 13, 5))
     assert reminder.fire_at == local(2026, 10, 7, 13, 0)
     assert c.occurrence.due_at == local(2026, 10, 7, 13, 0)
+
+
+async def test_snooze_to_this_evening_moves_the_time(session, make, reminders_of, local, prefs):
+    # [🌙 Вечером] on the 10:00 reminder (iteration 3, §4): the item is due tonight at the evening slot
+    [c] = await make({"kind": "task", "title": "Позвонить маме", "when": {"time": "10:00"}}, now=local(2026, 10, 6, 9))
+    at = local(2026, 10, 6, 10, 2)
+    reminder = await items.snooze(session, c.occurrence.id, at=timeresolve.tonight(at, prefs), prefs=prefs, now=at)
+    assert (reminder.fire_at, reminder.auto, reminder.occurrence_id) == (local(2026, 10, 6, 19), False, c.occurrence.id)
+    assert (c.occurrence.due_at, c.occurrence.status) == (local(2026, 10, 6, 19), "open")
+    assert await reminders_of(c.occurrence.id) == [
+        (local(2026, 10, 6, 10), "cancelled", 0, False),
+        (local(2026, 10, 6, 19), "pending", 0, False),
+    ]
+    await session.flush()
+    [row] = (await query.agenda(session, prefs, at)).open  # /today and the digests show it at 19:00
+    assert row.due_at == local(2026, 10, 6, 19)
+
+
+async def test_snooze_to_this_evening_never_moves_a_later_item_earlier(session, make, reminders_of, local, now, prefs):
+    # snoozed to tonight, an item due tomorrow keeps its time: one more reminder tonight
+    [c] = await make({"kind": "task", "title": "Встреча", "when": {"day": "+1", "time": "13:00"}}, now=now)
+    reminder = await items.snooze(session, c.occurrence.id, at=local(2026, 10, 6, 19), prefs=prefs, now=now)
+    assert reminder.fire_at == local(2026, 10, 6, 19)
+    assert c.occurrence.due_at == local(2026, 10, 7, 13)
+    pending = [fire for fire, *_ in await reminders_of(c.occurrence.id, "pending")]
+    assert pending == [local(2026, 10, 6, 19), local(2026, 10, 7, 13)]
+
+
+async def test_snooze_needs_exactly_one_target_ahead(session, make, local, now, prefs):
+    [c] = await make({"kind": "task", "title": "Отчёт", "when": {"time": "15:00"}}, now=now)
+    with pytest.raises(ValueError, match="ahead"):
+        await items.snooze(session, c.occurrence.id, at=now, prefs=prefs, now=now)
+    with pytest.raises(ValueError, match="exactly one"):
+        await items.snooze(session, c.occurrence.id, minutes=15, at=local(2026, 10, 6, 19), prefs=prefs, now=now)
 
 
 async def test_snooze_tomorrow_relative_to_now_even_if_due_is_later(session, make, local, now, prefs):

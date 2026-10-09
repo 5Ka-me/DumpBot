@@ -9,7 +9,7 @@ from datetime import date, timedelta
 import pytest
 
 from dumpbot.bot import views
-from dumpbot.bot.routers.commands import BOT_COMMANDS, today_view
+from dumpbot.bot.routers.commands import BOT_COMMANDS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, DigestData
 
@@ -235,20 +235,20 @@ def period_rows(make_row):
 def test_morning_digest_has_a_section_per_running_span(make_row, now, check_view):
     agenda = Agenda(day=TODAY, open=[], overdue=[], done=[], period_items=period_rows(make_row))
     text, kb = check_view(views.morning_digest(DigestData(kind="morning", agenda=agenda), PREFS, now))
-    assert kb is None
+    assert [b.text for row in kb.inline_keyboard for b in row] == ["✅ 1", "✅ 2", "✅ 3"]
     assert text.split("\n") == [
         "☀️ <b>Доброе утро!</b> План на сегодня, вт 6 окт",
         "",
         "На сегодня ничего не запланировано.",
         "",
         "🗓 <b>На этой неделе</b> (до вс 11 окт)",
-        "• 📌 Посмотреть расбери пай",
+        "1. 📌 Посмотреть расбери пай",
         "",
         "🗓 <b>В этом месяце</b> (до сб 31 окт)",
-        "• 🛒 Шины &lt;зимние&gt;",
+        "2. 🛒 Шины &lt;зимние&gt;",
         "",
         "🗓 <b>Этой осенью</b> (до пн 30 ноя)",
-        "• 📌 Убрать дачу",
+        "3. 📌 Убрать дачу",
     ]
 
 
@@ -277,9 +277,9 @@ def test_rows_show_spans_and_someday_as_words(make_row, at, now, check_view):
 
 def test_today_view_shows_the_running_spans(make_row, now, check_view):
     agenda = Agenda(day=TODAY, open=[], overdue=[], done=[], period_items=period_rows(make_row)[:1])
-    text, _ = check_view(today_view(agenda, PREFS, now))
+    text, _ = check_view(views.today_list(agenda, PREFS, now))
     assert "На сегодня ничего не запланировано." in text
-    assert "🗓 <b>На этой неделе</b> (до вс 11 окт)\n• 📌 Посмотреть расбери пай" in text
+    assert "🗓 <b>На этой неделе</b> (до вс 11 окт)\n1. 📌 Посмотреть расбери пай" in text
 
 
 def test_help_and_command_menu_mention_someday(check_view):

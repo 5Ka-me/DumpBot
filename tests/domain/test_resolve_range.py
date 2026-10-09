@@ -10,7 +10,7 @@ import pytest
 
 from dumpbot.ai.schemas import RANGE_RE
 from dumpbot.domain.prefs import Prefs
-from dumpbot.domain.timeresolve import localize, resolve_range
+from dumpbot.domain.timeresolve import localize, resolve_range, tonight
 
 TZ = ZoneInfo("Europe/Warsaw")
 NOW = datetime(2026, 10, 6, 14, 5, tzinfo=TZ)  # Tuesday
@@ -117,6 +117,24 @@ def test_tomorrow_before_night_cutoff_is_the_day_that_has_just_started(
     assert resolve_range("tomorrow", datetime(2026, 10, 7, 4, 0, tzinfo=TZ), prefs) == span(
         (2026, 10, 8), (2026, 10, 9)
     )
+
+
+@pytest.mark.parametrize(
+    ("now", "expected"),
+    [
+        (datetime(2026, 10, 6, 10, 0, tzinfo=TZ), datetime(2026, 10, 6, 19, 0, tzinfo=TZ)),
+        (
+            datetime(2026, 10, 7, 1, 30, tzinfo=TZ),
+            datetime(2026, 10, 7, 19, 0, tzinfo=TZ),
+        ),  # the local date, not night_cutoff's
+        (datetime(2026, 10, 6, 21, 0, tzinfo=TZ), datetime(2026, 10, 6, 19, 0, tzinfo=TZ)),  # already past
+        (datetime(2026, 10, 25, 10, 0, tzinfo=TZ), datetime(2026, 10, 25, 19, 0, tzinfo=TZ)),  # DST ends that night
+    ],
+)
+def test_tonight_is_the_evening_slot_of_the_local_day(now: datetime, expected: datetime, prefs: Prefs):
+    # [🌙 Вечером] of a reminder (iteration 3, §4)
+    assert tonight(now, prefs) == expected.astimezone(UTC)
+    assert tonight(now, Prefs(slot_evening=time(20, 30))) == expected.replace(hour=20, minute=30).astimezone(UTC)
 
 
 def test_other_timezone(prefs: Prefs):

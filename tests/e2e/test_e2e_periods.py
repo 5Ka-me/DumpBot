@@ -25,7 +25,7 @@ LIVE = {
         }
     ],
 }
-SECTION = "🗓 <b>На этой неделе</b> (до вс 11 окт)\n• 📌 Посмотреть Raspberry Pi"
+SECTION = "🗓 <b>На этой неделе</b> (до вс 11 окт)\n1. 📌 Посмотреть Raspberry Pi"
 
 
 def local(y: int, mo: int, d: int, h: int, mi: int = 0) -> datetime:
@@ -115,7 +115,7 @@ async def test_this_week_card_digest_section_and_friday_reminder(e2e: Any) -> No
     # Monday: the week is over -> overdue, no section
     text = await morning(e2e, 12)
     assert text is not None
-    assert "⚠️ <b>Просрочено</b>\n• на неделе с 5 окт · 📌 Посмотреть Raspberry Pi" in text
+    assert "⚠️ <b>Просрочено</b>\n1. на неделе с 5 окт · 📌 Посмотреть Raspberry Pi" in text
     assert "На этой неделе" not in text
 
 

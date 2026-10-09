@@ -9,7 +9,7 @@ from typing import Final, Literal
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import DIGEST_DAY_FMT, DigestCb, ItemCb, OccCb, SubCb
+from dumpbot.bot.cbdata import DIGEST_DAY_FMT, SNOOZE_EVENING, DigestCb, ItemCb, ListCb, OccCb, SubCb
 
 # Button colours (Bot API 9.4); clients that do not support them show a normal button.
 Style = Literal["success", "danger", "primary"]
@@ -18,6 +18,7 @@ BUTTON_TEXT_MAX: Final = 64  # longer labels get cut by clients anyway
 
 BACK = "← Назад"
 STEP_BUTTONS_PER_ROW: Final = 4
+LIST_BUTTONS_PER_ROW: Final = 5
 
 
 def clip_label(text: str, limit: int = BUTTON_TEXT_MAX) -> str:
@@ -80,16 +81,18 @@ def item_card_keyboard(
     return markup(*chunked(toggles, STEP_BUTTONS_PER_ROW), first, second, extra, last)
 
 
-def reminder_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
-    """[✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]."""
-    return markup(
-        [button("✅ Готово", OccCb(a="done", id=occurrence_id), style="success")],
-        [
-            button("⏰ 15 мин", OccCb(a="s15", id=occurrence_id)),
-            button("⏰ 1 час", OccCb(a="s60", id=occurrence_id)),
-            button("📅 Завтра", OccCb(a="tmr", id=occurrence_id)),
-        ],
-    )
+def reminder_keyboard(occurrence_id: int, *, evening: bool = False) -> InlineKeyboardMarkup:
+    """[✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]; with ``evening`` (the evening slot is still more than an hour
+    away) [✅ Готово] / [⏰ 1 час] [🌙 Вечером] [📅 Завтра]."""
+    snooze = [
+        button("⏰ 1 час", OccCb(a="s60", id=occurrence_id)),
+        button("📅 Завтра", OccCb(a="tmr", id=occurrence_id)),
+    ]
+    if evening:
+        snooze.insert(1, button("🌙 Вечером", OccCb(a=SNOOZE_EVENING, id=occurrence_id)))
+    else:
+        snooze.insert(0, button("⏰ 15 мин", OccCb(a="s15", id=occurrence_id)))
+    return markup([button("✅ Готово", OccCb(a="done", id=occurrence_id), style="success")], snooze)
 
 
 def undone_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
@@ -100,7 +103,23 @@ def back_to_card_row(item_id: int) -> list[InlineKeyboardButton]:
     return [button(BACK, ItemCb(a="back", id=item_id))]
 
 
-def digest_move_keyboard(day: date) -> InlineKeyboardMarkup:
+def digest_move_row(day: date) -> list[InlineKeyboardButton]:
     """[📅 Перенести невыполненное на завтра] for the evening digest of local ``day``."""
     cb = DigestCb(a="tmr", d=day.strftime(DIGEST_DAY_FMT))
-    return markup([button("📅 Перенести невыполненное на завтра", cb, style="primary")])
+    return [button("📅 Перенести невыполненное на завтра", cb, style="primary")]
+
+
+def list_buttons(
+    kind: str, day: date | None, lines: Iterable[tuple[str, int, int | None, int, bool]]
+) -> list[list[InlineKeyboardButton]]:
+    """[✅ 1] [✅ 2] … [↩️ 5] under a list, ``LIST_BUTTONS_PER_ROW`` a row, by number. ``lines``: (section, number,
+    occurrence id, item id, done) of its numbered lines; a done one offers the undo (ListCb)."""
+    d = day.strftime(DIGEST_DAY_FMT) if day is not None else ""
+    buttons = [
+        button(
+            f"{'↩️' if done else '✅'} {n}",
+            ListCb(a="undo" if done else "done", k=kind, d=d, s=section, n=n, o=occ_id or 0, i=item_id),
+        )
+        for section, n, occ_id, item_id, done in sorted(lines, key=lambda line: line[1])
+    ]
+    return chunked(buttons, LIST_BUTTONS_PER_ROW)
