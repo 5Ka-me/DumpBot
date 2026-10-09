@@ -6,15 +6,17 @@ User-editable preferences (timezone, slot times, quiet hours, budget...) live in
 
 from __future__ import annotations
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from dumpbot.db.engine import normalize_url
 
 # Render's free web service spins down after 15 minutes without inbound HTTP requests: a keep-alive ping must come
-# more often than that.
+# more often than that. ``bot.app.default_keepalive`` keeps the interval within these limits (with a warning);
+# Settings accepts any value, so a bad interval never stops a bot that does not even use keep-alive.
 KEEPALIVE_MIN_S = 60.0
 KEEPALIVE_MAX_S = 840.0
+KEEPALIVE_DEFAULT_S = 600.0
 
 
 class Settings(BaseSettings):
@@ -83,9 +85,14 @@ class Settings(BaseSettings):
     # https://<service>.onrender.com/healthz: the request comes back through the host's edge as inbound traffic, so a
     # free web service that sleeps without inbound requests stays awake (long polling is outbound only).
     keepalive_url: str = ""
-    keepalive_interval_s: float = Field(600.0, ge=KEEPALIVE_MIN_S, le=KEEPALIVE_MAX_S)
+    keepalive_interval_s: float = KEEPALIVE_DEFAULT_S  # empty = the default; limits: KEEPALIVE_MIN_S..KEEPALIVE_MAX_S
 
     @field_validator("database_url")
     @classmethod
     def _asyncpg_driver(cls, value: str) -> str:
         return normalize_url(value)
+
+    @field_validator("keepalive_interval_s", mode="before")
+    @classmethod
+    def _blank_interval_is_default(cls, value: object) -> object:
+        return KEEPALIVE_DEFAULT_S if isinstance(value, str) and not value.strip() else value

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from dumpbot.config import KEEPALIVE_MAX_S, KEEPALIVE_MIN_S, Settings
+from dumpbot.config import KEEPALIVE_DEFAULT_S, KEEPALIVE_MAX_S, KEEPALIVE_MIN_S, Settings
 
 RENDER_IDLE_S = 15 * 60  # Render's free web service spins down after 15 minutes without inbound requests
 SUPABASE = "postgres.abcdefghijkl:p%40ss%25word@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?ssl=require"
@@ -56,11 +56,26 @@ def test_free_hosting_switches_from_the_environment(monkeypatch: pytest.MonkeyPa
     assert settings.keepalive_interval_s == 300
 
 
-def test_keepalive_interval_always_beats_the_idle_limit() -> None:
-    assert KEEPALIVE_MAX_S < RENDER_IDLE_S
-    assert make(keepalive_interval_s=KEEPALIVE_MIN_S).keepalive_interval_s == 60
-    assert make(keepalive_interval_s=KEEPALIVE_MAX_S).keepalive_interval_s == 840
-    for bad in (0, 59.9, 840.1, RENDER_IDLE_S):
-        with pytest.raises(ValidationError) as caught:
-            make(keepalive_interval_s=bad)
-        assert [err["loc"] for err in caught.value.errors()] == [("keepalive_interval_s",)]
+def test_keepalive_limits_beat_the_idle_limit() -> None:
+    assert KEEPALIVE_MIN_S <= KEEPALIVE_DEFAULT_S <= KEEPALIVE_MAX_S < RENDER_IDLE_S
+
+
+@pytest.mark.parametrize("value", [0, 59.9, 840.1, RENDER_IDLE_S, 1800])
+def test_an_interval_out_of_limits_never_stops_the_bot(value: float) -> None:
+    """Settings takes any interval: ``bot.app.default_keepalive`` keeps it within limits, and only when keep-alive is
+    on. A bad KEEPALIVE_INTERVAL_S must not stop a bot (exit code 2) that may not even use keep-alive."""
+    assert make(keepalive_interval_s=value).keepalive_interval_s == value
+    assert make(keepalive_interval_s=value, keepalive_url="https://dump-bot.onrender.com/healthz").keepalive_url
+
+
+@pytest.mark.parametrize(("raw", "expected"), [("900", 900), ("1800", 1800), ("0", 0), ("", 600), ("  ", 600)])
+def test_interval_from_the_environment(monkeypatch: pytest.MonkeyPatch, raw: str, expected: float) -> None:
+    monkeypatch.setenv("KEEPALIVE_INTERVAL_S", raw)
+    assert make().keepalive_interval_s == expected
+
+
+def test_a_malformed_interval_is_still_a_config_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEEPALIVE_INTERVAL_S", "10m")
+    with pytest.raises(ValidationError) as caught:
+        make()
+    assert [err["loc"] for err in caught.value.errors()] == [("keepalive_interval_s",)]

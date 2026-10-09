@@ -6,11 +6,14 @@ import importlib
 import io
 import logging
 import os
+import socket
 import subprocess
 import sys
 from typing import Any
 
+import asyncpg.exceptions as asyncpg_errors
 import pytest
+from alembic.util import CommandError
 
 from dumpbot import logging_setup
 
@@ -134,14 +137,31 @@ def test_migrate_uses_alembic_ini_and_restores_our_logging(monkeypatch: pytest.M
     assert logging.getLogger().level == logging.DEBUG
 
 
-def test_failed_migrations_exit_with_code_3(monkeypatch: pytest.MonkeyPatch, caplog) -> None:
+STORED = "Купить лекарство от USER-PRIVATE-TEXT"  # a stored value that a migration's data step binds
+
+
+def _statement_error() -> Exception:
+    """What SQLAlchemy raises for a failed statement: the SQL, the bound parameters and the driver's message, which
+    quotes the bad argument."""
+    from sqlalchemy.exc import DBAPIError
+
+    driver = Exception(f"invalid input for query argument $2: '{STORED}'")
+    return DBAPIError("UPDATE items SET title = $1 WHERE id = $2", (STORED, STORED), driver)
+
+
+def _chained(top: Exception) -> Exception:
+    top.__cause__ = _statement_error()
+    return top
+
+
+def _fail_migrations(monkeypatch: pytest.MonkeyPatch, caplog, error: Exception) -> logging.LogRecord:
     import alembic.command
     from alembic.config import Config
 
     import dumpbot.__main__ as entry
 
     def upgrade(config: Any, revision: str) -> None:
-        raise RuntimeError("relation already exists")
+        raise error
 
     events: list[str] = []
     monkeypatch.setattr(alembic.command, "upgrade", upgrade)
@@ -153,8 +173,51 @@ def test_failed_migrations_exit_with_code_3(monkeypatch: pytest.MonkeyPatch, cap
     assert exited.value.code == entry.EXIT_MIGRATION_ERROR == 3
     assert events == ["setup INFO"]  # our logging is back before the failure is logged
     [critical] = [r for r in caplog.records if r.levelno == logging.CRITICAL]
+    return critical
+
+
+@pytest.mark.parametrize(
+    ("error", "shown"),
+    [
+        (TypeError("connect() got an unexpected keyword argument 'sslmode'"), "'sslmode'"),
+        (socket.gaierror(11001, "getaddrinfo failed"), "getaddrinfo failed"),
+        (ConnectionRefusedError(1225, "The remote computer refused the network connection"), "refused"),
+        (TimeoutError(), "TimeoutError"),
+        (asyncpg_errors.InvalidPasswordError('password authentication failed for user "postgres.ref"'), "password"),
+        (asyncpg_errors.InvalidCatalogNameError('database "dump" does not exist'), "does not exist"),
+        (asyncpg_errors.InternalServerError("Tenant or user not found"), "Tenant or user not found"),
+        (CommandError("Can't locate revision identified by 'abc'"), "Can't locate revision"),
+    ],
+)
+def test_a_setup_error_is_logged_in_full(monkeypatch: pytest.MonkeyPatch, caplog, error, shown) -> None:
+    """Errors raised before any statement ran: their messages hold no stored data and tell a bad URL, password or
+    host apart."""
+    critical = _fail_migrations(monkeypatch, caplog, error)
     assert critical.getMessage() == "database migrations failed; exiting"
-    assert critical.exc_info is not None and critical.exc_info[0] is RuntimeError  # with the traceback
+    assert critical.exc_info is not None and critical.exc_info[1] is error  # with the message and the traceback
+    assert shown in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("make_error", "described"),
+    [
+        (_statement_error, "DBAPIError (Exception)"),
+        (lambda: RuntimeError(STORED), "RuntimeError"),  # anything not known to be content-free
+        (lambda: KeyError(STORED), "KeyError"),
+        (lambda: _chained(RuntimeError(STORED)), "RuntimeError"),
+        (lambda: _chained(TypeError(STORED)), "TypeError"),  # a setup error type, but a statement failed first
+        (lambda: _chained(OSError(STORED)), "OSError"),
+    ],
+)
+def test_other_errors_never_print_their_text(monkeypatch: pytest.MonkeyPatch, caplog, make_error, described) -> None:
+    """A failed statement's text carries the SQL, the bound parameters and the driver's message, which may quote a
+    stored value: only the type, the driver error and the code locations reach the host's logs."""
+    critical = _fail_migrations(monkeypatch, caplog, make_error())
+    assert critical.exc_info is None
+    message = critical.getMessage()
+    assert message.startswith(f"database migrations failed: {described} at test_main.py:")
+    assert "; exiting\n" in message and 'File "' in message  # the code locations are kept
+    assert STORED not in caplog.text and "USER-PRIVATE" not in caplog.text
 
 
 async def test_run_polls_with_resolved_updates_and_always_cleans_up(monkeypatch: pytest.MonkeyPatch, tg) -> None:

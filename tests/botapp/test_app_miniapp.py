@@ -223,6 +223,66 @@ async def test_default_keepalive(settings_factory, caplog) -> None:
         assert "KEEPALIVE_URL must be an http(s):// address; keep-alive is off" in caplog.text
 
 
+def _app_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == app_module.log.name and r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize(
+    ("value", "used"),
+    [(60, 60), (300, 300), (840, 840), (0, 60), (59.9, 60), (900, 840), (1800, 840), (float("nan"), 600)],
+)
+async def test_default_keepalive_keeps_the_interval_within_limits(settings_factory, caplog, value, used) -> None:
+    async with aiohttp.ClientSession() as http:
+        with caplog.at_level(logging.WARNING):
+            off = default_keepalive(settings_factory(keepalive_interval_s=value), http)
+            assert off is None and _app_warnings(caplog) == []  # keep-alive off: the interval does not matter
+            settings = settings_factory(
+                keepalive_url="https://dump-bot.onrender.com/healthz", keepalive_interval_s=value
+            )
+            keepalive = default_keepalive(settings, http)
+    assert keepalive is not None and keepalive.interval_s == used
+    if value == used:
+        assert _app_warnings(caplog) == []
+    else:
+        assert _app_warnings(caplog) == [
+            "KEEPALIVE_INTERVAL_S must be from 60 to 840 s (free hosts sleep after 15 minutes without requests); "
+            f"using {used} s"
+        ]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:8080/healthz",
+        "http://127.0.0.1:8080/healthz",
+        "http://0.0.0.0:8080/healthz",
+        "http://[::1]:8080/healthz",
+        "http://10.0.0.5:8080/healthz",
+        "http://bot:8080/healthz",
+    ],
+)
+async def test_default_keepalive_warns_about_an_address_inside_the_container(settings_factory, caplog, url) -> None:
+    """Such a ping is answered by the bot itself and never passes the host's edge: Render still puts the service to
+    sleep. Warned once at startup; pinged anyway (other setups may want it)."""
+    async with aiohttp.ClientSession() as http:
+        with caplog.at_level(logging.WARNING):
+            keepalive = default_keepalive(settings_factory(keepalive_url=url), http)
+    assert keepalive is not None and keepalive.url == url
+    [warning] = _app_warnings(caplog)
+    assert warning == (
+        f"KEEPALIVE_URL points inside the container or a private network ({keepalive.host}): free hosts only count "
+        "requests through their public address, e.g. https://<service>.onrender.com/healthz"
+    )
+
+
+async def test_default_keepalive_is_quiet_about_a_public_address(settings_factory, caplog) -> None:
+    async with aiohttp.ClientSession() as http:
+        with caplog.at_level(logging.WARNING):
+            settings = settings_factory(keepalive_url="https://dump-bot.onrender.com/healthz")
+            assert default_keepalive(settings, http) is not None
+    assert _app_warnings(caplog) == []
+
+
 async def test_build_app_gives_keepalive_the_shared_session(settings_factory, tg) -> None:
     settings = settings_factory(
         database_url="postgresql+asyncpg://nobody:x@127.0.0.1:1/none",

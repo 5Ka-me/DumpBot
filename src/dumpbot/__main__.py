@@ -59,20 +59,53 @@ def migrate(log_level: str | int | None, config: Config | None = None) -> None:
     """``alembic upgrade head`` in-process (``MIGRATE_ON_START``, for hosts without a separate migrate step). The URL
     comes from ``DATABASE_URL`` as for the ``alembic`` CLI (migrations/env.py). ``config`` defaults to ``alembic.ini``
     in the working directory; its logging section replaces ours, so ours is set up again afterwards. A failure is
-    logged with its traceback and exits with ``EXIT_MIGRATION_ERROR``: the host shows the error and restarts the
-    service instead of running a bot without its tables."""
+    logged (``log_migration_failure``) and exits with ``EXIT_MIGRATION_ERROR``: the host shows the error and restarts
+    the service instead of running a bot without its tables."""
     from alembic import command
     from alembic.config import Config
 
     log.info("applying database migrations (alembic upgrade head)")
     try:
         command.upgrade(config if config is not None else Config(ALEMBIC_INI), "head")
-    except Exception:
+    except Exception as e:
         logging_setup.setup(log_level)
-        log.critical("database migrations failed; exiting", exc_info=True)
+        log_migration_failure(e)
         raise SystemExit(EXIT_MIGRATION_ERROR) from None
     logging_setup.setup(log_level)
     log.info("database migrations are up to date")
+
+
+def log_migration_failure(e: Exception) -> None:
+    """A setup error (``is_setup_error``) is logged with its message and traceback: that message is what tells a bad
+    URL, password or host apart. Anything else gets only the error type, the driver error and the code locations
+    (``describe_error``, ``safe_traceback``), as everywhere else in the bot: a failed statement's text carries the SQL
+    with its bound parameters, and the driver's message may quote a stored value (a data step binds item titles)."""
+    if is_setup_error(e):
+        log.critical("database migrations failed; exiting", exc_info=e)
+        return
+    from dumpbot.workers.jobs import describe_error, safe_traceback
+
+    log.critical("database migrations failed: %s; exiting\n%s", describe_error(e), safe_traceback(e))
+
+
+def is_setup_error(e: BaseException) -> bool:
+    """True for errors raised before any statement ran, whose messages hold no stored data: Alembic's own (a missing
+    revision), ``TypeError`` (an option the driver does not know, e.g. ``?sslmode=``), network errors (unknown host,
+    refused connection, timeout) and the driver's connection errors (wrong password, missing database, the pooler's
+    "Tenant or user not found"), which SQLAlchemy passes on unwrapped. Never when a SQLAlchemy statement error is
+    anywhere in the chain."""
+    from alembic.util import CommandError
+    from asyncpg.exceptions import InterfaceError, PostgresError
+    from sqlalchemy.exc import StatementError
+
+    seen: list[BaseException] = []
+    link: BaseException | None = e
+    while link is not None and all(link is not s for s in seen):
+        if isinstance(link, StatementError):
+            return False
+        seen.append(link)
+        link = link.__cause__ or link.__context__
+    return isinstance(e, CommandError | TypeError | OSError | PostgresError | InterfaceError)
 
 
 def main() -> None:

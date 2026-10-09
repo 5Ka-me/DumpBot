@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -49,10 +50,10 @@ from dumpbot.bot.middlewares import InFlight, OwnerOnly
 from dumpbot.bot.routers import make_routers
 from dumpbot.bot.routers.commands import bot_commands
 from dumpbot.bot.routers.common import FAILED
-from dumpbot.config import Settings
+from dumpbot.config import KEEPALIVE_DEFAULT_S, KEEPALIVE_MAX_S, KEEPALIVE_MIN_S, Settings
 from dumpbot.context import AppContext
 from dumpbot.db.engine import make_engine, make_sessionmaker
-from dumpbot.keepalive import KeepAlive, url_host
+from dumpbot.keepalive import KeepAlive, is_internal_host, url_host
 from dumpbot.workers.jobs import describe_error, safe_traceback
 
 if TYPE_CHECKING:
@@ -103,14 +104,38 @@ def default_web(ctx: AppContext) -> WebServer | None:
 
 def default_keepalive(settings: Settings, http: aiohttp.ClientSession) -> KeepAlive | None:
     """The keep-alive ping of ``KEEPALIVE_URL`` on the shared HTTP session, or None when it is empty (or not an
-    http(s):// address: then a warning, and the bot runs without it)."""
+    http(s):// address: then a warning, and the bot runs without it). An address inside the container or a private
+    network gets a warning but is pinged anyway; the interval is kept within limits (``keepalive_interval``)."""
     url = settings.keepalive_url.strip()
     if not url:
         return None
-    if url_host(url) is None:
+    host = url_host(url)
+    if host is None:
         log.warning("KEEPALIVE_URL must be an http(s):// address; keep-alive is off")
         return None
-    return KeepAlive(url, http, interval_s=settings.keepalive_interval_s)
+    if is_internal_host(host):
+        log.warning(
+            "KEEPALIVE_URL points inside the container or a private network (%s): free hosts only count requests "
+            "through their public address, e.g. https://<service>.onrender.com/healthz",
+            host,
+        )
+    return KeepAlive(url, http, interval_s=keepalive_interval(settings.keepalive_interval_s))
+
+
+def keepalive_interval(value: float) -> float:
+    """``KEEPALIVE_INTERVAL_S`` moved into ``KEEPALIVE_MIN_S``..``KEEPALIVE_MAX_S`` (NaN: the default), with a
+    warning when it was outside: Render's free service sleeps after 15 minutes without inbound requests."""
+    if KEEPALIVE_MIN_S <= value <= KEEPALIVE_MAX_S:
+        return value
+    fixed = KEEPALIVE_DEFAULT_S if math.isnan(value) else min(max(value, KEEPALIVE_MIN_S), KEEPALIVE_MAX_S)
+    log.warning(
+        "KEEPALIVE_INTERVAL_S must be from %.0f to %.0f s (free hosts sleep after 15 minutes without requests); "
+        "using %.0f s",
+        KEEPALIVE_MIN_S,
+        KEEPALIVE_MAX_S,
+        fixed,
+    )
+    return fixed
 
 
 def menu_url(settings: Settings) -> str | None:

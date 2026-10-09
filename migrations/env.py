@@ -112,7 +112,8 @@ async def run_async_migrations() -> None:
     # The URL is passed in the dict (not via set_main_option) so "%" in passwords needs no escaping.
     section = config.get_section(config.config_ini_section, {})
     section["sqlalchemy.url"] = database_url()
-    engine = async_engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool)
+    # Data steps bind stored values (item titles): a failed statement's error text must not quote them.
+    engine = async_engine_from_config(section, prefix="sqlalchemy.", poolclass=pool.NullPool, hide_parameters=True)
     try:
         async with engine.connect() as connection:
             await connection.run_sync(do_run_migrations)

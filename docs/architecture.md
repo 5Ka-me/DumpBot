@@ -1129,10 +1129,14 @@ Scheduler (`add_done_callback` → при исключении лог + `os._exi
 (`stop_grace_period: 30s` в compose.yaml покрывает это до SIGKILL).
 
 Бесплатный хостинг (README, «Бесплатный хостинг: Render + Supabase»): `MIGRATE_ON_START` — `main()` до старта
-выполняет `alembic upgrade head` в процессе (`alembic.ini` в рабочей папке; ошибка → лог с traceback и выход с кодом
-3; после миграций логирование настраивается заново: `fileConfig` из alembic.ini его заменяет). `KEEPALIVE_URL` —
-`KeepAlive` (`dumpbot/keepalive.py`) на общей aiohttp-сессии раз в `KEEPALIVE_INTERVAL_S` (60–840 с) делает GET
-своего публичного `/healthz`: Render усыпляет бесплатный сервис после 15 минут без входящих запросов, а long polling
+выполняет `alembic upgrade head` в процессе (`alembic.ini` в рабочей папке; ошибка → выход с кодом 3, текст и
+traceback в логе только у ошибок настройки — `is_setup_error`: Alembic, неизвестный параметр URL, сеть, подключение к
+базе; у остальных `describe_error` + `safe_traceback`: в тексте ошибки запроса SQL с параметрами и сохранённые
+значения, а движок миграций создаётся с `hide_parameters=True`; после миграций логирование настраивается заново:
+`fileConfig` из alembic.ini его заменяет). `KEEPALIVE_URL` — `KeepAlive` (`dumpbot/keepalive.py`) на общей
+aiohttp-сессии раз в `KEEPALIVE_INTERVAL_S` (60–840 с; значение вне границ `default_keepalive` заменяет ближайшим с
+предупреждением, а не останавливает бота) делает GET своего публичного `/healthz` (адрес внутри контейнера или частной
+сети — `localhost`, `0.0.0.0`, частный IP, имя без точек — даёт предупреждение при старте): Render усыпляет бесплатный сервис после 15 минут без входящих запросов, а long polling
 — исходящий. `Lifecycle` запускает его рядом с веб-сервером и останавливает перед ним; в watchdog он не входит, ошибки —
 WARNING не чаще раза в час, только тип ошибки или HTTP-статус. `DATABASE_URL` вида `postgres://` / `postgresql://`
 получает драйвер asyncpg (`db.engine.normalize_url`, в `Settings` и в migrations/env.py); ошибки БД в логах —

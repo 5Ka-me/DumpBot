@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ipaddress
 import logging
 import time
 from collections.abc import Callable
@@ -25,7 +26,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-__all__ = ["REQUEST_TIMEOUT_S", "WARN_EVERY_S", "KeepAlive", "url_host"]
+__all__ = ["REQUEST_TIMEOUT_S", "WARN_EVERY_S", "KeepAlive", "is_internal_host", "url_host"]
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,19 @@ def url_host(url: str) -> str | None:
         if parts.scheme.lower() in ("http", "https") and parts.hostname:
             return parts.hostname
     return None
+
+
+def is_internal_host(host: str) -> bool:
+    """True for a host that a request reaches without passing the hosting's public edge, so the ping would not count
+    as inbound traffic: ``localhost`` (and ``*.localhost``), a name without dots (a container or a private-network
+    service, e.g. ``bot``) and an IP address that is not global (loopback, private, link-local, ``0.0.0.0``, CGNAT)."""
+    name = host.strip().rstrip(".").lower()
+    if name == "localhost" or name.endswith(".localhost"):
+        return True
+    try:
+        return not ipaddress.ip_address(name).is_global
+    except ValueError:
+        return "." not in name
 
 
 class KeepAlive:

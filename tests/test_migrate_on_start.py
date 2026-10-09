@@ -4,7 +4,8 @@
 The database URL is given as hosts hand it out: ``postgres://`` / ``postgresql://`` without a driver, with a password
 that needs %-encoding. migrations/env.py must give it the asyncpg driver and keep the password intact. In a
 subprocess laid out like the image (alembic.ini and migrations/ in the working directory) the run ends with our own
-log format again (alembic.ini's logging config is replaced back); a failure exits with code 3 and a traceback.
+log format again (alembic.ini's logging config is replaced back); a failure exits with code 3, with a traceback for a
+setup error and without the stored values a failed data step had bound.
 """
 
 from __future__ import annotations
@@ -152,6 +153,52 @@ def test_migrate_in_the_image_layout_restores_our_logging(scratch: Scratch, tmp_
     assert PASSWORD not in proc.stderr and quote(PASSWORD, safe="") not in proc.stderr
     versions = asyncio.run(_scalars(scratch.asyncpg_url(), "SELECT version_num FROM alembic_version"))
     assert versions == [_head()]
+
+
+LEAKY_REVISION = '''"""a data step that fails on stored values (test only)
+
+Like migration 0005's ITEM_TITLE step, but the second argument does not fit its column.
+"""
+
+import sqlalchemy as sa
+from alembic import op
+
+revision = "9999"
+down_revision = "{head}"
+branch_labels = None
+depends_on = None
+
+TITLE = {title!r}
+ITEM = {item!r}
+
+
+def upgrade() -> None:
+    op.get_bind().execute(sa.text("UPDATE items SET title = :title WHERE id = :item"), {{"title": TITLE, "item": ITEM}})
+
+
+def downgrade() -> None:
+    pass
+'''
+STORED_TITLE = "Купить лекарство от USER-PRIVATE-TEXT"
+STORED_ITEM = "USER-PRIVATE-ID-x1"  # asyncpg's own message quotes the argument that does not fit
+
+
+def test_a_failed_statement_does_not_print_stored_values(scratch: Scratch, tmp_path) -> None:
+    """A data step that fails on stored values (pooler drop, timeout, constraint or type error) must not put them
+    into the host's logs: neither SQLAlchemy's ``[parameters: ...]`` nor the driver's message, which quotes the bad
+    argument. The error type and the failing step are still named."""
+    app = _image_layout(tmp_path)
+    revision = LEAKY_REVISION.format(head=_head(), title=STORED_TITLE, item=STORED_ITEM)
+    (app / "migrations" / "versions" / "99990000_leak.py").write_text(revision, encoding="utf-8")
+
+    proc = _run_migrate(app, scratch.url("postgresql"))
+
+    assert proc.returncode == 3, proc.stderr
+    assert f"Running upgrade {_head()} -> 9999" in proc.stderr  # the step really ran
+    assert STORED_TITLE not in proc.stderr and "USER-PRIVATE" not in proc.stderr
+    [message] = [message for level, message in OUR_LINE.findall(proc.stderr) if level == "CRITICAL"]
+    assert message.startswith("database migrations failed: ") and message.endswith("; exiting")
+    assert "Error" in message and "99990000_leak.py" in proc.stderr
 
 
 def test_failed_migrations_exit_with_code_3(scratch: Scratch, tmp_path) -> None:

@@ -15,7 +15,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from dumpbot.keepalive import KeepAlive, url_host
+from dumpbot.keepalive import KeepAlive, is_internal_host, url_host
 
 SECRET = "s3cr3t-ping-key"
 LOGGER = "dumpbot.keepalive"
@@ -95,6 +95,39 @@ def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
 )
 def test_url_host(url: str, host: str | None) -> None:
     assert url_host(url) == host
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "localhost",
+        "LOCALHOST",
+        "localhost.",
+        "dump.localhost",
+        "127.0.0.1",
+        "127.1.2.3",
+        "0.0.0.0",
+        "::1",
+        "::",
+        "10.0.0.5",
+        "172.17.0.2",
+        "192.168.1.20",
+        "169.254.1.1",
+        "100.101.102.103",  # CGNAT (Tailscale)
+        "fd00::1",
+        "fe80::1",
+        "bot",  # a container or private-network service name
+        "dump-bot",
+    ],
+)
+def test_internal_hosts(host: str) -> None:
+    """A ping to these never passes the hosting's public edge, so it does not keep a free service awake."""
+    assert is_internal_host(host)
+
+
+@pytest.mark.parametrize("host", ["dump-bot.onrender.com", "DUMP-BOT.onrender.com", "8.8.8.8", "2606:4700::1111"])
+def test_public_hosts(host: str) -> None:
+    assert not is_internal_host(host)
 
 
 async def test_a_ping_that_answers(target: Target, http, caplog) -> None:
