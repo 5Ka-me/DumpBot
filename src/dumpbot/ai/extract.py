@@ -8,6 +8,14 @@ too -> ``AIUnavailable``. A 404 from the fallback never turns a paid primary ans
 ``AIUnavailable`` is raised if there was one, ``AIModelNotFound`` only when both models are missing, else
 ``AIBadResponse``. Images route to vision-capable models (``llm_model`` / ``vision_fallback_model``).
 
+Fast switch to the fallback (docs/features/iteration-3.md §1), for ``extract``, ``split_steps`` and ``answer_query``:
+- a primary model on pause (``ChutesClient.cooldown_left``: a 408 / 429 / 5xx / timeout within ``llm_cooldown_s``) is
+  skipped while the fallback is not paused too: the fallback answers alone, as if the primary had just been
+  unavailable (nothing usable from the fallback -> ``AIUnavailable`` with ``retry_after`` = the rest of the pause);
+- no valid result from the primary within ``llm_hedge_after_s`` -> the fallback (unless paused) is asked in parallel;
+  the first valid result wins, the other call is cancelled (``HEDGE_LOST``, recorded in ``ai_usage``). Without a
+  valid result from either, the errors resolve exactly as in the sequential ladder.
+
 ``split_steps`` (docs/features/iteration-2.md §C2) breaks one task into checklist steps by the same ladder.
 
 After validation the code drops an AM/PM question about a time the message already pins ("в 17" is never 05:00):
@@ -16,18 +24,29 @@ After validation the code drops an AM/PM question about a time the message alrea
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import functools
 import logging
 import re
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, NoReturn
 
 from pydantic import BaseModel, ValidationError
 
 from dumpbot.ai import prompts
-from dumpbot.ai.client import AIBadResponse, AIModelNotFound, AIUnavailable, ChutesClient, parse_json_object
+from dumpbot.ai.client import (
+    HEDGE_LOST,
+    AIBadResponse,
+    AIConfigError,
+    AIError,
+    AIModelNotFound,
+    AIUnavailable,
+    ChutesClient,
+    parse_json_object,
+)
 from dumpbot.ai.schemas import (
     MAX_STEPS,
     EditPatch,
@@ -173,41 +192,153 @@ async def _ladder[M: BaseModel](
 
     ``AIUnavailable`` or ``AIModelNotFound`` (404) of the primary skips to the fallback. A 404 of the fallback never
     turns a paid primary answer into a config error: the primary's ``AIUnavailable`` is raised if there was one,
-    ``AIModelNotFound`` only when both models are missing, else ``AIBadResponse``.
+    ``AIModelNotFound`` only when both models are missing, else ``AIBadResponse``. A paused primary is skipped, a slow
+    one gets the fallback in parallel (``_with_fallback``).
+    """
+
+    def run(model: str, primary: bool) -> Coroutine[Any, Any, M | None]:
+        return _attempt(
+            client,
+            settings,
+            model,
+            messages,
+            purpose,
+            retries=1 if primary else 0,
+            out_cls=out_cls,
+            schema=schema,
+            schema_name=schema_name,
+        )
+
+    return await _with_fallback(client, settings, run, fallback=fallback, what=schema_name)
+
+
+@dataclass
+class _Outcome[T]:
+    """How one model's attempt ended: a valid result, an ``AIError``, or neither (unusable output, or cancelled)."""
+
+    value: T | None = None
+    error: AIError | None = None
+
+
+async def _outcome[T](attempt: Coroutine[Any, Any, T | None]) -> _Outcome[T]:
+    try:
+        return _Outcome(value=await attempt)
+    except AIError as e:
+        return _Outcome(error=e)
+
+
+async def _with_fallback[T](
+    client: ChutesClient,
+    settings: Settings,
+    run: Callable[[str, bool], Coroutine[Any, Any, T | None]],
+    *,
+    fallback: str | None,
+    what: str,
+) -> tuple[T, str, str | None]:
+    """``run(model, is_primary)`` with ``settings.llm_model``, then with ``fallback``; returns (result, model, missing
+    primary model or None). ``run`` gives a valid result or None (unusable output) and raises ``AIError``.
+
+    A paused primary (``client.cooldown_left``) is skipped while the fallback is not paused. Without a result from
+    the primary after ``llm_hedge_after_s`` the fallback runs in parallel (unless paused): the first valid result
+    wins and the other call is cancelled; errors are resolved by ``_pick`` as if the calls had run one after another.
+    A bad key / no balance from the primary before the hedge is raised without asking the fallback.
     """
     primary = settings.llm_model
-    call = functools.partial(_attempt, client, settings, out_cls=out_cls, schema=schema, schema_name=schema_name)
-    unavailable: AIUnavailable | None = None
-    missing: AIModelNotFound | None = None
-    try:
-        out = await call(primary, messages, purpose, retries=1)
-        if out is not None:
-            return out, primary, None
-    except AIUnavailable as e:
-        unavailable = e
-        log.warning("primary model %s unavailable (%s), trying %s", primary, e, fallback)
-    except AIModelNotFound as e:
-        missing = e
-        log.error("primary model %s not found (%s), trying %s", primary, e, fallback)
+    if not fallback or fallback == primary:
+        return _pick(await _outcome(run(primary, True)), None, primary, "", what)
+    paused = client.cooldown_left(primary)
+    if paused and not client.cooldown_left(fallback):
+        log.info("primary model %s is paused for %d s more, asking %s", primary, paused, fallback)
+        skipped: _Outcome[T] = _Outcome(error=AIUnavailable(f"{primary} is paused after errors", retry_after=paused))
+        return _pick(skipped, await _outcome(run(fallback, False)), primary, fallback, what)
 
-    if fallback and fallback != primary:
-        try:
-            out = await call(fallback, messages, purpose, retries=0)
-        except AIModelNotFound as e:
-            log.error("fallback model %s not found (%s)", fallback, e)
-            if unavailable is not None:
-                raise unavailable from e  # the primary may come back: let the queue retry
-            if missing is not None:
-                raise missing from e  # both models are missing: the owner has to fix the model IDs
-            # The primary answered (and was paid for) with unusable output: a retry would pay for the same again.
-            raise AIBadResponse(f"no valid {schema_name} from the primary model, the fallback model is missing") from e
-        if out is not None:
-            return out, fallback, primary if missing is not None else None
-    elif missing is not None:
-        raise missing  # no fallback model configured: the owner has to fix the model ID
-    if unavailable is not None:
-        raise unavailable  # the primary may come back: let the queue retry
-    raise AIBadResponse(f"no valid {schema_name} from the primary and fallback models")
+    hedge_after = 0.0 if client.cooldown_left(fallback) else settings.llm_hedge_after_s
+    first_task = asyncio.create_task(_outcome(run(primary, True)))
+    second_task: asyncio.Task[_Outcome[T]] | None = None
+    try:
+        if hedge_after > 0:
+            await asyncio.wait({first_task}, timeout=hedge_after)
+        if hedge_after > 0 and not first_task.done():
+            log.warning("no valid answer from %s in %g s, asking %s in parallel", primary, hedge_after, fallback)
+            second_task = asyncio.create_task(_outcome(run(fallback, False)))
+            first, second = await _race(first_task, second_task)
+        else:
+            first = await first_task
+            if first.value is not None or _owner_error(first.error):
+                return _pick(first, None, primary, fallback, what)
+            if isinstance(first.error, AIModelNotFound):
+                log.error("primary model %s not found (%s), trying %s", primary, first.error, fallback)
+            elif first.error is not None:
+                log.warning("primary model %s unavailable (%s), trying %s", primary, first.error, fallback)
+            second = await _outcome(run(fallback, False))
+    finally:
+        await _stop(first_task, second_task)  # only does something when cancelled or on a bug
+    return _pick(first, second, primary, fallback, what)
+
+
+async def _race[T](
+    first: asyncio.Task[_Outcome[T]], second: asyncio.Task[_Outcome[T]]
+) -> tuple[_Outcome[T], _Outcome[T]]:
+    """The outcomes of both attempts. As soon as one has a valid result the other is cancelled (``HEDGE_LOST``; its
+    call is recorded as cancelled before this returns) and counts as unusable."""
+    outcomes: dict[asyncio.Task[_Outcome[T]], _Outcome[T]] = {}
+    pending = {first, second}
+    while pending and not any(o.value is not None for o in outcomes.values()):
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in (first, second):
+            if task in done:
+                outcomes[task] = task.result()
+    if pending:
+        await _stop(*pending, reason=HEDGE_LOST)
+    return outcomes.get(first, _Outcome()), outcomes.get(second, _Outcome())
+
+
+async def _stop(*tasks: asyncio.Task[Any] | None, reason: str | None = None) -> None:
+    """Cancel the unfinished tasks and wait for all of them: nothing keeps running (or holds an HTTP response) after
+    the caller returns, and no exception goes unretrieved."""
+    started = [t for t in tasks if t is not None]
+    for task in started:
+        if not task.done():
+            task.cancel(reason)
+    await asyncio.gather(*started, return_exceptions=True)
+
+
+def _owner_error(error: AIError | None) -> bool:
+    """A bad key / no balance (401 / 402 / 403): no other model helps, the owner has to act."""
+    return isinstance(error, AIConfigError) and not isinstance(error, AIModelNotFound)
+
+
+def _pick[T](
+    first: _Outcome[T], second: _Outcome[T] | None, primary: str, fallback: str, what: str
+) -> tuple[T, str, str | None]:
+    """(result, model, missing primary or None) of the valid outcome, the primary's first; else raise the error of
+    the sequential ladder. ``second`` is None when the fallback was not asked."""
+    if first.value is not None:
+        return first.value, primary, None
+    if second is not None and second.value is not None:
+        return second.value, fallback, primary if isinstance(first.error, AIModelNotFound) else None
+    _fail(first.error, second, fallback, what)
+
+
+def _fail(error: AIError | None, second: _Outcome[Any] | None, fallback: str, what: str) -> NoReturn:
+    """Neither model gave a valid result: the primary's ``error`` (None = unusable output) and the fallback's outcome
+    decide what is raised."""
+    if error is not None and (second is None or _owner_error(error)):
+        raise error
+    if second is None:
+        raise AIBadResponse(f"no valid {what} from the primary model")
+    if isinstance(second.error, AIModelNotFound):
+        log.error("fallback model %s not found (%s)", fallback, second.error)
+        if error is not None:
+            # unavailable: the primary may come back, let the queue retry; missing: the owner has to fix both IDs
+            raise error from second.error
+        # The primary answered (and was paid for) with unusable output: a retry would pay for the same again.
+        raise AIBadResponse(f"no valid {what} from the primary model, the fallback model is missing") from second.error
+    if second.error is not None:
+        raise second.error
+    if isinstance(error, AIUnavailable):
+        raise error  # the primary may come back: let the queue retry
+    raise AIBadResponse(f"no valid {what} from the primary and fallback models")
 
 
 async def _attempt[M: BaseModel](
@@ -506,7 +637,8 @@ async def answer_query(
     """Short Russian plain-text answer (no HTML) based only on ``rows``.
 
     The primary model, then (unavailable, unusable answer or 404) the fallback; when the fallback is missing too,
-    the primary's error is raised.
+    the primary's error is raised. A paused primary is skipped, a slow one gets the fallback in parallel, as in
+    ``extract``.
     """
     if not rows:
         return "Ничего не нашёл 🤷"
@@ -515,17 +647,15 @@ async def answer_query(
         {"role": "user", "content": prompts.build_answer_text(question, rows[:MAX_ANSWER_ROWS], now, prefs)},
     ]
     max_tokens = min(settings.llm_max_tokens, MAX_ANSWER_TOKENS)
-    try:
-        answer = await _answer(client, settings.llm_model, messages, max_tokens)
-    except (AIUnavailable, AIBadResponse, AIModelNotFound) as e:
-        if not settings.llm_fallback_model or settings.llm_fallback_model == settings.llm_model:
-            raise
-        log.warning("answer with %s failed (%s), trying %s", settings.llm_model, e, settings.llm_fallback_model)
+
+    async def run(model: str, _primary: bool) -> str | None:
         try:
-            answer = await _answer(client, settings.llm_fallback_model, messages, max_tokens)
-        except AIModelNotFound as missing:
-            log.error("fallback model %s not found (%s)", settings.llm_fallback_model, missing)
-            raise e from missing
+            return await _answer(client, model, messages, max_tokens)
+        except AIBadResponse as e:
+            log.warning("answer with %s failed: %s", model, e)
+            return None
+
+    answer, _, _ = await _with_fallback(client, settings, run, fallback=settings.llm_fallback_model, what="answer")
     return answer
 
 

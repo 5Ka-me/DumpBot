@@ -337,6 +337,12 @@ class ChutesClient:
         Список публичный и запрашивается без ключа (с неверным ключом он отвечает 401). Цена кэшированного входа —
         pricing.input_cache_read (нет в списке → как обычный вход); cached_tokens — из
         usage.prompt_tokens_details.cached_tokens (входят в prompt_tokens)."""
+    def cooldown_left(self, model: str) -> float
+        """Итерация 3 (§1): сколько секунд ещё длится пауза модели (0.0 — паузы нет). Пауза — llm_cooldown_s (600)
+        после 408 / 429 / 5xx / таймаута ответа (не после ошибки соединения); в памяти процесса, по модели; любой 200
+        её снимает. Вызов, отменённый вызывающим (Task.cancel(HEDGE_LOST) — проигравший параллельный запрос, или
+        остановка бота), пишется в ai_usage с ok=false, error="cancelled: hedge lost" / "cancelled"; токены и цена —
+        только если ответ уже пришёл, иначе 0."""
 ```
 
 ### 4.6 ai/stt.py  [ai]
@@ -409,12 +415,18 @@ async def extract(client: ChutesClient, settings: Settings, inp: ExtractInput) -
     AIUnavailable или AIModelNotFound (404) основной → сразу пробуем запасную; если и она недоступна → AIUnavailable.
     404 запасной: основная была недоступна → её AIUnavailable; обе 404 (или запасной нет) → AIModelNotFound
     (AIConfigError); основная ответила негодным (это уже оплачено) → AIBadResponse, а не вечный часовой повтор.
+    Итерация 3 (§1): основная на паузе (client.cooldown_left), а запасная нет → сразу запасная, как будто основная
+    только что была недоступна (ничего годного → AIUnavailable с retry_after = остаток паузы). Нет годного ответа
+    основной за llm_hedge_after_s (12 с) → параллельно запасная (если она не на паузе): первый валидный результат
+    выигрывает, второй вызов отменяется (Task.cancel(HEDGE_LOST)) и дожидается записи в ai_usage; без валидного
+    результата ошибки разрешаются как в последовательной лестнице. llm_hedge_after_s=0 / llm_cooldown_s=0 — выключено.
     force_query → intent принудительно query; reply_item → intent принудительно edit (edit.target=None)."""
 
 async def answer_query(client: ChutesClient, settings: Settings, question: str, rows: list[dict],
                        now: datetime, prefs: Prefs) -> str
     """Краткий ответ по-русски простым текстом (без HTML), опираясь только на rows. Основная модель → при
-    AIUnavailable / AIBadResponse / AIModelNotFound запасная; если запасной нет (404) → ошибка основной."""
+    AIUnavailable / AIBadResponse / AIModelNotFound запасная; если запасной нет (404) → ошибка основной.
+    Пауза и параллельный запрос — как у extract (итерация 3, §1)."""
 
 @dataclass
 class SplitInput: task: dict; now: datetime; prefs: Prefs; note: str | None = None   # итерация 2, C2

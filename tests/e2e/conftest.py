@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import html
 import itertools
 import json
@@ -485,7 +486,8 @@ Script = dict[str, Any] | Callable[[ChatRequest], dict[str, Any]]
 class FakeChutes:
     """chat/completions answers with the extraction scripted for the prompt's MSG text (``script``), the steps
     scripted for a split prompt's TASK title (``script_split``), or a prose ``answer`` for answer_query prompts.
-    ``outage`` (an HTTP status) makes every chat/STT call fail, ``stt_outage`` only the STT chute.
+    ``outage`` (an HTTP status) makes every chat/STT call fail, ``stt_outage`` only the STT chute; ``down`` (models)
+    makes their chat calls answer 503, ``slow`` (model -> seconds) delays their chat answers (until teardown at most).
     ``/local/transcribe`` is the local Whisper service (no key, ``local_transcripts``)."""
 
     scripts: dict[str, Script] = field(default_factory=dict)
@@ -496,6 +498,9 @@ class FakeChutes:
     answer: str = "Сегодня ничего важного."
     outage: int | None = None
     stt_outage: int | None = None
+    down: set[str] = field(default_factory=set)
+    slow: dict[str, float] = field(default_factory=dict)
+    released: asyncio.Event = field(default_factory=asyncio.Event)  # set on teardown: slow answers end at once
     local_transcripts: dict[bytes, str] = field(default_factory=dict)
     local_requests: list[dict[str, Any]] = field(default_factory=list)
     chat_requests: list[ChatRequest] = field(default_factory=list)
@@ -538,9 +543,13 @@ class FakeChutes:
             return web.Response(status=401, text="Invalid token")
         req = ChatRequest(await request.json())
         self.chat_requests.append(req)
-        if self.outage is not None:
+        if self.outage is not None or req.model in self.down:
             self.failed_calls += 1
-            return web.Response(status=self.outage, text='{"detail":"No instances available (yet) for chute"}')
+            text = '{"detail":"No instances available (yet) for chute"}'
+            return web.Response(status=self.outage or 503, text=text)
+        if req.model in self.slow:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.released.wait(), self.slow[req.model])
         if req.is_answer:
             content = self.answer
         elif req.is_split:
@@ -751,7 +760,14 @@ def frozen(monkeypatch: pytest.MonkeyPatch) -> FrozenClock:
 
 
 def make_settings(
-    db_url: str, tg_url: str, ai_url: str, heartbeat: Path, *, local_whisper: bool = False, webapp: Path | None = None
+    db_url: str,
+    tg_url: str,
+    ai_url: str,
+    heartbeat: Path,
+    *,
+    local_whisper: bool = False,
+    webapp: Path | None = None,
+    llm: dict[str, Any] | None = None,
 ) -> Settings:
     miniapp: dict[str, Any] = {}
     if webapp is not None:
@@ -778,6 +794,7 @@ def make_settings(
         heartbeat_file=str(heartbeat),
         scheduler_interval_s=30.0,
         **miniapp,
+        **(llm or {}),
     )
 
 
@@ -788,6 +805,12 @@ def local_whisper() -> bool:
 
 
 @pytest.fixture
+def llm_settings() -> dict[str, Any]:
+    """Extra LLM settings (e.g. a short hedge delay); a test module overrides this fixture to set them."""
+    return {}
+
+
+@pytest.fixture
 def miniapp() -> bool:
     """Whether the Mini App's web server runs; a test module overrides this fixture to turn it on."""
     return False
@@ -795,7 +818,13 @@ def miniapp() -> bool:
 
 @pytest.fixture
 async def e2e(
-    engine: AsyncEngine, db_url: str, frozen: FrozenClock, tmp_path: Path, local_whisper: bool, miniapp: bool
+    engine: AsyncEngine,
+    db_url: str,
+    frozen: FrozenClock,
+    tmp_path: Path,
+    local_whisper: bool,
+    miniapp: bool,
+    llm_settings: dict[str, Any],
 ) -> AsyncIterator[E2E]:
     """Fake servers up, the app polling them; on teardown polling stops and the app shuts down cleanly.
 
@@ -814,7 +843,9 @@ async def e2e(
         webapp = tmp_path / "webapp"
         webapp.mkdir()
         (webapp / "index.html").write_text("<!doctype html><title>Свалка</title>", encoding="utf-8")
-    settings = make_settings(db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper, webapp=webapp)
+    settings = make_settings(
+        db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper, webapp=webapp, llm=llm_settings
+    )
     exits: list[int] = []
     bot_session = AiohttpSession(api=TelegramAPIServer.from_base(tg_url))
     app = await build_app(settings, bot_session=bot_session, runners=worker_only, exit_func=exits.append)
@@ -828,6 +859,7 @@ async def e2e(
             await wait_until(lambda: app.lifecycle.web is not None, "the Mini App's web server")
         yield env
     finally:
+        ai.released.set()
         try:
             await app.dp.stop_polling()
         except RuntimeError:  # polling already stopped (a failed startup)

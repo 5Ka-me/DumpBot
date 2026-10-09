@@ -146,13 +146,20 @@ async def test_split_steps_happy_path(fake, settings, sessionmaker):
         assert (await s.scalars(select(AiUsage.purpose))).all() == ["split"]
 
 
-async def test_split_steps_falls_back_and_repairs(fake, client, settings):
+async def test_split_steps_falls_back(fake, client, settings):
     fake.chat_error(503, "No instances available (yet) for chute")
     fake.chat_json(STEPS)
     out = await split_steps(client, settings, SplitInput(task=TASK, now=NOW, prefs=WARSAW))
     assert out.model == QWEN and fake.chat_models == [GEMMA, QWEN]
 
+    # the primary is paused after its 503: the next split goes straight to the fallback
     fake.chat_requests.clear()
+    fake.chat_json(STEPS)
+    out = await split_steps(client, settings, SplitInput(task=TASK, now=NOW, prefs=WARSAW))
+    assert out.model == QWEN and fake.chat_models == [QWEN]
+
+
+async def test_split_steps_repairs_invalid_output(fake, client, settings):
     fake.chat_json({"steps": [{"title": ""}]})  # invalid: one repair round with the error
     fake.chat_json({"steps": []})
     out = await split_steps(client, settings, SplitInput(task=TASK, now=NOW, prefs=WARSAW))

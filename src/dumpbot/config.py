@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     llm_fallback_model: str = "Qwen/Qwen3-32B-TEE"  # text only
     vision_fallback_model: str = "Qwen/Qwen3.6-27B-TEE"  # text + image
     llm_timeout_s: float = 60.0
+    # docs/features/iteration-3.md §1. After a 429 / timeout / 5xx a model is skipped this long while its fallback
+    # works (in process memory); 0 = never skipped.
+    llm_cooldown_s: float = 600.0
+    # No valid answer from the primary model this long -> the fallback model is asked in parallel and the first valid
+    # answer wins; 0 = no parallel request (the fallback only after the primary fails).
+    llm_hedge_after_s: float = 12.0
     llm_max_tokens: int = 1500
     # Used when the live price list (GET /models) is unavailable, USD per 1M tokens.
     llm_fallback_price_in: float = 1.0

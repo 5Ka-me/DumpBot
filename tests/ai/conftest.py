@@ -4,11 +4,15 @@ the AudioDojo STT chute (/stt/whisper), the local Whisper service (/local/transc
 
 Test files cannot import each other (``--import-mode=importlib``), so helpers live on the ``FakeChutes`` object
 and in fixtures.
+
+Chat replies are taken in order from the queue of the requested model (``model=`` when scripting), else from the
+common queue. A ``delay`` ends early when the fixture shuts the server down, so a "hanging" model costs no test time.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
@@ -65,7 +69,9 @@ class FakeChutes:
 
     def __init__(self) -> None:
         self.base = ""
+        self.closing = asyncio.Event()  # set on teardown: pending delays end at once
         self.chat_queue: list[Reply] = []
+        self.model_queues: dict[str, list[Reply]] = {}  # replies for one model only (hedge / pause tests)
         self.chat_requests: list[dict] = []
         self.chat_auth: list[str | None] = []
         self.models_reply = Reply(body=MODELS_PAYLOAD)
@@ -93,6 +99,7 @@ class FakeChutes:
         reasoning: str | None = None,
         finish_reason: str = "stop",
         delay: float = 0.0,
+        model: str | None = None,
     ) -> None:
         message: dict[str, Any] = {"role": "assistant", "content": content}
         if reasoning is not None:
@@ -111,21 +118,32 @@ class FakeChutes:
             }
             if cached_tokens is not None:
                 body["usage"]["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
-        self.chat_queue.append(Reply(body=body, delay=delay))
+        self._chat_queue(model).append(Reply(body=body, delay=delay))
 
     def chat_json(self, obj: Any, **kwargs: Any) -> None:
         self.chat_ok(json.dumps(obj, ensure_ascii=False), **kwargs)
 
-    def chat_error(self, status: int, body: str = "error", headers: dict[str, str] | None = None) -> None:
-        self.chat_queue.append(Reply(status=status, body=body, headers=headers or {}))
+    def chat_error(
+        self,
+        status: int,
+        body: str = "error",
+        headers: dict[str, str] | None = None,
+        *,
+        delay: float = 0.0,
+        model: str | None = None,
+    ) -> None:
+        self._chat_queue(model).append(Reply(status=status, body=body, headers=headers or {}, delay=delay))
 
     def chat_raw(self, body: Any, status: int = 200) -> None:
         """Queue an arbitrary chat response body (e.g. a malformed 200)."""
         self.chat_queue.append(Reply(status=status, body=body))
 
-    def set_models(self, body: Any = None, status: int = 200) -> None:
+    def _chat_queue(self, model: str | None) -> list[Reply]:
+        return self.chat_queue if model is None else self.model_queues.setdefault(model, [])
+
+    def set_models(self, body: Any = None, status: int = 200, *, delay: float = 0.0) -> None:
         """Replace the GET /v1/models response (default: the price snapshot)."""
-        self.models_reply = Reply(status=status, body=MODELS_PAYLOAD if body is None else body)
+        self.models_reply = Reply(status=status, body=MODELS_PAYLOAD if body is None else body, delay=delay)
 
     def stt_ok(self, text: str, *, delay: float = 0.0) -> None:
         self.stt_queue.append(Reply(body={"text": text}, delay=delay))
@@ -176,27 +194,29 @@ class FakeChutes:
         return app
 
     async def _chat(self, request: web.Request) -> web.StreamResponse:
-        self.chat_requests.append(await request.json())
+        body = await request.json()
+        self.chat_requests.append(body)
         self.chat_auth.append(request.headers.get("Authorization"))
-        reply = self.chat_queue.pop(0) if self.chat_queue else Reply(status=418, body="no scripted reply")
-        return await _respond(reply)
+        queue = self.model_queues.get(body.get("model")) or self.chat_queue
+        reply = queue.pop(0) if queue else Reply(status=418, body="no scripted reply")
+        return await self._respond(reply)
 
     async def _models(self, request: web.Request) -> web.StreamResponse:
         self.models_hits += 1
         self.models_auth.append(request.headers.get("Authorization"))
-        return await _respond(self.models_reply)
+        return await self._respond(self.models_reply)
 
     async def _stt(self, request: web.Request) -> web.StreamResponse:
         self.stt_requests.append(await request.json())
         self.stt_auth.append(request.headers.get("Authorization"))
         reply = self.stt_queue.pop(0) if self.stt_queue else Reply(status=418, body="no scripted reply")
-        return await _respond(reply)
+        return await self._respond(reply)
 
     async def _local(self, request: web.Request) -> web.StreamResponse:
         self.local_requests.append(await request.json())
         self.local_auth.append(request.headers.get("Authorization"))
         reply = self.local_queue.pop(0) if self.local_queue else Reply(status=418, body="no scripted reply")
-        return await _respond(reply)
+        return await self._respond(reply)
 
     async def _page(self, request: web.Request) -> web.StreamResponse:
         name = request.match_info["name"]
@@ -204,12 +224,16 @@ class FakeChutes:
         reply = self.pages.get(name)
         if reply is None:
             return web.Response(status=404, text="<title>Not found</title>", content_type="text/html")
-        return await _respond(reply)
+        return await self._respond(reply)
+
+    async def _respond(self, reply: Reply) -> web.StreamResponse:
+        if reply.delay:
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self.closing.wait(), reply.delay)
+        return _response(reply)
 
 
-async def _respond(reply: Reply) -> web.StreamResponse:
-    if reply.delay:
-        await asyncio.sleep(reply.delay)
+def _response(reply: Reply) -> web.StreamResponse:
     if isinstance(reply.body, dict | list):
         return web.json_response(reply.body, status=reply.status, headers=reply.headers)
     body = reply.body if isinstance(reply.body, bytes) else (reply.body or "").encode(reply.charset or "utf-8")
@@ -229,6 +253,7 @@ async def fake() -> AsyncIterator[FakeChutes]:
     try:
         yield fc
     finally:
+        fc.closing.set()
         await server.close()
 
 
