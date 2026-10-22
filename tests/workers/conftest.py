@@ -303,8 +303,9 @@ def ctx(
 
 
 @pytest.fixture
-def set_prefs(sessionmaker: async_sessionmaker[AsyncSession]) -> Callable[..., Awaitable[Prefs]]:
-    """``await set_prefs(budget_usd=1.0, ...)`` -> stored owner prefs (defaults + overrides)."""
+def set_prefs(sessionmaker: async_sessionmaker[AsyncSession], ctx: AppContext) -> Callable[..., Awaitable[Prefs]]:
+    """``await set_prefs(budget_usd=1.0, ...)`` -> stored owner prefs (defaults + overrides); ``ctx`` forgets the
+    prefs it loaded last, as the settings screens make it do."""
 
     async def _set(**changes: Any) -> Prefs:
         async with sessionmaker() as session:
@@ -312,6 +313,7 @@ def set_prefs(sessionmaker: async_sessionmaker[AsyncSession]) -> Callable[..., A
             prefs = Prefs.model_validate(prefs.model_dump())
             await save_prefs(session, OWNER, prefs)
             await session.commit()
+        ctx.forget_prefs()
         return prefs
 
     return _set

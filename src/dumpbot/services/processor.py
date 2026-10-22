@@ -39,6 +39,9 @@ shows at once.
 
 Data changes are committed before their cards are sent (a lost card never duplicates items); replies that change
 nothing (answers, candidate lists) are sent before the raw message is marked done, so a Telegram error retries them.
+A message saved as items, or a reply applied to its card, is marked done after its card (docs/features/iteration-4.md
+§7: one database wait less before it); a run of the job after a crash in between finds the items (the once-key of the
+edit) and only marks it done.
 Everything sent in quiet hours is silent (a deferred message can be processed at night); the final reaction goes on
 every part of an album.
 
@@ -57,9 +60,10 @@ stale-items check counts it as an action and its moves (docs/features/iteration-
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, time, timedelta
 from typing import Any, Final
@@ -68,8 +72,9 @@ import aiohttp
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup
 from pydantic import ValidationError
-from sqlalchemy import select, update
+from sqlalchemy import Select, case, exists, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from dumpbot import clock
 from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
@@ -79,12 +84,13 @@ from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QueryS
 from dumpbot.ai.stt import GarbageTranscript
 from dumpbot.bot import cards, sender, views
 from dumpbot.context import AppContext
+from dumpbot.db import meter
 from dumpbot.db.models import Item, Job, OnceKey, RawMessage
 from dumpbot.domain import phrases, quiet, recurrence, timeresolve
 from dumpbot.domain.fmt import fmt_date
 from dumpbot.domain.kinds import ACTIONABLE, SourceKind
 from dumpbot.domain.prefs import Prefs
-from dumpbot.dto import BudgetState, CreatedItem, PatchResult, Row
+from dumpbot.dto import BudgetState, CardExtras, CreatedItem, PatchResult, Row
 from dumpbot.services import events as journal
 from dumpbot.services import items as items_svc
 from dumpbot.services import query, undo, usage
@@ -173,6 +179,8 @@ class _Content:
     link_titles: dict[str, str] = field(default_factory=dict)
     force_query: bool = False
     unheard: bool = False  # a voice note's transcript was not speech (twice): nothing is saved, "Не разобрал"
+    # Transcripts / link titles being stored meanwhile (``_gather`` with ``meanwhile``): awaited by ``_stored``.
+    writes: list[asyncio.Task[None]] = field(default_factory=list)
 
     @property
     def empty(self) -> bool:
@@ -183,11 +191,21 @@ class _Content:
 
 
 async def handle_message(ctx: AppContext, payload: dict[str, Any]) -> None:
-    """Job "message" ``{raw_id}``: process one saved message."""
-    raws = await _load_raws(ctx, [int(payload["raw_id"])])
+    """Job "message" ``{raw_id}``: process one saved message (the one the capture router has just handed over, or
+    loaded)."""
+    raw_id = int(payload["raw_id"])
+    fresh = ctx.take_fresh(raw_id)
+    if fresh is not None:  # saved a moment ago: new, nothing saved from it yet
+        raws, saved, prefs = [fresh], False, await _prefs(ctx)
+    else:
+        stmt = select(RawMessage).where(RawMessage.id == raw_id)
+        (raws, saved), prefs = await _together(_load_message(ctx, stmt), _prefs(ctx))
     if not raws or raws[0].status in _FINISHED:
         return
-    await _process(ctx, raws)
+    if saved:
+        await _done(ctx, raws, None)
+        return
+    await _process(ctx, raws, prefs=prefs)
 
 
 async def handle_album(ctx: AppContext, payload: dict[str, Any]) -> None:
@@ -198,10 +216,11 @@ async def handle_album(ctx: AppContext, payload: dict[str, Any]) -> None:
     )
     if payload.get("chat_id") is not None:
         stmt = stmt.where(RawMessage.chat_id == int(payload["chat_id"]))
-    async with ctx.sessionmaker() as session:
-        raws = list((await session.scalars(stmt.order_by(RawMessage.message_id))).all())
-    if raws:
-        await _process(ctx, raws)
+    (raws, saved), prefs = await _together(_load_message(ctx, stmt.order_by(RawMessage.message_id)), _prefs(ctx))
+    if saved:
+        await _done(ctx, raws, None)
+    elif raws:
+        await _process(ctx, raws, prefs=prefs)
 
 
 async def handle_clarify(ctx: AppContext, payload: dict[str, Any]) -> None:
@@ -211,7 +230,7 @@ async def handle_clarify(ctx: AppContext, payload: dict[str, Any]) -> None:
     Applied at most once per raw message: a once-key is committed together with the new items, so a re-run of
     the job (a restart after that commit) neither pays the AI again nor replaces the items a second time.
     """
-    async with ctx.sessionmaker() as session:
+    async with ctx.autocommit() as session:
         raw = await session.get(RawMessage, int(payload["raw_id"]))
         if raw is None or await session.get(OnceKey, _clarified_key(raw.id)) is not None:
             return
@@ -239,18 +258,23 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     """
     raw_id, item_id = int(payload["raw_id"]), int(payload["item_id"])
     key = f"edit:{raw_id}:{item_id}"
-    async with ctx.sessionmaker() as session:
-        raw = await session.get(RawMessage, raw_id)
-        applied = await session.get(OnceKey, key) is not None
-    if raw is None or applied or raw.status == "ignored":
+    fresh = ctx.take_fresh(raw_id)
+    if fresh is not None:  # the reply the capture router saved a moment ago: nothing applied from it yet
+        raw, applied, prefs = fresh, False, await _prefs(ctx)
+    else:
+        (raw, applied), prefs = await _together(_load_edit(ctx, raw_id, key), _prefs(ctx))
+    if raw is None or raw.status == "ignored":
+        return
+    if applied:
+        if raw.status not in _FINISHED:  # the job stopped between the edit and marking the reply done (below)
+            await _done(ctx, [raw], None)
         return
     if raw.status == "done" and raw.reply_item_id == item_id:  # answered as a "?" query on an earlier run
         return
     picked = _picked_patch(raw, item_id)
     if picked is not None:
-        await _apply_picked(ctx, raw, item_id, picked, key)
+        await _apply_picked(ctx, raw, item_id, picked, key, prefs)
         return
-    prefs = await _prefs(ctx)
     now = _msg_now(raw)
     out: ExtractOutput | None = None
     try:
@@ -259,12 +283,12 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         if content.unheard:  # a voice reply that is not speech: no edit, "Не разобрал" with [🔁 Ещё раз]
             await _unheard(ctx, [raw], prefs, {"kind": "edit", "payload": {"raw_id": raw.id, "item_id": item_id}})
             return
-        async with ctx.sessionmaker() as session:
-            snapshot = await items_svc.item_snapshot(session, item_id, prefs, now)
         # «Закрывай вообще», «хватит повторять» and nothing more (iteration 4, §2): no AI needed to stop the series
         # (a one-off: done) — nor any budget.
-        if content.force_query or content.images or not phrases.only_stop_request(content.text):
-            await _check_budget(ctx, prefs, [raw])
+        with_ai = content.force_query or bool(content.images) or not phrases.only_stop_request(content.text)
+        budget = _check_budget(ctx, prefs, [raw]) if with_ai else _nothing()
+        snapshot, _ = await _together(_snapshot(ctx, item_id, prefs, now), budget)
+        if with_ai:
             out = await _extract(ctx, prefs, _extract_input(content, raw, prefs, reply_item=snapshot))
             if out.extraction.intent == "query" and out.extraction.query is not None:  # "?…" wins over the reply
                 await _reply_query(ctx, [raw], content, out.extraction.query, prefs, _image_text(out.extraction))
@@ -291,6 +315,8 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     if patch.action == "split":  # "разбей на шаги" in reply to the card
         await _split(ctx, prefs, item_id, now=now, note=content.text, raws=[raw], once_key=key, image_text=image_text)
         return
+    # The reply is marked done after its card (the once-key, committed with the edit, guards a re-run: see the top).
+    done_later = not _is_app([raw])
     async with ctx.sessionmaker() as session:
         if not await try_once(session, key):
             return  # applied concurrently
@@ -298,13 +324,16 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         if patch.rrule and (lost := lost_times_warning(content.text, result.item)) is not None:
             result.warnings.append(lost)
         view = await _patch_view(session, result, prefs, heard=_heard([raw]))
-        fresh = await _reload(session, [raw])
-        _finish(fresh, image_text)
-        _app_update(fresh, edited=[item_id])
+        if not done_later:
+            attached = _attach(session, [raw])
+            _finish(attached, image_text)
+            _app_update(attached, edited=[item_id])
         await session.commit()
         events = items_svc.take_parent_events(session)
     if not _is_app([raw]):
         await _send_patch_card(ctx, prefs, view, result, reply_to=raw.message_id, raw_message_id=raw.id)
+    if done_later:
+        await _done(ctx, [raw], image_text)
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, [raw], sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
@@ -332,10 +361,11 @@ def _picked_patch(raw: RawMessage, item_id: int) -> EditPatch | None:
         return None
 
 
-async def _apply_picked(ctx: AppContext, raw: RawMessage, item_id: int, patch: EditPatch, key: str) -> None:
+async def _apply_picked(
+    ctx: AppContext, raw: RawMessage, item_id: int, patch: EditPatch, key: str, prefs: Prefs
+) -> None:
     """The picked item gets the edit read from the message: no second AI call (no budget check either). Times in
     it are relative to the message, as when it was read."""
-    prefs = await _prefs(ctx)
     now = _msg_now(raw)
     if patch.action == "split":  # "разбей переезд на шаги": the split call itself still asks the AI
         note = _join(raw.text, raw.transcript, raw.image_text)
@@ -549,7 +579,8 @@ async def _split_call(
     reply_to = raws[0].message_id if raws else card_message
     try:
         await _check_budget(ctx, prefs, raws)
-        return await split_steps(ctx.ai, ctx.settings, inp)
+        with meter.ai():
+            return await split_steps(ctx.ai, ctx.settings, inp)
     except AIUnavailable:
         await _defer(ctx, raws)
         if not raws and card_message is not None:  # the button has no message to put ✍ on: say it once
@@ -653,9 +684,15 @@ async def on_dead(ctx: AppContext, job: Job) -> None:
 # --- pipeline ---------------------------------------------------------------------------------------------------
 
 
-async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: str | None = None) -> None:
+async def _process(
+    ctx: AppContext, raws: list[RawMessage], *, prefs: Prefs | None = None, clarification: str | None = None
+) -> None:
+    """The pipeline of the module docstring. The database waits on the way to the card are kept few
+    (docs/features/iteration-4.md §7): the prefs come with the raws (``prefs``), the budget check and the related
+    candidates are looked up at once, the save is one transaction, and what can wait (``bot_messages``, the AI calls'
+    ai_usage rows, the journal) is written after the card."""
     primary = raws[0]
-    prefs = await _prefs(ctx)
+    prefs = prefs or await _prefs(ctx)
     replace = clarification is not None
     if not replace and not any(_needs_ai(r) for r in raws):
         await _save_without_ai(ctx, raws, prefs)
@@ -663,15 +700,21 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
     content: _Content | None = None
     try:
         # A clarification reuses the stored OCR text instead of paying for the pictures again.
-        content = await _gather(ctx, raws, prefs, with_images=not (replace and primary.image_text))
-        if content.unheard:
-            await _unheard(ctx, raws, prefs, _job_of(raws))
-            return
-        if content.empty and not replace:
-            await _save_without_ai(ctx, raws, prefs)
-            return
-        await _check_budget(ctx, prefs, raws)
-        candidates = await _related_candidates(ctx, raws, content, prefs)
+        content = await _gather(ctx, raws, prefs, with_images=not (replace and primary.image_text), meanwhile=True)
+        try:
+            if content.unheard:
+                await _unheard(ctx, raws, prefs, _job_of(raws))
+                return
+            if content.empty and not replace:
+                await _save_without_ai(ctx, raws, prefs)
+                return
+            # One database wait for all three: the budget check, the related candidates, the new transcript stored
+            # (before extract() is paid for).
+            _, candidates, _ = await _all(
+                _check_budget(ctx, prefs, raws), _related_candidates(ctx, raws, content, prefs), _stored(content)
+            )
+        finally:
+            await asyncio.gather(*content.writes, return_exceptions=True)
         inp = _extract_input(content, primary, prefs, clarification=clarification, related=candidates)
         out = await _extract(ctx, prefs, inp)
         await _dispatch(ctx, raws, content, out, prefs, replace=replace, related=[c["id"] for c in candidates])
@@ -693,7 +736,8 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
 async def _extract(ctx: AppContext, prefs: Prefs, inp: ExtractInput) -> ExtractOutput:
     """``extract()``; when the fallback stood in for a missing (404) primary model, or the fallback itself is missing,
     tell the owner once a day (each)."""
-    out = await extract(ctx.ai, ctx.settings, inp)
+    with meter.ai():
+        out = await extract(ctx.ai, ctx.settings, inp)
     day = clock.utcnow().astimezone(prefs.zone).date().isoformat()
     if out.missing_model:
         text = (
@@ -751,7 +795,7 @@ async def _related_candidates(
     messages without text."""
     if content.force_query or not content.text.strip():
         return []
-    async with ctx.sessionmaker() as session:
+    async with ctx.autocommit() as session:
         rows = await query.related_candidates(
             session, content.text, _msg_now(raws[0]), exclude_raw_ids=[r.id for r in raws]
         )
@@ -785,8 +829,12 @@ async def _save(
     extraction = ext if ext.items else _fallback_note(content.text, image_text)
     ask = ext.ask if not replace and note is None else None  # no question loops after a clarification
     now_view = clock.utcnow()
+    # A chat message is marked done after its reply, one round trip less before the cards (docs/features/
+    # iteration-4.md §7); a re-run after a crash in between finds its items and only marks it (``_load_message``).
+    # A question (the answer reads its raw_json) and a message from the Mini App (no reply) are marked with the items.
+    done_later = ask is None and not _is_app(raws)
     async with ctx.sessionmaker() as session:
-        fresh = await _reload(session, raws)
+        fresh = _attach(session, raws)
         head = fresh[0]
         if replace and not await try_once(session, _clarified_key(head.id)):
             return  # this answer was applied by an earlier run of the job
@@ -808,11 +856,18 @@ async def _save(
             created = await items_svc.create_items(session, raw=head, **kwargs)
         quiet_chat = ask is not None or _is_app(fresh)  # the Mini App reads the items, no cards
         lost = _lost_times(content.text, created, prefs)
-        shown = [] if quiet_chat else await _cards(session, created, prefs, now_view, every=note is not None, lost=lost)
+        shown = (
+            []
+            if quiet_chat
+            else await _cards(
+                session, created, prefs, now_view, every=note is not None, lost=lost, heard=_heard(_by_message(raws))
+            )
+        )
         if ask is not None:
             head.raw_json = {**(head.raw_json or {}), ASK_KEY: ask.model_dump(mode="json")}
-        _finish(fresh, image_text)
-        _app_update(fresh, note=note)
+        if not done_later:
+            _finish(fresh, image_text)
+            _app_update(fresh, note=note)
         await session.commit()
 
     if ask is not None:
@@ -848,6 +903,8 @@ async def _save(
             occurrence_id=occ.id if occ is not None else None,
             raw_message_id=primary.id,
         )
+    if done_later:
+        await _done(ctx, raws, image_text)
     await _react(ctx, raws, sender.REACT_SAVED)
 
 
@@ -859,14 +916,21 @@ async def _cards(
     *,
     every: bool = False,
     lost: dict[int, str] | None = None,
+    heard: str | None = None,
 ) -> list[tuple[CreatedItem, View]]:
     """Cards for items with reminders, actionable kinds, a checklist or related items, or something to confirm
-    (``every``: all items); the rest only get 👌. ``lost``: one more warning by item id (``_lost_times``)."""
+    (``every``: all items); the rest only get 👌. ``lost``: one more warning by item id (``_lost_times``).
+
+    A new item's extras are known without asking the database unless it got steps or links just now: no checklist,
+    no related items, no parent, and ``heard`` (what was heard in the message's voice notes)."""
     out: list[tuple[CreatedItem, View]] = []
     for c in created:
         res = c.resolution
         warnings = [*res.warnings, *filter(None, [(lost or {}).get(c.item.id)])]
-        extras = await query.card_extras(session, c.item)
+        if c.steps or c.related:
+            extras = await query.card_extras(session, c.item)
+        else:
+            extras = CardExtras(heard=heard)
         shown = every or c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or warnings
         if shown or extras.steps or extras.related:
             view = views.item_card(c.item, c.occurrence, c.reminders, prefs, now, warnings=warnings, extras=extras)
@@ -967,6 +1031,7 @@ async def _reply_query(
         markup,
         reply_to=primary.message_id,
         silent=_quiet(prefs),
+        quiet_checked=True,
         purpose="answer",
         raw_message_id=primary.id,
     )
@@ -988,12 +1053,13 @@ async def run_question(ctx: AppContext, question: str, spec: QuerySpec, prefs: P
     """Rows of the QuerySpec and, when the model asked for a summary, a short prose answer. ``AIUnavailable`` /
     ``AIBadResponse`` of the answer only leave it out: the rows are found already, and the list beats a retry that
     would pay for the extraction again."""
-    async with ctx.sessionmaker() as session:
+    async with ctx.autocommit() as session:
         rows = await query.run_query(session, spec, prefs, now)
     text: str | None = None
     if spec.answer == "summary":
         try:
-            text = await answer_query(ctx.ai, ctx.settings, question, query.rows_for_llm(rows, prefs), now, prefs)
+            with meter.ai():
+                text = await answer_query(ctx.ai, ctx.settings, question, query.rows_for_llm(rows, prefs), now, prefs)
         except (AIUnavailable, AIBadResponse) as e:
             log.warning("no prose answer (%s), showing the list", describe_error(e))
     title = f"🔎 По запросу «{spec.text}»" if spec.text else "🔎 Вот что нашёл"
@@ -1183,6 +1249,7 @@ async def _send_candidates(
         markup,
         reply_to=primary.message_id,
         silent=_quiet(prefs),
+        quiet_checked=True,
         purpose=sender.PURPOSE_PICK,
         raw_message_id=primary.id,
     )
@@ -1291,8 +1358,28 @@ def _plain_content(raws: Sequence[RawMessage]) -> _Content:
 # --- content ----------------------------------------------------------------------------------------------------
 
 
-async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with_images: bool) -> _Content:
-    """Texts, transcripts and pictures of the raws (in message order), their URLs, forward origin, link titles."""
+async def _gather(
+    ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with_images: bool, meanwhile: bool = False
+) -> _Content:
+    """Texts, transcripts and pictures of the raws (in message order), their URLs, forward origin, link titles.
+
+    ``meanwhile``: new transcripts and link titles are stored while the job goes on (``_Content.writes``; the caller
+    awaits them with ``_stored`` before it pays for anything else), else before this returns."""
+    writes: list[asyncio.Task[None]] = []
+    try:
+        content = await _read(ctx, raws, prefs, with_images=with_images, writes=writes)
+    except BaseException:
+        await asyncio.gather(*writes, return_exceptions=True)  # a transcript paid for stays stored
+        raise
+    if not meanwhile:
+        await _stored(content)
+    return content
+
+
+async def _read(
+    ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with_images: bool, writes: list[asyncio.Task[None]]
+) -> _Content:
+    """``_gather`` without waiting for ``writes``."""
     primary = raws[0]
     texts: list[str] = []
     urls: list[str] = []
@@ -1305,7 +1392,7 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
         urls.extend(u for u in raw.urls or [] if u not in urls)
         origin = origin or raw.forward_origin
         if raw.content_type in VOICE_TYPES:
-            transcript = await _transcript(ctx, raw, prefs, raws)
+            transcript = await _transcript(ctx, raw, prefs, raws, writes)
             if _is_unheard(raw):
                 unheard = True
             elif transcript:
@@ -1327,13 +1414,22 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
         urls=urls,
         images=images,
         forward_origin=origin,
-        link_titles=await _link_titles(ctx, primary, urls),
+        link_titles=await _link_titles(ctx, primary, urls, writes),
         force_query=force_query,
         unheard=unheard,
+        writes=writes,
     )
 
 
-async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list[RawMessage]) -> str:
+async def _stored(content: _Content) -> None:
+    """Wait for the transcripts and link titles ``_gather`` stores meanwhile; the first failure is raised once all of
+    them ended."""
+    await _all(*content.writes)
+
+
+async def _transcript(
+    ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list[RawMessage], writes: list[asyncio.Task[None]]
+) -> str:
     """Stored transcript, or download + STT and commit it right away (a retry must not pay twice).
 
     STT goes to chutes and / or the local Whisper in the order of ``prefs.stt_mode``; the budget is checked only
@@ -1344,6 +1440,9 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
     A transcript that is not speech (docs/features/iteration-4.md §1: ``RoutedSTT`` with ``screen`` already tried a
     second path) is kept for analysis — in ``transcript``, the tries in ``raw_json[UNHEARD_KEY]`` — and "" is
     returned; ``_is_unheard`` tells the caller (a re-run of the job reads the same from the stored raw).
+
+    The paid call needs a budget check: the month's spend is read while the file downloads (``usage.prefetch_spend``),
+    and the transcript is stored by a task in ``writes`` (``_gather``).
     """
     if raw.transcript is not None:
         return raw.transcript
@@ -1353,6 +1452,7 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
     # Every part of an album of audio files is transcribed in this one job (up to stt_timeout_s + local_stt_timeout_s
     # each), while the worker beats only between jobs: each part is progress for the jobs watchdog.
     ctx.watchdog.beat(JOBS_WATCH)
+    usage.prefetch_spend(ctx.autocommit, prefs, clock.utcnow())
     audio = await _download(ctx, raw)
     if audio is None:
         return ""
@@ -1361,25 +1461,31 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
         await _check_budget(ctx, prefs, raws)
 
     try:
-        text = await ctx.stt.transcribe(
-            audio,
-            mime_type=raw.mime_type,
-            language=prefs.stt_language,
-            mode=prefs.stt_mode,
-            before_paid=before_paid,
-            screen=True,
-            duration=raw.duration,
-        )
+        with meter.ai():
+            text = await ctx.stt.transcribe(
+                audio,
+                mime_type=raw.mime_type,
+                language=prefs.stt_language,
+                mode=prefs.stt_mode,
+                before_paid=before_paid,
+                screen=True,
+                duration=raw.duration,
+            )
     except GarbageTranscript as garbage:
         await _keep_unheard(ctx, raw, garbage)
         return ""
     text = text.strip()
-    async with ctx.sessionmaker() as session:
-        await session.execute(update(RawMessage).where(RawMessage.id == raw.id).values(transcript=text))
-        await session.commit()
-    raw.transcript = text
+    writes.append(asyncio.ensure_future(_store(ctx, raw, "transcript", text)))
     log.info("message %s transcribed (%d chars)", raw.message_id, len(text))
     return text
+
+
+async def _store(ctx: AppContext, raw: RawMessage, column: str, value: Any) -> None:
+    """One column of a raw message, committed at once (a transcript: a retry must not pay for it again)."""
+    async with ctx.autocommit() as session:
+        await session.execute(update(RawMessage).where(RawMessage.id == raw.id).values({column: value}))
+        await session.commit()
+    set_committed_value(raw, column, value)  # as stored: attaching the raw later writes nothing (``_attach``)
 
 
 # --- voice notes that are not speech (docs/features/iteration-4.md §1) ------------------------------------------
@@ -1395,8 +1501,8 @@ async def _keep_unheard(ctx: AppContext, raw: RawMessage, garbage: GarbageTransc
             fresh.transcript = garbage.text
             fresh.raw_json = {**(fresh.raw_json or {}), UNHEARD_KEY: marker}
             await session.commit()
-    raw.transcript = garbage.text
-    raw.raw_json = {**(raw.raw_json or {}), UNHEARD_KEY: marker}
+    set_committed_value(raw, "transcript", garbage.text)
+    set_committed_value(raw, "raw_json", {**(raw.raw_json or {}), UNHEARD_KEY: marker})
     reasons = ", ".join(t.get("reason") or t.get("error") or "?" for t in garbage.tries)
     log.info("message %s: the transcript is not speech (%s), nothing saved", raw.message_id, reasons)
 
@@ -1521,8 +1627,10 @@ async def _download(ctx: AppContext, raw: RawMessage) -> bytes | None:
     return bytes(data) or None
 
 
-async def _link_titles(ctx: AppContext, primary: RawMessage, urls: list[str]) -> dict[str, str]:
-    """Page titles of the links, fetched once and kept on the raw message."""
+async def _link_titles(
+    ctx: AppContext, primary: RawMessage, urls: list[str], writes: list[asyncio.Task[None]]
+) -> dict[str, str]:
+    """Page titles of the links, fetched once and kept on the raw message (stored by a task in ``writes``)."""
     if not urls:
         return {}
     if primary.link_titles is not None:
@@ -1532,10 +1640,8 @@ async def _link_titles(ctx: AppContext, primary: RawMessage, urls: list[str]) ->
     except Exception as e:  # titles are decoration: never fail the message for them
         log.info("link titles for message %s failed: %s", primary.message_id, type(e).__name__)
         titles = {}
-    async with ctx.sessionmaker() as session:
-        await session.execute(update(RawMessage).where(RawMessage.id == primary.id).values(link_titles=titles))
-        await session.commit()
-    primary.link_titles = titles
+    set_committed_value(primary, "link_titles", titles)  # what the job uses from now on, stored or not yet
+    writes.append(asyncio.ensure_future(_store(ctx, primary, "link_titles", titles)))
     return titles
 
 
@@ -1668,13 +1774,12 @@ async def _check_budget(
     now = clock.utcnow()
     month = now.astimezone(prefs.zone).strftime("%Y-%m")
     notify = False
-    async with ctx.sessionmaker() as session:
-        state = await usage.budget_state(session, prefs, now)
-        if state.exhausted:
-            notify = await try_once(session, f"budget100:{month}")
-        elif state.ratio >= BUDGET_WARN_RATIO:
-            notify = await try_once(session, f"budget80:{month}")
-        await session.commit()
+    # Read once per job (the check before a paid STT call and the one before extract() share it), with the job's own
+    # calls not written yet (``usage.job_spend``).
+    state = await usage.job_budget(ctx.autocommit, prefs, now)
+    if state.exhausted or state.ratio >= BUDGET_WARN_RATIO:
+        async with ctx.autocommit() as session:
+            notify = await try_once(session, f"budget{100 if state.exhausted else 80}:{month}")
     if state.exhausted:
         resume = _budget_resume(now, prefs)
         if notify:
@@ -1802,20 +1907,74 @@ async def _give_up(
 
 
 async def _prefs(ctx: AppContext) -> Prefs:
-    async with ctx.sessionmaker() as session:
-        prefs = await ctx.prefs(session)
-        await session.commit()  # the first load inserts the defaults row
-    return prefs
+    """The prefs of the job: the ones loaded within the last minute (``AppContext.recent_prefs``), else from the
+    database."""
+    recent = ctx.recent_prefs()
+    if recent is not None:
+        return recent
+    async with ctx.autocommit() as session:  # the first load inserts the defaults row (committed by itself)
+        return await ctx.prefs(session)
 
 
-async def _load_raws(ctx: AppContext, ids: list[int]) -> list[RawMessage]:
-    async with ctx.sessionmaker() as session:
-        return await _reload_ids(session, ids)
+async def _load_edit(ctx: AppContext, raw_id: int, key: str) -> tuple[RawMessage | None, bool]:
+    """The raw of an edit job and whether its edit was applied already (its once-key ``key``), in one statement."""
+    applied = exists().where(OnceKey.key == key)
+    async with ctx.autocommit() as session:
+        row = (await session.execute(select(RawMessage, applied).where(RawMessage.id == raw_id))).first()
+    return (row[0], bool(row[1])) if row is not None else (None, False)
+
+
+async def _snapshot(ctx: AppContext, item_id: int, prefs: Prefs, now: datetime) -> dict[str, Any]:
+    """``items.item_snapshot`` in a session of its own."""
+    async with ctx.autocommit() as session:
+        return await items_svc.item_snapshot(session, item_id, prefs, now)
+
+
+async def _nothing() -> None:
+    return None
+
+
+async def _load_message(ctx: AppContext, stmt: Select[tuple[RawMessage]]) -> tuple[list[RawMessage], bool]:
+    """The raws of a message job (``stmt``) and whether its items were saved already: the job ran before and stopped
+    between the save and marking the raws done (``_save``), so only that is left to do."""
+    saved = exists().where(Item.raw_message_id == RawMessage.id, Item.parent_id.is_(None))
+    async with ctx.autocommit() as session:
+        rows = (await session.execute(stmt.add_columns(saved))).all()
+    return [raw for raw, _ in rows], any(has_items for _, has_items in rows)
 
 
 async def _reload(session: AsyncSession, raws: Sequence[RawMessage]) -> list[RawMessage]:
     """The same raws, attached to ``session`` (in the given order)."""
     return await _reload_ids(session, [r.id for r in raws])
+
+
+def _attach(session: AsyncSession, raws: Sequence[RawMessage]) -> list[RawMessage]:
+    """The raws this job loaded (and kept up to date with what it wrote since: transcripts, link titles), attached
+    to ``session`` as they are — ``_reload`` without the round trip. Only this job changes an unfinished raw."""
+    for raw in raws:
+        session.add(raw)
+    return list(raws)
+
+
+def _by_message(raws: Sequence[RawMessage]) -> list[RawMessage]:
+    """The raws in the order they were sent (an album's parts; a clarification lists the asked-about one first)."""
+    return sorted(raws, key=lambda r: r.message_id)
+
+
+async def _all(*steps: Awaitable[Any]) -> list[Any]:
+    """All at once (each on a connection of its own: one database wait instead of several in a row), every one to its
+    end — a database call is never cancelled half-way; then the first failure is raised."""
+    results = await asyncio.gather(*steps, return_exceptions=True)
+    for result in results:
+        if isinstance(result, BaseException):
+            raise result
+    return results
+
+
+async def _together[A, B](first: Awaitable[A], second: Awaitable[B]) -> tuple[A, B]:
+    """``_all`` of two, typed."""
+    one, two = await _all(first, second)
+    return one, two
 
 
 async def _reload_ids(session: AsyncSession, ids: list[int]) -> list[RawMessage]:
@@ -1833,6 +1992,25 @@ def _finish(raws: Sequence[RawMessage], image_text: str | None) -> None:
         raw.error = None
     if raws and image_text:
         raws[0].image_text = image_text
+
+
+async def _done(ctx: AppContext, raws: Sequence[RawMessage], image_text: str | None) -> None:
+    """``_finish`` for raws not attached to a session: one UPDATE, without a transaction around it."""
+    if not raws:
+        return
+    primary = raws[0]
+    now = clock.utcnow()
+    values: dict[str, Any] = {"status": "done", "processed_at": now, "error": None}
+    if image_text:
+        values["image_text"] = case((RawMessage.id == primary.id, image_text), else_=RawMessage.image_text)
+    async with ctx.autocommit() as session:
+        await session.execute(update(RawMessage).where(RawMessage.id.in_([r.id for r in raws])).values(**values))
+        await session.commit()
+    for raw in raws:
+        for key, value in (("status", "done"), ("processed_at", now), ("error", None)):
+            set_committed_value(raw, key, value)
+    if image_text:
+        set_committed_value(primary, "image_text", image_text)
 
 
 async def _mark_done(ctx: AppContext, raws: list[RawMessage], image_text: str | None, **app: Any) -> None:
@@ -1912,7 +2090,7 @@ async def _send(
     if app:
         return None
     try:
-        return await sender.send(ctx, text, markup, silent=_quiet(prefs), **kwargs)
+        return await sender.send(ctx, text, markup, silent=_quiet(prefs), quiet_checked=True, **kwargs)
     except Exception as e:
         log.warning("could not send %s message: %s", kwargs.get("purpose"), describe_error(e))
         return None
@@ -1926,7 +2104,9 @@ def _quiet(prefs: Prefs) -> bool:
 
 async def _react(ctx: AppContext, raws: Sequence[RawMessage], emoji: str) -> None:
     """The final reaction on every part of the message (the capture router put 👀 on each album part); none on a
-    message from the Mini App (it is not in the chat)."""
+    message from the Mini App (it is not in the chat). The AI calls' ai_usage rows that waited for the reply
+    (``usage.deferred``) are written first, so the reaction still means that everything is stored."""
+    await usage.write_pending(ctx.autocommit)
     for raw in raws:
         if raw.source != APP_SOURCE:
             await sender.react(ctx, raw.message_id, emoji)

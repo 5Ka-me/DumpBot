@@ -119,8 +119,10 @@ async def save(
     if not created:  # a redelivered update: it was queued (and reacted to) the first time
         log.info("message %s was already saved", message.message_id)
         return
+    if not raw.media_group_id:  # its job ("message", or "edit" for a reply to a card) takes it as it is
+        ctx.keep_fresh(raw)
+    ctx.jobs_wakeup.set()  # the worker starts while the reaction is on its way
     await sender.react(ctx, message.message_id, sender.REACT_SEEN)
-    ctx.jobs_wakeup.set()
 
 
 async def reply_target(session: AsyncSession, ctx: AppContext, message: Message) -> Reply:

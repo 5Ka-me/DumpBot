@@ -3,7 +3,9 @@
 A sleeping PC freezes the bot; when it wakes at night it catches up on updates queued by Telegram and answers them
 (a list for a command sent at 22:46 arrived at 00:50 with a sound). This request middleware makes any message sent
 inside the owner's quiet hours silent unless the caller decided explicitly (``disable_notification`` already set):
-reminders for a time the user named themselves pass ``False`` and still ring.
+reminders for a time the user named themselves pass ``False`` and still ring, and so does the job processor, which
+looked at the quiet hours itself (``sender.send(quiet_checked=True)``). The prefs are the ones loaded within the last
+minute (``AppContext.recent_prefs``) when there are such: a message costs no round trip to the database for this.
 """
 
 from __future__ import annotations
@@ -40,8 +42,11 @@ class QuietHoursRequests(BaseRequestMiddleware):
         return await make_request(bot, method)
 
     async def _in_quiet_hours(self) -> bool:
+        prefs = self._ctx.recent_prefs()  # loaded within the last minute: no round trip to the database
+        if prefs is not None:
+            return quiet.in_quiet_hours(clock.utcnow(), prefs)
         try:
-            async with self._ctx.sessionmaker() as session:
+            async with self._ctx.autocommit() as session:
                 prefs = await self._ctx.prefs(session)
         except Exception as e:  # never block a message because the DB hiccupped
             log.warning("quiet hours check skipped: %s", type(e).__name__)

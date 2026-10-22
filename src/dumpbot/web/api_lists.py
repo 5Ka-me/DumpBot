@@ -367,6 +367,7 @@ async def patch_settings(request: web.Request) -> web.Response:
             raise bad_request("Недопустимое значение", str(loc[0])) from None
         budget_raised = await save_changes(session, ctx.owner_id, prefs, new, now)
         await session.commit()
+    ctx.forget_prefs()
     ctx.scheduler_wakeup.set()
     if budget_raised:
         ctx.jobs_wakeup.set()

@@ -34,8 +34,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from typing import Any, Final
 
-from sqlalchemy import ColumnElement, DateTime, Select, Text, and_, exists, func, literal, literal_column, or_, select
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import ColumnElement, DateTime, Select, and_, exists, func, literal, literal_column, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import defer
 from sqlalchemy.sql.selectable import Subquery
@@ -47,7 +46,7 @@ from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, CardExtras, RelatedRef, Row, Step, UsageSummary
 from dumpbot.services.items import current_occurrence, current_occurrence_order
-from dumpbot.services.related import lexeme_query, subject_lexemes
+from dumpbot.services.related import message_words, subject_lexeme_array
 
 __all__ = [
     "Agenda",
@@ -386,19 +385,33 @@ async def related_candidates(
     multi-item message, and two shared words beat one. Only open items (not done, not deleted; an actionable item
     whose current occurrence is done counts as done, an active series stays; a past-due one the owner has not ticked
     is still open), top-level, saved in the last ``RELATED_DAYS`` days, not from ``exclude_raw_ids`` (the message
-    itself). Nothing left of the message -> []."""
-    lexemes = await subject_lexemes(session, text)
-    if not lexemes:
+    itself). Nothing left of the message -> [].
+
+    One statement: the message's subject lexemes are worked out inside it (``related.subject_lexeme_array``), and the
+    rows come without the checklist counts of ``_with_family`` (the prompt does not show them)."""
+    words = message_words(text)
+    if not words:
         return []
-    tsq = lexeme_query(lexemes)
+    lx = select(subject_lexeme_array(words).label("lexemes")).cte("lx")
+    lexemes = lx.c.lexemes
+    tsq = func.to_tsquery(literal_column("'simple'::regconfig"), func.array_to_string(lexemes, " | "))
     cutoff = _utc(now) - timedelta(days=RELATED_DAYS)
     occ = _occ_subquery(open_only=False)
-    stmt = _item_select(occ).where(
-        Item.status == "open",
-        or_(Item.kind.not_in(_ACTIONABLE_KINDS), Item.rec_active.is_(True), occ.c.occ_status.is_distinct_from("done")),
-        Item.parent_id.is_(None),
-        Item.created_at >= cutoff,
-        Item.search_tsv.op("@@", is_comparison=True)(tsq),
+    stmt = (
+        _item_select(occ)
+        .join(lx, true())
+        .where(
+            func.cardinality(lexemes) > 0,
+            Item.status == "open",
+            or_(
+                Item.kind.not_in(_ACTIONABLE_KINDS),
+                Item.rec_active.is_(True),
+                occ.c.occ_status.is_distinct_from("done"),
+            ),
+            Item.parent_id.is_(None),
+            Item.created_at >= cutoff,
+            Item.search_tsv.op("@@", is_comparison=True)(tsq),
+        )
     )
     if exclude_raw_ids:
         stmt = stmt.where(or_(Item.raw_message_id.is_(None), Item.raw_message_id.not_in(list(exclude_raw_ids))))
@@ -410,12 +423,16 @@ async def related_candidates(
         Item.created_at.desc(),
         Item.id.desc(),
     )
-    return await _item_rows(session, stmt.limit(limit))
+    result = await session.execute(stmt.limit(limit))
+    return [
+        _row(item, occurrence_id=occ_id, due_at=due_at, occ_status=occ_status)
+        for item, occ_id, due_at, occ_status in result.all()
+    ]
 
 
-def _lexeme_hits(doc: ColumnElement[Any], lexemes: Sequence[str]) -> ColumnElement[int]:
-    """How many of ``lexemes`` the tsvector ``doc`` has: its length minus the length without them."""
-    return func.length(doc) - func.length(func.ts_delete(doc, literal(list(lexemes), ARRAY(Text))))
+def _lexeme_hits(doc: ColumnElement[Any], lexemes: ColumnElement[Any]) -> ColumnElement[int]:
+    """How many of ``lexemes`` (a ``text[]``) the tsvector ``doc`` has: its length minus the length without them."""
+    return func.length(doc) - func.length(func.ts_delete(doc, lexemes))
 
 
 async def related_refs(session: AsyncSession, item_id: int) -> list[RelatedRef]:
@@ -435,9 +452,10 @@ async def related_refs(session: AsyncSession, item_id: int) -> list[RelatedRef]:
     return [RelatedRef(item_id=i, kind=kind, title=title, created_at=created) for i, kind, title, created in rows]
 
 
-async def card_extras(session: AsyncSession, item: Item) -> CardExtras:
+async def card_extras(session: AsyncSession, item: Item, *, with_heard: bool = True) -> CardExtras:
     """What the item's card shows besides the item: its checklist (a top-level item), the related items, the title
-    of its parent (a step)."""
+    of its parent (a step), what was heard in the voice note it came from (not looked up without ``with_heard``:
+    the card shows another transcript)."""
     steps = await _steps(session, item.id) if item.parent_id is None else []
     parent_title = None
     if item.parent_id is not None:
@@ -447,7 +465,7 @@ async def card_extras(session: AsyncSession, item: Item) -> CardExtras:
         steps=tuple(steps),
         related=tuple(related),
         parent_title=parent_title,
-        heard=await heard(session, item.raw_message_id),
+        heard=await heard(session, item.raw_message_id) if with_heard else None,
     )
 
 

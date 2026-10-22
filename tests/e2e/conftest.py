@@ -41,6 +41,7 @@ from aiogram.client.telegram import TelegramAPIServer
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 from sqlalchemy import select
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from dumpbot import __main__ as entry
@@ -162,6 +163,7 @@ class Call:
     method: str
     params: dict[str, Any]
     result: Any
+    at: float = field(default_factory=_time.perf_counter)  # when the fake server got it (``time.perf_counter``)
 
     @property
     def message_id(self) -> int:
@@ -201,6 +203,7 @@ class FakeTelegram:
         self.rejected: list[tuple[str, str]] = []  # (method, Telegram's error) for invalid messages
         self.files: dict[str, tuple[str, bytes]] = {}  # file_id -> (file_path, bytes)
         self.downloads: list[str] = []
+        self.download_delay_s = 0.0  # how long a file takes to come from the file server
         self.bad_tokens = 0
         self._update_ids = itertools.count(1)
         self._bot_message_ids = itertools.count(9001)
@@ -347,6 +350,8 @@ class FakeTelegram:
             return web.Response(status=401)
         path = request.match_info["path"]
         self.downloads.append(path)
+        if self.download_delay_s:
+            await asyncio.sleep(self.download_delay_s)
         for file_path, data in self.files.values():
             if file_path == path:
                 return web.Response(body=data, content_type="application/octet-stream")
@@ -505,6 +510,7 @@ class FakeChutes:
     local_requests: list[dict[str, Any]] = field(default_factory=list)
     chat_requests: list[ChatRequest] = field(default_factory=list)
     stt_requests: list[dict[str, Any]] = field(default_factory=list)
+    stt_at: list[float] = field(default_factory=list)  # when each STT request came (``time.perf_counter``)
     failed_calls: int = 0
     unscripted: list[str] = field(default_factory=list)
     bad_auth: int = 0
@@ -602,6 +608,7 @@ class FakeChutes:
             return web.Response(status=401, text="Invalid token")
         body = await request.json()
         self.stt_requests.append(body)
+        self.stt_at.append(_time.perf_counter())
         outage = self.outage or self.stt_outage
         if outage is not None:
             self.failed_calls += 1
@@ -626,6 +633,131 @@ class FakeChutes:
         )
 
 
+# --- a database far away ----------------------------------------------------------------------------------------
+
+_SSL_REQUEST = 80877103
+_GSSENC_REQUEST = 80877104
+# The last stretch of a delay is waited out by polling the clock: timers (and time.monotonic) can be ~16 ms off on
+# Windows, so the proxy keeps time with time.perf_counter.
+_SPIN_S = 0.02
+
+
+class SlowDatabase:
+    """A TCP proxy in front of the test Postgres that holds every answer of the server for ``rtt_s`` (the bot on
+    Render talking to Supabase: ~150 ms a round trip) and notes when the client starts each round trip.
+
+    A round trip is a client message the client then waits on: the start-up / SSL request, an authentication answer
+    (``p``), a ``Flush`` (``H``: asyncpg's prepare), a ``Sync`` (``S``: the end of an extended-protocol batch) or a
+    simple ``Query`` (``Q``: ``BEGIN``, ``COMMIT``…). Only the answers are delayed (one wait per round trip)."""
+
+    def __init__(self, host: str, port: int, rtt_s: float) -> None:
+        self.host, self.port, self.rtt_s = host, port, rtt_s
+        self.trips: list[float] = []  # when each round trip's request came (``time.perf_counter``)
+        self._server: asyncio.Server | None = None
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    async def start(self) -> int:
+        self._server = await asyncio.start_server(self._accept, "127.0.0.1", 0)
+        return int(self._server.sockets[0].getsockname()[1])
+
+    async def close(self) -> None:
+        if self._server is not None:
+            self._server.close()
+        for task in list(self._tasks):
+            task.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
+
+    def between(self, start: float, end: float) -> list[float]:
+        """The round trips started in [start, end] (``time.perf_counter``)."""
+        return [t for t in self.trips if start <= t <= end]
+
+    def waits(self, start: float, end: float) -> int:
+        """How many round trips in [start, end] the client waited for one after another: round trips started within
+        half a round trip of each other (on two connections at once) are one wait."""
+        count, wave = 0, -1.0
+        for t in sorted(self.between(start, end)):
+            if t >= wave + self.rtt_s / 2:
+                count, wave = count + 1, t
+        return count
+
+    async def _accept(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        self._tasks.add(task)
+        try:
+            up_reader, up_writer = await asyncio.open_connection(self.host, self.port)
+            requests = _ClientMessages(self.trips)
+            await asyncio.gather(
+                self._pump(reader, up_writer, 0.0, requests.feed), self._pump(up_reader, writer, self.rtt_s, None)
+            )
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            writer.close()
+            self._tasks.discard(task)
+
+    @staticmethod
+    async def _pump(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        delay: float,
+        observe: Callable[[bytes], None] | None,
+    ) -> None:
+        clock = _time.perf_counter
+        queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue()
+
+        async def deliver() -> None:
+            while True:
+                due, data = await queue.get()
+                if not data:
+                    return
+                if (wait := due - clock() - _SPIN_S) > 0:
+                    await asyncio.sleep(wait)
+                while clock() < due:  # noqa: ASYNC110 - polling the clock is the point: timers are late
+                    await asyncio.sleep(0)
+                writer.write(data)
+                await writer.drain()
+
+        delivering = asyncio.create_task(deliver())
+        try:
+            while data := await reader.read(65536):
+                if observe is not None:
+                    observe(data)
+                queue.put_nowait((clock() + delay, data))
+        finally:
+            queue.put_nowait((0.0, b""))
+            with contextlib.suppress(ConnectionError):
+                await delivering
+            writer.close()
+
+
+class _ClientMessages:
+    """Splits the client's byte stream into protocol messages and notes the ones that start a round trip."""
+
+    def __init__(self, trips: list[float]) -> None:
+        self._trips = trips
+        self._buf = bytearray()
+        self._startup = True  # the first messages have no type byte
+
+    def feed(self, data: bytes) -> None:
+        self._buf += data
+        while True:
+            if self._startup:
+                if len(self._buf) < 8 or len(self._buf) < (n := int.from_bytes(self._buf[:4], "big")):
+                    return
+                code = int.from_bytes(self._buf[4:8], "big")
+                del self._buf[:n]
+                self._startup = code in (_SSL_REQUEST, _GSSENC_REQUEST)  # the StartupMessage follows those
+                self._trips.append(_time.perf_counter())
+                continue
+            if len(self._buf) < 5 or len(self._buf) < 1 + (n := int.from_bytes(self._buf[1:5], "big")):
+                return
+            kind = chr(self._buf[0])
+            del self._buf[: 1 + n]
+            if kind in "SQpH":
+                self._trips.append(_time.perf_counter())
+
+
 # --- the running application -------------------------------------------------------------------------------------
 
 
@@ -646,6 +778,7 @@ class E2E:
     ai_url: str = ""
     t0: datetime = T0
     stranger: int = STRANGER
+    db: SlowDatabase | None = None  # the app's way to the database, with the ``db_rtt_s`` fixture on
 
     @property
     def web_url(self) -> str:
@@ -817,6 +950,13 @@ def miniapp() -> bool:
 
 
 @pytest.fixture
+def db_rtt_s() -> float:
+    """Round-trip time between the app and its database (``SlowDatabase``); 0 = direct. A test module overrides this
+    fixture to put the database far away."""
+    return 0.0
+
+
+@pytest.fixture
 async def e2e(
     engine: AsyncEngine,
     db_url: str,
@@ -825,12 +965,19 @@ async def e2e(
     local_whisper: bool,
     miniapp: bool,
     llm_settings: dict[str, Any],
+    db_rtt_s: float,
 ) -> AsyncIterator[E2E]:
     """Fake servers up, the app polling them; on teardown polling stops and the app shuts down cleanly.
 
     ``engine`` (tests/conftest.py) is requested so the tables are truncated after the test.
     """
     tg, ai = FakeTelegram(frozen), FakeChutes()
+    db: SlowDatabase | None = None
+    app_db_url = db_url
+    if db_rtt_s > 0:
+        target = make_url(db_url)
+        db = SlowDatabase(target.host or "127.0.0.1", target.port or 5432, db_rtt_s)
+        app_db_url = target.set(port=await db.start()).render_as_string(hide_password=False)
     tg_server = TestServer(tg.app(), host="127.0.0.1")
     ai_server = TestServer(ai.app(), host="127.0.0.1")
     await tg_server.start_server()
@@ -844,13 +991,13 @@ async def e2e(
         webapp.mkdir()
         (webapp / "index.html").write_text("<!doctype html><title>Свалка</title>", encoding="utf-8")
     settings = make_settings(
-        db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper, webapp=webapp, llm=llm_settings
+        app_db_url, tg_url, ai_url, tmp_path / "heartbeat", local_whisper=local_whisper, webapp=webapp, llm=llm_settings
     )
     exits: list[int] = []
     bot_session = AiohttpSession(api=TelegramAPIServer.from_base(tg_url))
     app = await build_app(settings, bot_session=bot_session, runners=worker_only, exit_func=exits.append)
     polling = asyncio.create_task(entry.poll(app, handle_signals=False, polling_timeout=1))
-    env = E2E(app=app, tg=tg, ai=ai, clock=frozen, scheduler=Scheduler(app.ctx), exits=exits, ai_url=ai_url)
+    env = E2E(app=app, tg=tg, ai=ai, clock=frozen, scheduler=Scheduler(app.ctx), exits=exits, ai_url=ai_url, db=db)
     try:
         await wait_until(lambda: tg.of("setMyCommands") or polling.done(), "startup")
         assert not polling.done(), "polling stopped during startup"
@@ -868,6 +1015,8 @@ async def e2e(
         await app.cleanup()
         await tg_server.close()
         await ai_server.close()
+        if db is not None:
+            await db.close()
 
     # The shutdown must be clean and nothing unexpected may have happened along the way.
     assert exits == [], "a background task crashed"

@@ -107,7 +107,8 @@ async def test_messages_processed_in_quiet_hours_are_silent(ctx, add_raw, fake_a
     await processor.handle_message(ctx, {"raw_id": raw.id})
 
     night, day = bot.sent
-    assert (night["disable_notification"], day["disable_notification"]) == (True, None)
+    # the processor looked at the quiet hours itself: no need for bot.quiet_requests to load the prefs again
+    assert (night["disable_notification"], day["disable_notification"]) == (True, False)
 
 
 async def test_note_gets_only_a_reaction(ctx, add_raw, fake_ai, bot, items_of_raw) -> None:

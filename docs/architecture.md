@@ -10,7 +10,7 @@
 Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
 Итерация 4 ([features/iteration-4.md](features/iteration-4.md)): сделанное (§1 фильтр мусорных расшифровок, §2 повторы:
 фразы остановки и несколько времён в день, §3 кнопки напоминания по типу записи, §4 залежавшиеся дела, §5 журнал
-действий, §6 еженедельный обзор) отмечено в контрактах ниже.
+действий, §6 еженедельный обзор, §7 скорость: обращения к БД до карточки) отмечено в контрактах ниже.
 
 ## 1. Общая схема
 
@@ -86,6 +86,7 @@ Mini App ([iteration-2.md, D](features/iteration-2.md), [miniapp-api.md](feature
 | Формат сообщений | HTML parse mode; весь пользовательский/LLM-текст экранировать `html.escape(…, quote=False)`. Даты рендерим сами по-русски (`domain.fmt`). |
 | FSM | `MemoryStorage` (короткие диалоги правки/настроек; потеря при рестарте не критична). Ответом диалога считается только набранное владельцем (не пересланное, не «?…») сообщение без reply в течение `ANSWER_TTL` (5 мин) или reply на сам запрос в течение `PROMPT_TTL` (15 мин); всё остальное закрывает диалог и уходит в capture. |
 | Логи | stdlib `logging`; **никогда** не логировать текст сообщений/транскрипты/OCR на уровне INFO, не логировать токены/URL файлов Telegram. |
+| Задержка БД (итерация 4, §7) | Render → Supabase ~150 мс на обращение: каждое на пути «задача взята → карточка» на счету. Без `pool_pre_ping` (пинг только соединения, простоявшего > 30 с: `db.meter.idle_ping`), пул LIFO (кэш prepared statements горячего соединения), чтения и одиночные записи — в autocommit (`ctx.autocommit`: без `BEGIN`/`COMMIT`), независимые чтения — параллельно на разных соединениях, необязательное (bot_messages, «done» сообщения, ai_usage, журнал, итог задачи) — после карточки. Текстовое сообщение с временем: 6 ожиданий БД (~0,9 с при 150 мс), было ~50. |
 
 ## 3. Структура проекта и владельцы
 
@@ -112,6 +113,7 @@ src/dumpbot/
     garbage.py             расшифровка — не речь? (итерация 4, §1)                                    [ai]
     linkinfo.py            заголовки страниц по ссылкам                                              [ai]
   db/ base.py models.py engine.py                                                                     [foundation ✔]
+    meter.py               обращения задачи к БД и время ИИ (строка лога на задачу), пинг простоявших соединений (итерация 4, §7)
   services/
     settings_repo.py                                                                                  [foundation ✔]
     usage.py               запись ai_usage, траты за месяц, состояние бюджета                        [ai]
@@ -564,6 +566,11 @@ async def month_spend(session, prefs: Prefs, now: datetime) -> float   # тек�
 async def budget_state(session, prefs: Prefs, now: datetime) -> BudgetState
 def next_month_start(now: datetime, prefs: Prefs) -> datetime         # aware UTC начало следующего месяца по prefs.tz
 ```
+Итерация 4, §7 — внутри задачи очереди (`deferred()` → `JobUsage`): `record_usage` не пишет сразу, строки ждут
+`write_pending(sessionmaker, job=None)` (одним INSERT; processor — перед итоговой реакцией, `JobWorker` — после задачи
+при любом исходе); `job_spend` / `job_budget(sessionmaker, prefs, now)` читают траты месяца из БД один раз за задачу
+(проверка перед платным STT и перед `extract()` — одно чтение) и прибавляют стоимость вызовов задачи с тех пор
+(записанных и нет); `prefetch_spend` начинает это чтение заранее (пока качается голосовое). Вне задачи — как раньше.
 
 ### 4.9a services/events.py  [workers] (итерация 4, §5)
 
@@ -626,6 +633,8 @@ class CreatedItem:
     occurrence: Occurrence | None
     reminders: list[Reminder]
     resolution: Resolution
+    steps: list[CreatedItem] = []      # итерация 4, §7: шаги, созданные вместе с ней
+    related: list[int] = []            # и id связанных: карточка новой записи без них обходится без запросов
 
 @dataclass
 class PatchResult:
@@ -718,6 +727,7 @@ async def move_to_tomorrow(session, occurrence_ids: list[int], prefs: Prefs, now
 ```python
 async def create_items(..., related_allowed: Collection[int] = ()) -> list[CreatedItem]
     # + шаги ExtractedItem.steps (не у повтора; в результат не входят) и item_links только на id из related_allowed
+    # итерация 4, §7: один INSERT на таблицу для всех записей сообщения (items, occurrences, reminders), не на запись
 def can_split(item: Item) -> bool               # open, не шаг, не активный повтор
 async def add_steps(session, parent_id: int, steps: Sequence[StepSpec], prefs: Prefs, now: datetime, *,
                     model: str | None = None, prompt_version: str | None = None) -> list[CreatedItem]
@@ -849,9 +859,12 @@ async def related_candidates(session, text: str, now: datetime, *, exclude_raw_i
     # слов напоминаний, времени, частых глаголов, чисел, ссылок; ничего не осталось → []); порядок: больше лексем в
     # title/details, больше лексем во всей записи, ts_rank, новее; только открытые (не done/deleted, задача со
     # сделанным текущим повторением — как done, серии и просроченные неотмеченные остаются), не шаги, created_at за
-    # 365 дней, кроме записей exclude_raw_ids
+    # 365 дней, кроме записей exclude_raw_ids. Итерация 4, §7: один запрос — лексемы считаются внутри него
+    # (related.subject_lexeme_array), без счётчиков шагов (_with_family)
 async def related_refs(session, item_id: int) -> list[RelatedRef]   # item_links в обе стороны, не deleted, новые первыми
-async def card_extras(session, item: Item) -> CardExtras            # шаги (☐/☑, время), похожие, название родителя
+async def card_extras(session, item: Item, *, with_heard: bool = True) -> CardExtras
+    # шаги (☐/☑, время), похожие, название родителя, расшифровка голосового (без with_heard — не ищется: карточка
+    # покажет другую, cards.render_card(heard=…))
 async def usage_summary(session, prefs: Prefs, now: datetime) -> UsageSummary
 def rows_for_llm(rows: list[Row], prefs: Prefs) -> list[dict]      # компактные dict для answer_query (локальные даты)
 ```
@@ -898,6 +911,12 @@ class JobWorker:
 `RetryLater` → `queued`, `run_after = at or now+delay` (count_attempt=False — не увеличивать attempts, например бюджет).
 `AIUnavailable` → `run_after = now + min(2**attempts мин, 6 ч)` (или retry_after). Иное исключение → attempts++, backoff;
 при `attempts >= max_attempts` → `dead`, `last_error`, и вызвать `on_dead(ctx, job)` (уведомление владельцу, реакция 😢).
+
+Итерация 4, §7: взять задачу и записать её итог — по одному оператору без транзакции вокруг (`ctx.autocommit`).
+Задача выполняется внутри `db.meter.measure()` и `usage.deferred()`: после неё (при любом исходе) пишутся оставшиеся
+строки ai_usage, затем итог, и в лог уходит INFO `job 12 (message): ai 1.92 s, db 7 queries / 0.31 s, total 2.40 s`
+— время ИИ (LLM, STT) без БД внутри, число обращений к БД (операторы, `BEGIN`, `COMMIT`/`ROLLBACK`, пинги) и время,
+когда хоть одно шло (параллельные считаются раз), всё время задачи; только числа.
 
 ### 4.13 services/ingest.py  [workers]
 
@@ -989,6 +1008,23 @@ temperature 0 и фиксированный seed — повтор дал бы т
 остаются как есть (тот же ответ + 😢); для `edit`/`edit_time` — сразу «😢 Не смог применить изменение…», raw `failed`.
 `ExtractOutput.missing_model` (основная модель 404, ответила запасная) → уведомление «модели X нет, работаю на
 запасной» один раз в сутки (once_key `aimodel:YYYY-MM-DD`), обработка продолжается.
+
+Итерация 4, §7 — скорость: путь «задача взята → карточка» на Render упирается в ~150 мс на обращение к Supabase.
+Текстовое сообщение с временем — 6 ожиданий БД (было ~50, `tests/e2e/test_e2e_speed.py` с прокси-задержкой):
+- старт: raw передаёт capture (`ctx.keep_fresh` → `take_fresh`, для `message` и reply-правки; иначе загрузка и prefs
+  параллельно), prefs — загруженные за последнюю минуту (`ctx.recent_prefs`; сохранение настроек — `forget_prefs`);
+- одно ожидание: проверка бюджета (`usage.job_budget`, одно чтение на задачу) ‖ похожие записи (один запрос) ‖
+  запись расшифровки / заголовков ссылок (`_gather(meanwhile=True)`: задачи в `_Content.writes`, ждутся до платного
+  `extract()`); у голосового траты читаются, пока файл качается (`usage.prefetch_spend`);
+- сохранение — одна транзакция: `BEGIN`, по INSERT на таблицу, `COMMIT`; raws не перечитываются (`_attach`),
+  карточка новой записи без шагов и связей — без запросов (`CardExtras(heard=…)` из памяти);
+- после карточки: `bot_messages` (sender, autocommit), raws `done` (`_done`, один UPDATE), строки ai_usage (перед
+  реакцией), журнал, итог задачи. Повтор задачи после сбоя между сохранением и `done`: `_load_message` видит записи
+  этого raw → только `done`, без ИИ и карточки (у reply-правки то же по её once-key). Вопрос (`ASK_KEY`) и Mini App —
+  `done` в транзакции записей, как раньше;
+- сообщения processor'а решают тихие часы сами (`sender.send(quiet_checked=True)`), `quiet_requests` не грузит prefs.
+Reply-правка (`apply_patch` по шагам: блокировка, перенос, напоминания, карточка с шагами и связями) — ~19 ожиданий,
+не переделывалась.
 
 Итерация 4, §1 — голосовое, которое не речь: `_transcript` зовёт `stt.transcribe(screen=True, duration=raw.duration)`;
 `GarbageTranscript` → отвергнутая расшифровка в `raw.transcript`, попытки в `raw_json[UNHEARD_KEY]` (commit сразу:
@@ -1131,11 +1167,13 @@ occurrence (ответ на вопрос текстом — правка зап�
 
 ```python
 async def send(ctx: AppContext, text: str, markup: InlineKeyboardMarkup | ForceReply | None = None, *,
-               reply_to: int | None = None, silent: bool = False, purpose: str,
+               reply_to: int | None = None, silent: bool = False, quiet_checked: bool = False, purpose: str,
                item_id: int | None = None, occurrence_id: int | None = None,
                raw_message_id: int | None = None) -> int
     """send_message в ctx.chat_id (HTML), reply_parameters(allow_sending_without_reply=True), повтор при
-    TelegramRetryAfter (до 3 раз), запись BotMessage в своей сессии. Возвращает message_id."""
+    TelegramRetryAfter (до 3 раз), запись BotMessage в своей сессии (autocommit). Возвращает message_id.
+    quiet_checked (итерация 4, §7): тихие часы проверил вызывающий, silent — его решение (disable_notification
+    True/False), quiet_requests prefs не грузит."""
 async def edit(ctx: AppContext, message_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None
     # "message is not modified" игнорировать
 async def react(ctx: AppContext, message_id: int, emoji: str) -> None   # best-effort, ошибки глушить

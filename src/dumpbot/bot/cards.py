@@ -60,7 +60,7 @@ async def render_card(
 ) -> View:
     """``views.item_card`` with what the card shows besides the item (checklist, related items, parent, the transcript
     of the voice note it came from); ``heard`` replaces that transcript (the card answers another voice note)."""
-    extras = await query.card_extras(session, item)
+    extras = await query.card_extras(session, item, with_heard=heard is None)
     if heard is not None:
         extras = replace(extras, heard=heard)
     return views.item_card(item, occ, reminders, prefs, now, warnings=warnings, extras=extras)

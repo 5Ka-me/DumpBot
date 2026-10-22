@@ -55,7 +55,7 @@ from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Select, case, exists, false, func, select
+from sqlalchemy import Select, case, exists, false, func, select, true
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -268,7 +268,7 @@ async def _create_all(
     now = _utc(now)
     single = len(extraction.items) == 1
     allowed = set(related_allowed)
-    out: list[CreatedItem] = []
+    planned: list[tuple[ExtractedItem, Item, Resolution]] = []
     for extracted in extraction.items:
         res = timeresolve.resolve_item(extracted, now, prefs, source=source)
         item = Item(
@@ -301,41 +301,61 @@ async def _create_all(
             item.rec_dtstart_local = res.rec_dtstart_local
             item.rec_tz = prefs.tz
             item.rec_active = True
-        created = await _insert(session, item, res)
+        planned.append((extracted, item, res))
+    out = await _insert_all(session, [(item, res) for _, item, res in planned])
+    for (extracted, item, _), created in zip(planned, out, strict=True):
         if extracted.steps and not item.rec_active:
-            await _create_steps(session, item, extracted.steps, prefs, now, model=model, prompt_version=prompt_version)
-        await _link(session, item, [i for i in extracted.related if i in allowed])
-        out.append(created)
+            created.steps = await _create_steps(
+                session, item, extracted.steps, prefs, now, model=model, prompt_version=prompt_version
+            )
+        created.related = await _link(session, item, [i for i in extracted.related if i in allowed])
     log.info("created %d item(s) from raw %s", len(out), raw_id)
     return out
 
 
-async def _insert(session: AsyncSession, item: Item, res: Resolution) -> CreatedItem:
-    """Add the item, plus its occurrence and reminders when the resolution has a due time."""
-    session.add(item)
+async def _insert_all(session: AsyncSession, planned: Sequence[tuple[Item, Resolution]]) -> list[CreatedItem]:
+    """Add the items, each with its occurrence and reminders when its resolution has a due time: one INSERT per
+    table for all of them, not per item (every statement is a round trip to the database,
+    docs/features/iteration-4.md §7)."""
+    if not planned:
+        return []
+    session.add_all([item for item, _ in planned])
     await session.flush()
-    occ: Occurrence | None = None
-    reminders: list[Reminder] = []
-    if res.due_at is not None:
-        occ = Occurrence(item_id=item.id, due_at=res.due_at, precision=res.precision, status="open")
-        session.add(occ)
+    occs = [
+        Occurrence(item_id=item.id, due_at=res.due_at, precision=res.precision, status="open")
+        if res.due_at is not None
+        else None
+        for item, res in planned
+    ]
+    if any(occs):
+        session.add_all([occ for occ in occs if occ is not None])
         await session.flush()
-        reminders = await _add_reminders(session, occ.id, res.reminders)
-    return CreatedItem(item=item, occurrence=occ, reminders=reminders, resolution=res)
+    reminders = [
+        _reminders(occ.id, res.reminders) if occ is not None else []
+        for occ, (_, res) in zip(occs, planned, strict=True)
+    ]
+    if any(reminders):
+        session.add_all([r for rs in reminders for r in rs])
+        await session.flush()
+    return [
+        CreatedItem(item=item, occurrence=occ, reminders=rs, resolution=res)
+        for (item, res), occ, rs in zip(planned, occs, reminders, strict=True)
+    ]
 
 
-async def _link(session: AsyncSession, item: Item, related_ids: Sequence[int]) -> None:
+async def _link(session: AsyncSession, item: Item, related_ids: Sequence[int]) -> list[int]:
     """``item_links`` rows "item is similar to the earlier related item" (at most MAX_RELATED, never itself), only
     for related items whose title / details share a subject word with the item's (``related.sharing_subject``: the
-    model's "related" alone is not trusted)."""
+    model's "related" alone is not trusted). Returns the linked ids."""
     ids = [i for i in dict.fromkeys(related_ids) if i != item.id]
     if not ids:
-        return
+        return []
     ids = (await sharing_subject(session, f"{item.title} {item.details or ''}", ids))[:MAX_RELATED]
     if not ids:
-        return
+        return []
     rows = [{"item_id": item.id, "related_id": i, "kind": "similar"} for i in ids]
     await session.execute(pg_insert(ItemLink).values(rows).on_conflict_do_nothing())
+    return ids
 
 
 def _titled(title: str, res: Resolution, prefs: Prefs) -> str:
@@ -517,7 +537,7 @@ async def _create_steps(
 ) -> list[CreatedItem]:
     """Steps ``first``.. (at most MAX_STEPS) of ``parent``; only those with a time of their own get an occurrence."""
     named = [(title, spec) for spec in specs if (title := " ".join(spec.title.split()))]
-    out: list[CreatedItem] = []
+    planned: list[tuple[Item, Resolution]] = []
     for position, (title, spec) in enumerate(named[:MAX_STEPS], start=first):
         res = _step_resolution(spec, now, prefs)
         item = Item(
@@ -541,8 +561,8 @@ async def _create_steps(
             created_at=now,
             updated_at=clock.utcnow(),
         )
-        out.append(await _insert(session, item, res))
-    return out
+        planned.append((item, res))
+    return await _insert_all(session, planned)
 
 
 def _step_resolution(spec: StepSpec, now: datetime, prefs: Prefs) -> Resolution:
@@ -672,9 +692,20 @@ async def get_item(session: AsyncSession, item_id: int) -> Item | None:
 
 async def item_snapshot(session: AsyncSession, item_id: int, prefs: Prefs, now: datetime) -> dict[str, Any]:
     """Item as the edit prompt sees it: {id, kind, title, details, tags, due_local, rrule, lead, status}, plus
-    ``period`` ("YYYY-MM-DD..YYYY-MM-DD") or ``someday: true`` for an item with a fuzzy time."""
-    item = await _get_item(session, item_id)
-    occ = await current_occurrence(session, item_id)
+    ``period`` ("YYYY-MM-DD..YYYY-MM-DD") or ``someday: true`` for an item with a fuzzy time. One query: the item with
+    its current occurrence."""
+    cur = (
+        select(Occurrence)
+        .where(Occurrence.item_id == item_id)
+        .order_by(*current_occurrence_order())
+        .limit(1)
+        .subquery("cur")
+    )
+    current = aliased(Occurrence, cur)
+    row = (await session.execute(select(Item, current).outerjoin(current, true()).where(Item.id == item_id))).first()
+    if row is None:
+        raise NotFoundError(f"item {item_id} not found")
+    item, occ = row
     snap: dict[str, Any] = {
         "id": item.id,
         "kind": item.kind,
@@ -1793,13 +1824,17 @@ def _period_span(item: Item, occ: Occurrence) -> tuple[date, date] | None:
     return item.period_start, item.period_end
 
 
-async def _add_reminders(session: AsyncSession, occurrence_id: int, plans: Iterable[ReminderPlan]) -> list[Reminder]:
-    reminders = [
+def _reminders(occurrence_id: int, plans: Iterable[ReminderPlan]) -> list[Reminder]:
+    return [
         Reminder(
             occurrence_id=occurrence_id, fire_at=p.fire_at, lead_minutes=p.lead_minutes, auto=p.auto, status="pending"
         )
         for p in plans
     ]
+
+
+async def _add_reminders(session: AsyncSession, occurrence_id: int, plans: Iterable[ReminderPlan]) -> list[Reminder]:
+    reminders = _reminders(occurrence_id, plans)
     if reminders:
         session.add_all(reminders)
         await session.flush()

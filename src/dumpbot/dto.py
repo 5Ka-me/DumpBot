@@ -49,6 +49,8 @@ class CreatedItem:
     occurrence: Occurrence | None
     reminders: list[Reminder]
     resolution: Resolution
+    steps: list[CreatedItem] = field(default_factory=list)  # its checklist, created together with it
+    related: list[int] = field(default_factory=list)  # the earlier items it was linked to ("🔗 похоже на")
 
 
 @dataclass

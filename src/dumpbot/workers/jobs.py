@@ -2,8 +2,8 @@
 
 A job is claimed with ``UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED) RETURNING`` (status ``running``,
 ``attempts + 1``, ``locked_until``). A ``running`` job whose lock expired (the process died mid-job) is claimed
-again. Handlers open their own sessions from ``ctx.sessionmaker``; the worker records the outcome in a separate
-short transaction:
+again. Handlers open their own sessions from ``ctx.sessionmaker``; claiming a job and recording its outcome are one
+statement each, without a transaction around them (``ctx.autocommit``: docs/features/iteration-4.md §7):
 
 - success -> ``done`` (a handler that returns a dict leaves it in ``Job.result`` for the Mini App);
 - ``RetryLater`` -> ``queued`` at ``at`` or ``now + delay`` (``count_attempt=False`` gives the attempt back,
@@ -16,6 +16,10 @@ short transaction:
 ``STALL_AFTER`` (far beyond the slowest job: the AI fallback ladder, speech-to-text, Telegram) exits the process.
 A job with many slow steps beats ``WATCH_NAME`` itself: the processor does before each part of an album it
 transcribes.
+
+Every job runs inside ``db.meter.measure()`` and ``usage.deferred()``: the ai_usage rows its AI calls left unwritten
+are written after it whatever its outcome, and an INFO line says where its time went, numbers only
+(``job 12 (message): ai 1.92 s, db 7 queries / 0.31 s, total 2.40 s``).
 
 Logs and ``last_error`` never contain exception messages of unknown origin: they may carry message text (SQL
 parameters, validation input) or Telegram file URLs with the bot token. Only the exception type and the code
@@ -41,7 +45,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from dumpbot import clock
 from dumpbot.ai.client import AIError, AIUnavailable
 from dumpbot.context import AppContext
+from dumpbot.db import meter
 from dumpbot.db.models import Job, OnceKey, RawMessage
+from dumpbot.services import usage
 
 __all__ = [
     "AI_RETRY_WINDOW",
@@ -290,7 +296,8 @@ class JobWorker:
         return count
 
     async def _claim_one(self) -> Job | None:
-        async with self._ctx.sessionmaker() as session:
+        # One statement: its own transaction is enough (no BEGIN / COMMIT round trips).
+        async with self._ctx.autocommit() as session:
             jobs = await claim(session, clock.utcnow(), limit=1, lock_for=self._lock_for)
             await session.commit()
         return jobs[0] if jobs else None
@@ -306,21 +313,29 @@ class JobWorker:
             await self._dead(job, "attempts exhausted (crashed repeatedly)")
             return
         log.debug("job %s (%s) attempt %d", job.id, job.kind, job.attempts)
-        try:
-            result = await handler(self._ctx, dict(job.payload or {}))
-        except asyncio.CancelledError:
-            await self._release(job)
-            raise
-        except RetryLater as e:
-            await self._retry_later(job, e)
-        except AIUnavailable as e:
-            await self._ai_unavailable(job, e)
-        except Exception as e:
-            await self._failed(job, e)
-        else:
-            outcome = result if isinstance(result, dict) else None
-            await self._record(job.id, status="done", last_error=None, result=outcome)
-            log.debug("job %s (%s) done", job.id, job.kind)
+        # The AI calls' ai_usage rows wait until the reply is out (services.usage.deferred); what the handler did
+        # not write itself is written here, whatever the outcome.
+        with meter.measure() as spent, usage.deferred() as spending:
+            try:
+                result = await handler(self._ctx, dict(job.payload or {}))
+            except asyncio.CancelledError:
+                await self._release(job, spending)
+                raise
+            except Exception as e:
+                await usage.write_pending(self._ctx.autocommit, spending)
+                if isinstance(e, RetryLater):
+                    await self._retry_later(job, e)
+                elif isinstance(e, AIUnavailable):
+                    await self._ai_unavailable(job, e)
+                else:
+                    await self._failed(job, e)
+            else:
+                await usage.write_pending(self._ctx.autocommit, spending)
+                outcome = result if isinstance(result, dict) else None
+                await self._record(job.id, status="done", last_error=None, result=outcome)
+                log.debug("job %s (%s) done", job.id, job.kind)
+        # docs/features/iteration-4.md §7: where the time went, numbers only.
+        log.info("job %s (%s): %s", job.id, job.kind, spent.summary())
 
     async def _retry_later(self, job: Job, e: RetryLater) -> None:
         now = clock.utcnow()
@@ -379,13 +394,16 @@ class JobWorker:
         except Exception as e:
             log.error("on_dead for job %s failed: %s", job.id, describe_error(e))
 
-    async def _release(self, job: Job) -> None:
-        """Cancelled mid-job (shutdown): give the attempt back and make the job runnable right away."""
+    async def _release(self, job: Job, spending: usage.JobUsage) -> None:
+        """Cancelled mid-job (shutdown): keep the ai_usage rows of the calls already made, give the attempt back and
+        make the job runnable right away."""
+
+        async def release() -> None:
+            await usage.write_pending(self._ctx.autocommit, spending)
+            await self._record(job.id, status="queued", run_after=clock.utcnow(), attempts=max(job.attempts - 1, 0))
+
         try:
-            await asyncio.wait_for(
-                self._record(job.id, status="queued", run_after=clock.utcnow(), attempts=max(job.attempts - 1, 0)),
-                timeout=2.0,
-            )
+            await asyncio.wait_for(release(), timeout=2.0)
         except (Exception, asyncio.CancelledError):
             log.warning("job %s: could not release on cancel; its lock expires on its own", job.id)
 
@@ -393,7 +411,7 @@ class JobWorker:
         values.setdefault("locked_until", None)
         values["updated_at"] = clock.utcnow()
         try:
-            async with self._ctx.sessionmaker() as session:
+            async with self._ctx.autocommit() as session:  # one statement: no transaction around it
                 await session.execute(update(Job).where(Job.id == job_id).values(**values))
                 await session.commit()
         except Exception as e:  # the job stays "running" and is claimed again when its lock expires
@@ -402,7 +420,7 @@ class JobWorker:
     async def _wait_time(self) -> float:
         """Seconds until the next queued job is due (album debounce), capped by the poll interval."""
         try:
-            async with self._ctx.sessionmaker() as session:
+            async with self._ctx.autocommit() as session:
                 nxt = await session.scalar(select(func.min(Job.run_after)).where(Job.status == "queued"))
         except Exception as e:
             log.debug("next run_after lookup failed: %s", describe_error(e))

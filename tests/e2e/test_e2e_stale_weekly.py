@@ -42,15 +42,20 @@ async def tick(e2e: Any, now: datetime) -> list[Any]:
 
 async def press(e2e: Any, message: Any, data: str) -> Any:
     before = len(e2e.tg.edits_of(message.message_id))
+    pressed = await _journaled(e2e, data)  # the same button may have been pressed before (o:tmr of one occurrence)
     e2e.tg.push_callback(message, data)
     edits = await e2e.wait(lambda: e2e.tg.edits_of(message.message_id)[before:], f"edit after {data}")
-    await e2e.wait_db(lambda: _journaled(e2e, data), f"{data} journaled")  # written right after the answer
+
+    async def journaled() -> bool:  # written right after the answer
+        return await _journaled(e2e, data) > pressed
+
+    await e2e.wait_db(journaled, f"{data} journaled")
     return edits[-1]
 
 
-async def _journaled(e2e: Any, data: str) -> bool:
+async def _journaled(e2e: Any, data: str) -> int:
     rows = await e2e.all(Event)
-    return any(e.type == "button" and (e.data or {}).get("cb") == data for e in rows)
+    return sum(1 for e in rows if e.type == "button" and (e.data or {}).get("cb") == data)
 
 
 def questions(messages: list[Any]) -> list[Any]:

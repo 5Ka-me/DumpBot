@@ -163,6 +163,7 @@ async def _change(callback: CallbackQuery, ctx: AppContext, key: str, value: str
             return
         budget_raised = await save_changes(session, ctx.owner_id, prefs, new, now)
         await session.commit()
+    ctx.forget_prefs()
     await common.answer(callback, SAVED)
     await common.show(ctx, message_id, _view(ctx, views.SETTINGS_PARENT.get(key, "main"), new))
     _wake(ctx, budget_raised)
@@ -194,6 +195,7 @@ async def on_value(message: Message, ctx: AppContext, state: FSMContext) -> None
             return
         budget_raised = await save_changes(session, ctx.owner_id, prefs, new, now)
         await session.commit()
+    ctx.forget_prefs()
     await state.clear()
     await common.show(ctx, data.get("prompt_id"), _view(ctx, spec.menu, new))
     await sender.react(ctx, message.message_id, sender.REACT_SAVED)

@@ -27,8 +27,8 @@ import re
 from collections.abc import Sequence
 from typing import Final
 
-from sqlalchemy import ColumnElement, cast, func, literal, literal_column, select
-from sqlalchemy.dialects.postgresql import TSQUERY
+from sqlalchemy import ColumnElement, ScalarSelect, Text, and_, cast, func, literal, literal_column, select
+from sqlalchemy.dialects.postgresql import ARRAY, TSQUERY, aggregate_order_by
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from dumpbot.db.models import Item
@@ -40,6 +40,7 @@ __all__ = [
     "lexeme_query",
     "message_words",
     "sharing_subject",
+    "subject_lexeme_array",
     "subject_lexeme_sets",
     "subject_lexemes",
 ]
@@ -195,6 +196,30 @@ async def subject_lexeme_sets(session: AsyncSession, texts: Sequence[str]) -> li
     for i, lexemes in zip(todo, row, strict=True):
         out[i] = [lx for lx in lexemes or [] if len(lx) > 1 and not lx.isdigit() and _WORD_RE.fullmatch(lx)]
     return out
+
+
+def subject_lexeme_array(words: Sequence[str]) -> ScalarSelect[list[str]]:
+    """``subject_lexemes`` of ``message_words`` ``words`` as an SQL ``text[]`` (``'{}'`` when nothing is left), for a
+    query that needs them without asking for them first: one round trip to the database instead of two
+    (docs/features/iteration-4.md §7). The lexemes are kept as ``subject_lexeme_sets`` keeps them: longer than one
+    character, not a number, nothing that could break a tsquery."""
+    generic = func.tsvector_to_array(func.to_tsvector(_RU, literal(" ".join(GENERIC_WORDS))))
+    found = (
+        func.unnest(func.tsvector_to_array(func.ts_delete(func.to_tsvector(_RU, literal(" ".join(words))), generic)))
+        .table_valued("lexeme")
+        .render_derived()
+    )
+    lexeme = found.c.lexeme
+    usable = and_(
+        func.length(lexeme) > 1,
+        lexeme.op("!~")(literal("^[0-9]+$")),
+        lexeme.op("!~")(literal(r"[\s'\\:&|!()<>*]")),
+    )
+    return (
+        select(func.coalesce(func.array_agg(aggregate_order_by(lexeme, lexeme)), literal([], ARRAY(Text))))
+        .where(usable)
+        .scalar_subquery()
+    )
 
 
 def lexeme_query(lexemes: Sequence[str]) -> ColumnElement[str]:

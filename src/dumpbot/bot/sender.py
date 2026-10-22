@@ -88,6 +88,7 @@ async def send(
     *,
     reply_to: int | None = None,
     silent: bool = False,
+    quiet_checked: bool = False,
     purpose: str,
     item_id: int | None = None,
     occurrence_id: int | None = None,
@@ -97,8 +98,13 @@ async def send(
 
     ``reply_to`` is a Telegram message_id in the owner's chat; the message is still sent if it was deleted.
     ``markup`` is inline buttons, or ``ForceReply`` for a prompt whose answer is a reply to it.
+    ``quiet_checked``: the caller looked at the quiet hours itself (``silent`` is its decision), so
+    ``bot.quiet_requests`` does not load the prefs again for this message.
     """
     reply = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
+    # None lets bot.quiet_requests silence it in quiet hours; a reminder that reaches the sender is for a time the
+    # user named (automatic ones are held back by the scheduler), so it rings unless told otherwise.
+    ring = False if purpose == "reminder" or quiet_checked else None
     msg = await _with_retry(
         lambda: ctx.bot.send_message(
             chat_id=ctx.chat_id,
@@ -106,9 +112,7 @@ async def send(
             parse_mode=ParseMode.HTML,
             reply_markup=markup,
             reply_parameters=reply,
-            # None lets bot.quiet_requests silence it in quiet hours; a reminder that reaches the sender is for a time
-            # the user named (automatic ones are held back by the scheduler), so it rings unless told otherwise.
-            disable_notification=True if silent else (False if purpose == "reminder" else None),
+            disable_notification=True if silent else ring,
         ),
         "send_message",
     )
@@ -133,8 +137,8 @@ async def _record(
     occurrence_id: int | None,
     raw_message_id: int | None,
 ) -> None:
-    """Store the message -> item mapping in its own session. The message is already out, so a DB error is only
-    logged: failing here would make callers retry and send a duplicate."""
+    """Store the message -> item mapping in its own session (one statement, no transaction around it). The message
+    is already out, so a DB error is only logged: failing here would make callers retry and send a duplicate."""
     stmt = (
         insert(BotMessage)
         .values(
@@ -148,7 +152,7 @@ async def _record(
         .on_conflict_do_nothing(index_elements=[BotMessage.chat_id, BotMessage.message_id])
     )
     try:
-        async with ctx.sessionmaker() as session:
+        async with ctx.autocommit() as session:
             await session.execute(stmt)
             await session.commit()
     except SQLAlchemyError:

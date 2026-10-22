@@ -15,9 +15,11 @@ from dumpbot.domain.prefs import Prefs
 
 
 class _Ctx:
-    def __init__(self, prefs: Prefs | None = None, *, broken: bool = False) -> None:
+    def __init__(self, prefs: Prefs | None = None, *, broken: bool = False, recent: Prefs | None = None) -> None:
         self._prefs = prefs or Prefs(tz="Europe/Warsaw")
         self._broken = broken
+        self._recent = recent
+        self.loads = 0
 
     @asynccontextmanager
     async def _session(self):
@@ -25,11 +27,15 @@ class _Ctx:
             raise ConnectionError("db down")
         yield object()
 
-    def sessionmaker(self):
+    def autocommit(self):
         return self._session()
 
     async def prefs(self, session: Any) -> Prefs:
+        self.loads += 1
         return self._prefs
+
+    def recent_prefs(self) -> Prefs | None:
+        return self._recent
 
 
 async def _send(ctx: _Ctx, method: Any, now: datetime, monkeypatch: pytest.MonkeyPatch) -> Any:
@@ -80,3 +86,19 @@ async def test_db_error_does_not_block_sending(monkeypatch):
 
 def test_voice_language_defaults_to_russian():
     assert Prefs().stt_language == "ru"
+
+
+async def test_prefs_loaded_within_the_minute_spare_the_database(monkeypatch):
+    # iteration 4, §7: a message no longer costs a round trip to the database for the quiet hours
+    ctx = _Ctx(broken=True, recent=Prefs(tz="Europe/Warsaw"))
+    m = await _send(ctx, SendMessage(chat_id=1, text="x"), NIGHT, monkeypatch)
+    assert m.disable_notification is True
+    ctx = _Ctx(recent=Prefs(tz="Europe/Warsaw", quiet_enabled=False))
+    m = await _send(ctx, SendMessage(chat_id=1, text="x"), NIGHT, monkeypatch)
+    assert m.disable_notification is None and ctx.loads == 0
+
+
+async def test_without_recent_prefs_they_are_loaded(monkeypatch):
+    ctx = _Ctx()
+    await _send(ctx, SendMessage(chat_id=1, text="x"), NIGHT, monkeypatch)
+    assert ctx.loads == 1
