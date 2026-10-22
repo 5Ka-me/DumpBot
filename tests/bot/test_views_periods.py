@@ -184,7 +184,8 @@ def test_reminder_of_a_period_item_names_the_span(make_item, make_occ, make_remi
     friday = at(2026, 10, 9, 19, 0)
     text, kb = check_view(views.reminder_message(item, occ, auto_reminder(make_reminder, occ, friday), PREFS, friday))
     assert text == "🔔 <b>Посмотреть расбери пай</b>\n🗓 на этой неделе (до вс 11 окт)"
-    assert [t for t, _ in buttons(kb)] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
+    # iteration 4, §3: a span's reminder moves it by the week, to a day, or to "когда-нибудь"
+    assert [t for t, _ in buttons(kb)] == ["✅ Готово", "➡️ След. неделя", "📅 Выбрать день", "💤 Когда-нибудь"]
     done, _ = check_view(views.reminder_done(item, occ, PREFS, friday + timedelta(minutes=3)))
     assert done.splitlines()[1] == "<i>на этой неделе (до вс 11 окт) · сделано</i>"
 

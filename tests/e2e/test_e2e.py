@@ -122,8 +122,8 @@ async def test_voice_note_to_reminder_to_done(e2e: Any) -> None:
     await e2e.tick(local(2026, 10, 6, 13, 0))
     [reminder_msg] = e2e.tg.sent[sent_before:]
     assert reminder_msg.text == "🔔 <b>Купить наушники</b>"  # no "через 5 мин"
-    # 13:00: the evening (19:00) is more than an hour away -> [🌙 Вечером] instead of [⏰ 15 мин]
-    assert [text for text, _ in reminder_msg.buttons] == ["✅ Готово", "⏰ 1 час", "🌙 Вечером", "📅 Завтра"]
+    # a one-off at a time (iteration 4, §3): [⏰ 1 час] [⏰ 3 часа] [📅 Завтра]
+    assert [text for text, _ in reminder_msg.buttons] == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
     assert reminder_msg.reply_to is None
     [reminder] = await e2e.reminders(item.id)
     assert (reminder.status, reminder.tg_message_id) == ("sent", reminder_msg.message_id)
@@ -444,13 +444,13 @@ async def test_snooze_from_the_reminder(e2e: Any) -> None:
     await e2e.tick(local(2026, 10, 6, 14, 2))
     [again] = e2e.tg.sent[sent_before:]
     assert again.text.startswith("🔔 <b>Купить наушники</b>")
-    assert [text for text, _ in again.buttons] == ["✅ Готово", "⏰ 1 час", "🌙 Вечером", "📅 Завтра"]
+    assert [text for text, _ in again.buttons] == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
     assert [(r.status, wall(r.fire_at)) for r in await e2e.reminders(item.id)] == [
         ("sent", "2026-10-06 13:00"),
         ("sent", "2026-10-06 14:02"),
     ]
 
-    # an old [⏰ 15 мин] (a reminder sent before 🌙 existed) still works
+    # an old [⏰ 15 мин] (a reminder sent before iteration 4) still works
     e2e.clock.set(local(2026, 10, 6, 14, 3))
     e2e.tg.push_callback(again, f"o:s15:{occ.id}")
     await e2e.wait(lambda: e2e.tg.edits_of(again.message_id), "the second reminder edited")

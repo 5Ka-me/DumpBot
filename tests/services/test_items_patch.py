@@ -238,7 +238,8 @@ async def test_stop_recurrence(session, make, now, prefs):
     assert c.item.rec_active is False
     assert c.item.rrule == "FREQ=WEEKLY;BYDAY=MO"
     assert result.occurrence.id == c.occurrence.id
-    assert result.occurrence.status == "open"
+    # iteration 4, §2: next Monday's instance (ahead) is cancelled too; nothing is left, the item is done
+    assert (result.occurrence.status, result.item.status, result.reminders) == ("cancelled", "done", [])
 
 
 # --- rrule -----------------------------------------------------------------------------------------------------
@@ -338,7 +339,7 @@ async def test_done_ahead_of_time_and_rrule_starts_after_it(session, make, occur
 
 async def test_invalid_rrule_only_warns(session, make, local, now, prefs):
     [c] = await make(MEETING, now=now)
-    result = await items.apply_patch(session, c.item.id, patch(rrule="FREQ=DAILY;BYHOUR=5"), prefs, now)
+    result = await items.apply_patch(session, c.item.id, patch(rrule="FREQ=DAILY;BYSECOND=5"), prefs, now)
     assert result.warnings == ["не понял правило повтора"]
     assert c.item.rrule is None
     assert result.occurrence.due_at == local(2026, 10, 6, 15, 0)

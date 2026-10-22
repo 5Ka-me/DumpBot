@@ -13,12 +13,14 @@ from dumpbot.bot.cbdata import (
     ITEM_ACTIONS,
     LIST_ACTIONS,
     LIST_KINDS,
+    NEXT_SPAN,
     OCC_ACTIONS,
     SNOOZE_ACTIONS,
     SNOOZE_MINUTES,
     STEP_ACTIONS,
     AgainCb,
     AskCb,
+    DayCb,
     DigestCb,
     ItemCb,
     KindCb,
@@ -45,7 +47,7 @@ def _roundtrip(cb: CallbackData) -> str:
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
     # "l" (LeadCb) is retired: never reuse it
-    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u", "vr"]
+    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u", "vr", "dy"]
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -84,9 +86,22 @@ def test_occurrence_actions(action: str):
 
 
 def test_snooze_minutes_cover_snooze_actions():
-    assert SNOOZE_ACTIONS == OCC_ACTIONS - {"done", "undone"}
-    assert SNOOZE_MINUTES == {"s15": 15, "s60": 60, "tmr": None}
+    # iteration 4, §3: ⏰ 3 часа; s15 and 🌙 eve live on in reminders sent before
+    assert SNOOZE_MINUTES == {"s15": 15, "s60": 60, "s180": 180, "tmr": None}
     assert SNOOZE_ACTIONS - set(SNOOZE_MINUTES) == {"eve"}  # 🌙 today's evening slot
+
+
+def test_occurrence_actions_match_contract():
+    """Reminders by item type (iteration 4, §3): next week / month, someday, the day picker and back, ⏹ of a series."""
+    assert NEXT_SPAN == {"nw": "next_week", "nm": "next_month"}
+    assert OCC_ACTIONS == {"done", "undone", *SNOOZE_ACTIONS, "nw", "nm", "smd", "pick", "rem", "stop"}
+
+
+async def test_day_of_the_picker_fits_and_matches_only_its_filter():
+    assert _roundtrip(DayCb(id=BIG * 1000, d="20261026")) == f"dy:{BIG * 1000}:20261026"
+    data = DayCb(id=7, d="20261026").pack()
+    assert await DayCb.filter()(_query(data)) == {"callback_data": DayCb(id=7, d="20261026")}
+    assert await DigestCb.filter()(_query(data)) is False
 
 
 @pytest.mark.parametrize("action", sorted(LIST_ACTIONS))

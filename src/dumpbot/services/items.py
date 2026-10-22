@@ -36,6 +36,11 @@ Conventions kept by this module:
   parents is collected per session (``take_parent_events``) for the bot's "🎉 Все шаги выполнены" message;
 - related items (§C1): ``item_links`` rows for the earlier items the AI named among the candidates it was shown and
   that share a subject word with the new item (``services.related``: not a reminder / time word or a common verb);
+- repetition (docs/features/iteration-4.md §2): a series may name several times a day in its rule ("каждый день в
+  9:00 и 18:00": BYHOUR / BYMINUTE, ``timeresolve.series_rule``). Stopping it cancels every open instance still
+  ahead with its pending reminders (one made in advance never comes); the instance already due stays, or is closed
+  when the owner asked to stop "and close" (a stop phrase, ⏹ in a reminder); with nothing open left the item is done.
+  A stop asked for a one-off item is just "done";
 - ``updated_at`` is always set explicitly (server-side ``onupdate`` would expire it, and async sessions cannot
   lazy-load).
 """
@@ -46,7 +51,7 @@ import logging
 import re
 from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -84,6 +89,7 @@ __all__ = [
     "create_items",
     "current_occurrence",
     "current_occurrence_order",
+    "day_time",
     "delete_item",
     "ensure_recurring",
     "get_item",
@@ -91,8 +97,10 @@ __all__ = [
     "lock_item",
     "mark_done",
     "mark_undone",
+    "move_to_day",
     "move_to_tomorrow",
     "pending_reminders",
+    "picker_days",
     "remove_reminders",
     "replace_items_for_raw",
     "restore_item",
@@ -948,20 +956,44 @@ async def set_tags(session: AsyncSession, item_id: int, tags: list[str]) -> Item
     return item
 
 
-async def stop_recurrence(session: AsyncSession, item_id: int, now: datetime | None = None) -> Item:
-    """rec_active=False; the current (earliest open) occurrence stays. Later instances that were already generated
-    (the next one exists as soon as the current one is due) are cancelled with their reminders.
+async def stop_recurrence(
+    session: AsyncSession,
+    item_id: int,
+    now: datetime | None = None,
+    *,
+    close: bool = False,
+    occurrence_id: int | None = None,
+    prefs: Prefs | None = None,
+) -> Item:
+    """rec_active=False, and every open instance still ahead (due after ``now``: the next one, made in advance, and
+    any other) is cancelled with its pending reminders — none of them comes any more (docs/features/iteration-4.md
+    §2). An instance already due stays open (it is on today's list), unless ``close``: then it is done — the
+    instance ``occurrence_id`` (the reminder ⏹ was pressed on, even if it was snoozed ahead), else the earliest open
+    one already due. With nothing open left the item is done (a stopped series has nothing more to do).
 
-    ``now`` is an optional extension of the contract (default: the current time).
+    ``now``, ``close``, ``occurrence_id`` and ``prefs`` are optional extensions of the contract (default: the current
+    time, nothing closed, the owner's prefs).
     """
     now = _utc(now) if now is not None else clock.utcnow()
     item = await _get_item(session, item_id)
     item.rec_active = False
-    current = await _first_open(session, item.id)
+    closed: Occurrence | None = None
+    if close:
+        if occurrence_id is not None:
+            closed = await session.get(Occurrence, occurrence_id)
+            if closed is not None and (closed.item_id != item.id or closed.status != "open"):
+                closed = None
+        else:
+            first = await _first_open(session, item.id)
+            closed = first if first is not None and first.due_at <= now else None
     for occ in await _open_occurrences(session, item.id, after=now):
-        if current is not None and occ.id != current.id:
+        if closed is None or occ.id != closed.id:
             occ.status = "cancelled"
             await _cancel_pending(session, [occ.id])
+    if closed is not None:
+        prefs = prefs if prefs is not None else await _owner_prefs(session)
+        await mark_done(session, closed.id, now, prefs)
+    await _close_if_finished(session, item, now)
     _touch(item)
     return item
 
@@ -1005,6 +1037,9 @@ async def apply_patch(
 ) -> PatchResult:
     """Apply an EditPatch. Order: delete (exclusive) -> title/kind/tags -> done/undone -> rrule -> when -> lead
     -> no_reminder / stop_recurrence ("сделал, теперь каждую неделю" closes this instance, then starts the rule).
+    ``stop_recurrence`` is what the owner's stop phrases ask for (docs/features/iteration-4.md §2: «закрывай вообще»,
+    «хватит повторять»): an active series stops and the instance already due is closed (``stop_recurrence(close=
+    True)``); any other item is just done.
 
     ``when`` moves the current open occurrence (or creates one) and re-plans its reminders; for an active
     series it moves only this instance. The new time is the notification time, unless the patch has a ``lead`` too
@@ -1025,7 +1060,7 @@ async def apply_patch(
     was_actionable = item.kind in ACTIONABLE
     _apply_fields(item, patch)
 
-    if patch.action == "done":
+    if patch.action == "done" or (patch.action == "stop_recurrence" and not (item.rec_active and item.rrule)):
         await _patch_done(session, item, prefs, now)
     elif patch.action == "undone":
         await _patch_undone(session, item, prefs, now)
@@ -1044,8 +1079,8 @@ async def apply_patch(
 
     if patch.action == "no_reminder":
         await remove_reminders(session, item.id, prefs=prefs, now=now)
-    elif patch.action == "stop_recurrence":
-        await stop_recurrence(session, item.id, now)
+    elif patch.action == "stop_recurrence" and item.rec_active:
+        await stop_recurrence(session, item.id, now, close=True, prefs=prefs)
 
     _touch(item)
     return await _patch_result(session, item, warnings)
@@ -1254,6 +1289,17 @@ async def _set_rrule(
     ref_precision = reference.precision if reference is not None else None
     start, time_spec = _series_start(patch.when, ref_at, ref_precision, prefs, now, span_start=item.period_start)
     dtstart = start.replace(tzinfo=None)
+    try:  # "каждый день в 9 и 18" (iteration 4, §2): the rule names its times; the first one starts the series
+        at = dtstart.time() if time_spec else dtstart.time().replace(minute=0)
+        rule = timeresolve.series_rule(rule, at, patch.when.text if patch.when is not None else None)
+    except ValueError:
+        warnings.append(timeresolve.WARN_BAD_RRULE)
+        return False
+    if times := recurrence.rule_times(rule):
+        day = dtstart.date()
+        if patch.when is not None and not (patch.when.day or patch.when.at or patch.when.period):
+            day = min(day, now.astimezone(tz).date())  # a time only: today counts while one of its times is ahead
+        dtstart = datetime.combine(day, times[0])
     after, inclusive = now, True
     if first is None and reference is not None and reference.status == "done" and reference.due_at >= now:
         # Nothing open, just marked done ahead of time: the series continues after that instance.
@@ -1493,11 +1539,59 @@ def _rec_zone(item: Item, prefs: Prefs) -> ZoneInfo:
 
 
 def _rec_precision(item: Item) -> Precision:
-    """Precision of the series' instances, from its When spec: HH:MM -> exact, slot -> slot, none -> default."""
+    """Precision of the series' instances, from its When spec: HH:MM -> exact, slot -> slot, none -> default — but
+    a rule naming its own times of day ("каждый день в 9 и 18": BYHOUR) is exact unless the spec names a slot."""
     spec_time = (item.when_spec or {}).get("time")
-    if not spec_time:
-        return "default"
-    return "exact" if _HHMM_RE.match(str(spec_time)) else "slot"
+    if spec_time and not _HHMM_RE.match(str(spec_time)):
+        return "slot"
+    if spec_time or recurrence.rule_times(item.rrule):
+        return "exact"
+    return "default"
+
+
+# --- move to a day picked in a reminder (docs/features/iteration-4.md §3) ----------------------------------------
+
+_TIMED: Final = frozenset({"exact", "slot", "relative"})  # an occurrence at a time of day the owner gave
+PICKER_DAYS: Final = 7
+
+
+def day_time(item: Item, occ: Occurrence, prefs: Prefs) -> time:
+    """The time of day a day picked for the item ([📅 Выбрать день]) gets: the time the owner stated for it (its
+    notification time plus its lead: "Встреча (15:00)" -> 15:00), or ``task_default_time`` for an item without a time
+    of its own (a span, "на днях", a bare date, the bot's default)."""
+    if occ.precision not in _TIMED:
+        return prefs.task_default_time
+    return _stated_at(item, occ, prefs).astimezone(_rec_zone(item, prefs)).time().replace(second=0, microsecond=0)
+
+
+def picker_days(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> list[date]:
+    """The ``PICKER_DAYS`` days [📅 Выбрать день] offers: from today while ``day_time`` is still ahead today, else
+    from tomorrow (a day is never offered once its moment has passed)."""
+    tz = prefs.zone
+    today = _utc(now).astimezone(tz).date()
+    first = (
+        today if timeresolve.localize(today, day_time(item, occ, prefs), tz) > _utc(now) else today + timedelta(days=1)
+    )
+    return [first + timedelta(days=i) for i in range(PICKER_DAYS)]
+
+
+async def move_to_day(session: AsyncSession, occurrence_id: int, day: date, prefs: Prefs, now: datetime) -> PatchResult:
+    """[📅 Выбрать день] of a reminder: the item moves to ``day`` at ``day_time`` — a plain dated item from then on (a
+    span or "на днях" is that day now), keeping its explicit leads ("за час") and its role (a deadline is that day's
+    deadline). Done like an edit with that day and time (``apply_patch``); a moment already past gets the usual
+    "дата в прошлом" warning and no reminder."""
+    occ = await _get_occ(session, occurrence_id)
+    item = await _get_item(session, occ.item_id)
+    at = day_time(item, occ, prefs)
+    timed = occ.precision in _TIMED
+    when = When(
+        text=f"{fmt_date(day)} {fmt_time(at)}",
+        day=day.isoformat(),
+        time=at.strftime("%H:%M"),
+        role=_role(item),  # type: ignore[arg-type]
+    )
+    lead = list(item.lead_minutes) if timed and item.lead_minutes else None
+    return await apply_patch(session, item.id, EditPatch(when=when, lead=lead), prefs, now)
 
 
 # --- move to tomorrow ------------------------------------------------------------------------------------------

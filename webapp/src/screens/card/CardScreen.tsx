@@ -182,7 +182,7 @@ export function CardScreen({ id }: { id: number }) {
     if (await confirmDialog(`Удалить «${item.title}»?${withSteps}`)) await run("delete", () => api.action(id, "delete"));
   };
   const stopRepeat = async () => {
-    if (await confirmDialog("Остановить повтор? Текущий раз останется.")) await run("stoprec", () => api.action(id, "stoprec"));
+    if (await confirmDialog("Остановить повтор? Следующих напоминаний не будет, уже наступивший раз останется.")) await run("stoprec", () => api.action(id, "stoprec"));
   };
 
   const toggleStep = async (step: Step) => {

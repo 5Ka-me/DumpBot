@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from dumpbot.ai.schemas import RRULE_RE
-from dumpbot.domain.recurrence import describe_rrule_ru, next_occurrence, normalize_rrule
+from dumpbot.domain.recurrence import (
+    complete_times,
+    describe_rrule_ru,
+    next_occurrence,
+    normalize_rrule,
+    rule_times,
+    with_times,
+    without_times,
+)
 
 TZ = ZoneInfo("Europe/Warsaw")
 NOW = datetime(2026, 10, 6, 14, 5, tzinfo=TZ)
@@ -49,6 +57,8 @@ def chain(rule: str, start: datetime, after: datetime, n: int) -> list[datetime]
         ("FREQ=WEEKLY;UNTIL=20261231", "FREQ=WEEKLY;UNTIL=20261231"),
         ("FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29", "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=29"),
         ("FREQ=WEEKLY;WKST=SU;BYDAY=SU,MO;COUNT=4", "FREQ=WEEKLY;WKST=SU;BYDAY=SU,MO;COUNT=4"),
+        ("FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0"),  # iteration 4, §2
+        ("freq=daily;byhour=8,20;byminute=0,30;bysetpos=2,3", "FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3"),
     ],
 )
 def test_normalize(raw: str, expected: str):
@@ -64,7 +74,12 @@ def test_normalize(raw: str, expected: str):
         "garbage",
         "BYDAY=MO",  # no FREQ
         "FREQ=HOURLY",
-        "FREQ=WEEKLY;BYHOUR=9",
+        "FREQ=WEEKLY;BYSECOND=9",
+        "FREQ=DAILY;BYHOUR=24",
+        "FREQ=DAILY;BYHOUR=9,9",
+        "FREQ=DAILY;BYMINUTE=60",
+        "FREQ=DAILY;BYHOUR=-1",
+        "FREQ=DAILY;BYHOUR=0,1,2,3,4,5,6,7,8,9,10,11,12;BYMINUTE=0,30",  # 26 times a day
         "DTSTART:20261006T090000\nRRULE:FREQ=DAILY",
         "FREQ=WEEKLY;FREQ=DAILY",
         "FREQ=WEEKLY;COUNT=3;UNTIL=20261231",
@@ -208,7 +223,7 @@ def test_after_in_utc_and_local_is_the_same():
 
 def test_invalid_rule_raises():
     with pytest.raises(ValueError):
-        next_occurrence("FREQ=WEEKLY;BYHOUR=9", START, TZ, NOW)
+        next_occurrence("FREQ=WEEKLY;BYSECOND=9", START, TZ, NOW)
 
 
 # --- describe_rrule_ru ----------------------------------------------------------------------------------------
@@ -293,3 +308,114 @@ def test_describe_exotic_falls_back_to_rule(rule: str):
 
 def test_describe_invalid_returns_input():
     assert describe_rrule_ru("FREQ=HOURLY") == "FREQ=HOURLY"
+
+
+# --- several times a day (docs/features/iteration-4.md §2) ----------------------------------------------------------
+
+
+def test_two_times_a_day():
+    rule = "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0"
+    assert chain(rule, START, L(2026, 10, 6, 8, 0), 4) == [
+        L(2026, 10, 6, 9, 0),
+        L(2026, 10, 6, 18, 0),
+        L(2026, 10, 7, 9, 0),
+        L(2026, 10, 7, 18, 0),
+    ]
+    assert next_occurrence(rule, START, TZ, NOW) == L(2026, 10, 6, 18, 0)  # 14:05: this evening's
+
+
+def test_times_keep_the_wall_clock_across_dst():
+    rule = "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0"
+    assert chain(rule, START, L(2026, 10, 24, 19, 0), 3) == [
+        L(2026, 10, 25, 9, 0),  # the autumn switch: still 09:00 local
+        L(2026, 10, 25, 18, 0),
+        L(2026, 10, 26, 9, 0),
+    ]
+
+
+def test_times_with_different_minutes_picked_by_setpos():
+    rule = "FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3"
+    assert rule_times(rule) == (time(8, 30), time(20, 0))
+    expected = [L(2026, 10, 6, 8, 30), L(2026, 10, 6, 20, 0), L(2026, 10, 7, 8, 30)]
+    assert chain(rule, datetime(2026, 10, 6, 8, 30), L(2026, 10, 6, 8, 0), 3) == expected
+
+
+def test_weekly_with_times():
+    rule = "FREQ=WEEKLY;BYDAY=MO;BYHOUR=9,18;BYMINUTE=0"
+    assert chain(rule, START, NOW, 3) == [L(2026, 10, 12, 9, 0), L(2026, 10, 12, 18, 0), L(2026, 10, 19, 9, 0)]
+
+
+@pytest.mark.parametrize(
+    ("rule", "times"),
+    [
+        ("FREQ=DAILY", ()),
+        ("FREQ=DAILY;BYHOUR=18,9;BYMINUTE=0", (time(9, 0), time(18, 0))),
+        ("FREQ=DAILY;BYHOUR=9;BYMINUTE=0,30", (time(9, 0), time(9, 30))),
+        ("FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=-1,1", (time(8, 0), time(20, 30))),
+        ("FREQ=MONTHLY;BYDAY=MO;BYSETPOS=1", ()),  # BYSETPOS of days, no times of its own
+        ("FREQ=HOURLY", ()),  # invalid
+        (None, ()),
+    ],
+)
+def test_rule_times(rule: str | None, times: tuple[time, ...]):
+    assert rule_times(rule) == times
+
+
+def test_complete_times_takes_the_missing_part_from_the_start():
+    assert complete_times("FREQ=DAILY;BYHOUR=9,18", time(9, 30)) == "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=30"
+    assert complete_times("FREQ=DAILY;BYMINUTE=0,30", time(9, 0)) == "FREQ=DAILY;BYMINUTE=0,30;BYHOUR=9"
+    assert complete_times("rrule:freq=weekly;byday=mo", time(9, 0)) == "FREQ=WEEKLY;BYDAY=MO"
+
+
+@pytest.mark.parametrize(
+    ("rule", "times", "expected"),
+    [
+        ("FREQ=DAILY", [time(9), time(18)], "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0"),
+        (
+            "FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30",
+            [time(8, 30), time(20)],
+            "FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3",
+        ),
+        # a weekly rule every week is the daily one with its days, so that BYSETPOS picks per day
+        (
+            "FREQ=WEEKLY;BYDAY=MO,TH",
+            [time(8, 30), time(20)],
+            "FREQ=DAILY;BYDAY=MO,TH;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3",
+        ),
+        ("FREQ=WEEKLY;INTERVAL=2;BYDAY=MO", [time(8, 30), time(20)], None),
+        ("FREQ=MONTHLY;BYMONTHDAY=1", [time(8, 30), time(20)], None),
+        ("FREQ=MONTHLY;BYMONTHDAY=1", [time(9), time(18)], "FREQ=MONTHLY;BYMONTHDAY=1;BYHOUR=9,18;BYMINUTE=0"),
+        ("FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1", [time(9), time(18)], None),  # it would pick one of them
+        (
+            "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1",
+            [time(9)],
+            "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1;BYHOUR=9;BYMINUTE=0",
+        ),
+        ("FREQ=DAILY", [], None),
+    ],
+)
+def test_with_times(rule: str, times: list[time], expected: str | None):
+    got = with_times(rule, times)
+    assert got == expected
+    if got is not None and "BYSETPOS=1;" not in got:
+        assert rule_times(got) == tuple(sorted(times))
+
+
+def test_without_times():
+    assert without_times("FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3") == "FREQ=DAILY"
+    assert without_times("FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1") == "FREQ=MONTHLY;BYDAY=FR;BYSETPOS=-1"
+
+
+@pytest.mark.parametrize(
+    ("rule", "text"),
+    [
+        ("FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", "каждый день в 09:00 и 18:00"),
+        ("FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3", "каждый день в 08:30 и 20:00"),
+        ("FREQ=DAILY;BYHOUR=8,13,20;BYMINUTE=0", "каждый день в 08:00, 13:00 и 20:00"),
+        ("FREQ=WEEKLY;BYDAY=MO;BYHOUR=9,18;BYMINUTE=0", "каждый понедельник в 09:00 и 18:00"),
+        ("FREQ=DAILY;BYDAY=MO,TH;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3", "по пн и чт в 08:30 и 20:00"),
+        ("FREQ=DAILY;BYHOUR=9;BYMINUTE=0;COUNT=5", "каждый день в 09:00, 5 раз"),
+    ],
+)
+def test_describe_times(rule: str, text: str):
+    assert describe_rrule_ru(rule) == text

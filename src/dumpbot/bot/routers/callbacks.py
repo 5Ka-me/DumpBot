@@ -16,7 +16,12 @@ reopen that line without the AI and re-render the list from its buttons (``bot.l
 (``UndoCb``) of an edit applied by description puts back what it changed (``services.undo``).
 
 Iteration 4 (docs/features/iteration-4.md §1): [🔁 Ещё раз] (``AgainCb``) under "🎤 Не разобрал голосовое…"
-transcribes the same voice note again (``processor.retry_unheard``).
+transcribes the same voice note again (``processor.retry_unheard``). §2-3, reminders by item type: [⏰ 3 часа]
+(``s180``); [➡️ След. неделя] / [➡️ След. месяц] (``nw`` / ``nm``) make the item "на следующей неделе" / "в следующем
+месяце"; [💤 Когда-нибудь] (``smd``); [📅 Выбрать день] (``pick``) turns the message into a 7-day picker (``DayCb``
+moves the item to that day, [Другая дата…] is the "🕒 Время" prompt, [← Назад] = ``rem``); [⏹ Хватит повторять] of a
+series and [⏹ Больше не повторять] after its ✅ (``stop``) stop it — every instance still ahead is cancelled with its
+reminders and this one is closed.
 
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
@@ -34,7 +39,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
 
 from dumpbot import clock
-from dumpbot.ai.schemas import EditPatch
+from dumpbot.ai.schemas import EditPatch, When
 from dumpbot.bot import cards, lists, sender, views
 from dumpbot.bot.cbdata import (
     DIGEST_ACTIONS,
@@ -42,13 +47,19 @@ from dumpbot.bot.cbdata import (
     LIST_ACTIONS,
     LIST_EVENING,
     LIST_KINDS,
+    NEXT_SPAN,
     OCC_ACTIONS,
+    OCC_BACK,
+    OCC_PICK,
+    OCC_SOMEDAY,
+    OCC_STOP,
     SNOOZE_ACTIONS,
     SNOOZE_EVENING,
     SNOOZE_MINUTES,
     STEP_ACTIONS,
     AgainCb,
     AskCb,
+    DayCb,
     DigestCb,
     ItemCb,
     KindCb,
@@ -62,7 +73,7 @@ from dumpbot.bot.routers import common
 from dumpbot.bot.states import EditStates
 from dumpbot.db.models import Occurrence, RawMessage
 from dumpbot.domain import timeresolve
-from dumpbot.domain.fmt import fmt_dt, plural_ru
+from dumpbot.domain.fmt import fmt_date, fmt_dt, plural_ru
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
 from dumpbot.services import digest, items, processor, query, undo
 from dumpbot.workers import jobs
@@ -85,6 +96,13 @@ UNDO_ALREADY: Final = "Уже отменено"
 UNDO_STALE: Final = "🤷 Запись уже изменилась — отменить нельзя"
 AGAIN_QUEUED: Final = "🔁 Распознаю ещё раз"
 AGAIN_ALREADY: Final = "Уже распознаю ещё раз…"
+ALREADY_DONE: Final = "Уже сделано"
+NOT_ACTUAL: Final = "Напоминание уже неактуально"
+STOPPED: Final = "⏹ Повтор остановлен"
+ALREADY_STOPPED: Final = "Повтор уже остановлен"
+DAY_PASSED: Final = "Этот день уже прошёл — выбери другой"
+NEXT_SPAN_TOAST: Final[dict[str, str]] = {"nw": "➡️ Перенёс на следующую неделю", "nm": "➡️ Перенёс на следующий месяц"}
+SPAN_TEXT: Final[dict[str, str]] = {"nw": "на следующей неделе", "nm": "в следующем месяце"}
 # Digest buttons sent before the digest day was part of the callback data ("d:tmr").
 OLD_DIGEST_DATA: Final = frozenset(f"{DigestCb.__prefix__}:{a}" for a in DIGEST_ACTIONS)
 
@@ -115,6 +133,7 @@ def make_router() -> Router:
     router.callback_query.register(on_list, ListCb.filter())
     router.callback_query.register(on_undo, UndoCb.filter())
     router.callback_query.register(on_again, AgainCb.filter())
+    router.callback_query.register(on_day, DayCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     # Buttons of an older version (the removed "⏱ Напомнить за…" menu: ItemCb "lead", "l:…"), garbage data.
@@ -164,13 +183,15 @@ async def on_occ(callback: CallbackQuery, callback_data: OccCb, ctx: AppContext)
         item = await common.get_item(session, occ.item_id)
         if item.status == "deleted":
             return Outcome(views.deleted_card(item), common.DELETED)
-        # Snooze buttons exist only on reminders; done/undone also on cards (told apart by bot_messages).
-        on_reminder = action in SNOOZE_ACTIONS or await common.purpose_of(session, ctx, message_id) == "reminder"
-        if action == "done":
-            return await _done(session, item, occ, prefs, now, on_reminder=on_reminder)
-        if action == "undone":
-            return await _undone(session, item, occ, prefs, now, on_reminder=on_reminder)
-        return await _snooze(session, item, occ, action, prefs, now)
+        if action in ("done", "undone"):  # also on cards (told apart by bot_messages); the other ones: reminders
+            on_reminder = await common.purpose_of(session, ctx, message_id) == "reminder"
+            mark = _done if action == "done" else _undone
+            return await mark(session, item, occ, prefs, now, on_reminder=on_reminder)
+        if action == OCC_STOP:
+            return await _stop_series(session, item, occ, prefs, now)
+        if action in SNOOZE_ACTIONS:
+            return await _snooze(session, item, occ, action, prefs, now)
+        return await _reminder_action(session, item, occ, action, prefs, now)
 
     await run(callback, ctx, op)
 
@@ -213,13 +234,20 @@ async def _parent_title(session: AsyncSession, item: Item) -> str | None:
     return parent.title if parent is not None else None
 
 
+def _not_open(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> Outcome | None:
+    """A reminder button pressed when its occurrence is no longer open: done -> the done view, otherwise a toast."""
+    if occ.status == "done":
+        return Outcome(views.reminder_done(item, occ, prefs, now), ALREADY_DONE)
+    if occ.status != "open":
+        return Outcome(None, NOT_ACTUAL)
+    return None
+
+
 async def _snooze(
     session: AsyncSession, item: Item, occ: Occurrence, action: str, prefs: Prefs, now: datetime
 ) -> Outcome:
-    if occ.status == "done":
-        return Outcome(views.reminder_done(item, occ, prefs, now), "Уже сделано")
-    if occ.status != "open":
-        return Outcome(None, "Напоминание уже неактуально")
+    if (stale := _not_open(item, occ, prefs, now)) is not None:
+        return stale
     if action == SNOOZE_EVENING:
         tonight = timeresolve.tonight(now, prefs)
         if tonight <= now:  # an old reminder pressed after the evening slot: the other buttons instead
@@ -235,6 +263,73 @@ async def _snooze(
     # The item's time moved there. No buttons on the snoozed message: the snoozed reminder (of tomorrow's instance,
     # if a series instance was merged into it) comes again with its own.
     return Outcome(views.reminder_snoozed(item, reminder, prefs, now), toast, wake_scheduler=True)
+
+
+async def _reminder_action(
+    session: AsyncSession, item: Item, occ: Occurrence, action: str, prefs: Prefs, now: datetime
+) -> Outcome:
+    """The buttons of a span's reminder (docs/features/iteration-4.md §3): [➡️ След. неделя] / [➡️ След. месяц] make
+    the item "на следующей неделе" / "в следующем месяце" (as the reply «давай на следующей неделе» would);
+    [💤 Когда-нибудь] takes its date away; [📅 Выбрать день] shows the 7-day picker, [← Назад] the reminder again."""
+    if (stale := _not_open(item, occ, prefs, now)) is not None:
+        return stale
+    parent_title = await _parent_title(session, item)
+    if action == OCC_BACK:
+        return Outcome(views.reminder_message(item, occ, None, prefs, now, parent_title=parent_title))
+    if action == OCC_PICK:
+        days = items.picker_days(item, occ, prefs, now)
+        return Outcome(views.day_picker(item, occ, days, prefs, now, parent_title=parent_title))
+    if action == OCC_SOMEDAY:
+        someday = EditPatch(when=When(text="когда-нибудь", period="someday"))
+        await items.apply_patch(session, item.id, someday, prefs, now)
+        return Outcome(views.reminder_someday(item), "💤 Когда-нибудь", wake_scheduler=True)
+    period = NEXT_SPAN[action]
+    when = When(text=SPAN_TEXT[action], period=period)  # the span itself, whatever the item's role was
+    result = await items.apply_patch(session, item.id, EditPatch(when=when), prefs, now)
+    view = views.reminder_moved(result.item, result.occurrence, result.reminders, prefs, now)
+    return Outcome(view, NEXT_SPAN_TOAST[action], wake_scheduler=True)
+
+
+async def _stop_series(session: AsyncSession, item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> Outcome:
+    """[⏹ Хватит повторять] of a series' reminder, [⏹ Больше не повторять] after its ✅ (docs/features/iteration-4.md
+    §2): the repetition stops — every instance still ahead is cancelled with its reminders (one made in advance never
+    comes) and this one is closed (done). The message shows it done, with [↩️ Не сделано]."""
+    if not (item.rec_active and item.rrule):
+        view = views.reminder_done(item, occ, prefs, now) if occ.status == "done" else None
+        return Outcome(view, ALREADY_STOPPED)
+    await items.stop_recurrence(session, item.id, now, close=True, occurrence_id=occ.id, prefs=prefs)  # occ is done
+    view = views.reminder_done(item, occ, prefs, now) if occ.status == "done" else views.reminder_stopped(item)
+    return Outcome(view, STOPPED, wake_scheduler=True)
+
+
+async def on_day(callback: CallbackQuery, callback_data: DayCb, ctx: AppContext) -> None:
+    """A day of the [📅 Выбрать день] picker: the item moves to that day at its own time of day (an item without one:
+    ``task_default_time``), ``items.move_to_day``. A day whose moment has passed by now (an old picker) re-renders the
+    picker with the days still ahead."""
+    day = _digest_day(callback_data.d)
+    if day is None:
+        await common.answer(callback, common.STALE)
+        return
+
+    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
+        occ = await session.get(Occurrence, callback_data.id)
+        if occ is None:
+            raise items.NotFoundError(f"occurrence {callback_data.id} not found")
+        item = await common.get_item(session, occ.item_id)
+        if item.status == "deleted":
+            return Outcome(views.deleted_card(item), common.DELETED)
+        if (stale := _not_open(item, occ, prefs, now)) is not None:
+            return stale
+        days = items.picker_days(item, occ, prefs, now)
+        if day < days[0]:
+            view = views.day_picker(item, occ, days, prefs, now, parent_title=await _parent_title(session, item))
+            return Outcome(view, DAY_PASSED)
+        result = await items.move_to_day(session, occ.id, day, prefs, now)
+        view = views.reminder_moved(result.item, result.occurrence, result.reminders, prefs, now)
+        toast = f"📅 Перенёс на {fmt_date(day, today=now.astimezone(prefs.zone).date())}"
+        return Outcome(view, toast, wake_scheduler=True)
+
+    await run(callback, ctx, op)
 
 
 # --- item cards ----------------------------------------------------------------------------------------------------

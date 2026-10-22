@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from datetime import date, time, timedelta
+from datetime import date, timedelta
 
 import pytest
 
@@ -349,44 +349,130 @@ def test_reminder_message(prefs, at, make_item, make_occ, make_reminder, check_v
     occ = make_occ(due, id=BIG)
     text, kb = check_view(views.reminder_message(make_item(), occ, make_reminder(occ), prefs, due - delta))
     assert lines(text) == ["🔔 <b>Купить наушники</b>"]
-    # 13:00: the evening (19:00) is more than an hour away -> [🌙 Вечером] instead of [⏰ 15 мин]
+    # A one-off at a time (iteration 4, §3): [⏰ 1 час] [⏰ 3 часа] [📅 Завтра] at any hour, no 🌙 any more.
     assert buttons(kb) == [
         ("✅ Готово", f"o:done:{BIG}"),
         ("⏰ 1 час", f"o:s60:{BIG}"),
-        ("🌙 Вечером", f"o:eve:{BIG}"),
+        ("⏰ 3 часа", f"o:s180:{BIG}"),
         ("📅 Завтра", f"o:tmr:{BIG}"),
     ]
     assert [len(row) for row in kb.inline_keyboard] == [1, 3]
 
 
+@pytest.mark.parametrize("hour", [0, 10, 18, 23])
+@pytest.mark.parametrize("precision", ["exact", "slot", "relative", "date", "default", "fallback"])
+def test_one_off_reminder_buttons_at_any_hour(prefs, at, make_item, make_occ, buttons, hour, precision):
+    now = at(2026, 10, 6, hour, 0)
+    occ = make_occ(now, precision=precision)
+    labels = [label for label, _ in buttons(views.reminder_message(make_item(), occ, None, prefs, now)[1])]
+    assert labels == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
+    assert views.reminder_kind(make_item(), occ) == "timed"
+
+
 @pytest.mark.parametrize(
-    ("hour", "minute", "evening"),
-    [(0, 30, True), (10, 0, True), (17, 59, True), (18, 0, False), (18, 30, False), (19, 0, False), (23, 0, False)],
+    ("item_kw", "precision", "nxt"),
+    [
+        ({"period_kind": "week", "period_start": date(2026, 10, 5), "period_end": date(2026, 10, 11)}, "period", "nw"),
+        ({"period_kind": "season", "period_start": date(2026, 9, 1), "period_end": date(2026, 11, 30)}, "period", "nw"),
+        ({"period_kind": "soon"}, "soon", "nw"),
+        ({"when_spec": {"role": "deadline"}}, "date", "nw"),
+        ({"when_spec": {"role": "deadline", "time": "15:00"}}, "exact", "nw"),
+        ({"period_kind": "month", "period_start": date(2026, 10, 1), "period_end": date(2026, 10, 31)}, "period", "nm"),
+    ],
 )
-def test_reminder_offers_the_evening_until_an_hour_before_it(
-    prefs, at, make_item, make_occ, make_reminder, buttons, hour, minute, evening
-):
-    now = at(2026, 10, 6, hour, minute)
+def test_span_reminder_buttons(prefs, now, make_item, make_occ, check_view, buttons, item_kw, precision, nxt):
+    """A week / month / season, "на днях", a deadline (iteration 4, §3): [➡️ След. неделя] (a month: «След. месяц»)
+    [📅 Выбрать день] [💤 Когда-нибудь]."""
+    item = make_item(**item_kw)
+    occ = make_occ(now, id=BIG, precision=precision)
+    _, kb = check_view(views.reminder_message(item, occ, None, prefs, now))
+    label = "➡️ След. месяц" if nxt == "nm" else "➡️ След. неделя"
+    assert buttons(kb) == [
+        ("✅ Готово", f"o:done:{BIG}"),
+        (label, f"o:{nxt}:{BIG}"),
+        ("📅 Выбрать день", f"o:pick:{BIG}"),
+        ("💤 Когда-нибудь", f"o:smd:{BIG}"),
+    ]
+    assert [len(row) for row in kb.inline_keyboard] == [1, 3]
+    assert views.reminder_kind(item, occ) == "span"
+
+
+def test_series_reminder_buttons(prefs, now, make_item, make_occ, check_view, buttons):
+    item = make_item(rrule="FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", rec_active=True)
     occ = make_occ(now, id=BIG)
-    _, kb = views.reminder_message(make_item(), occ, make_reminder(occ), prefs, now)
-    labels = [label for label, _ in buttons(kb)]
-    if evening:
-        assert labels == ["✅ Готово", "⏰ 1 час", "🌙 Вечером", "📅 Завтра"]
-    else:
-        assert labels == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
-    assert views.offers_evening(prefs, now) is evening
+    text, kb = check_view(views.reminder_message(item, occ, None, prefs, now))
+    assert lines(text) == ["🔔 <b>Купить наушники</b>", "🔁 каждый день в 09:00 и 18:00"]
+    assert buttons(kb) == [
+        ("✅ Готово", f"o:done:{BIG}"),
+        ("⏰ 1 час", f"o:s60:{BIG}"),
+        ("⏹ Хватит повторять", f"o:stop:{BIG}"),
+    ]
+    assert views.reminder_kind(item, occ) == "series"
+    stopped = make_item(rrule="FREQ=DAILY", rec_active=False)  # a stopped series' last reminder: a one-off's buttons
+    assert views.reminder_kind(stopped, occ) == "timed"
 
 
-def test_reminder_evening_follows_the_evening_slot(prefs, at, make_item, make_occ, buttons):
-    late_evening = Prefs(slot_evening=time(21, 0))
-    now = at(2026, 10, 6, 19, 30)  # 19:30: an hour and a half before a 21:00 evening
-    occ = make_occ(now)
-    assert "🌙 Вечером" in [
-        label for label, _ in buttons(views.reminder_message(make_item(), occ, None, late_evening, now)[1])
+def test_reminder_done_of_a_series_offers_to_stop_it(prefs, now, at, make_item, make_occ, check_view, buttons):
+    occ = make_occ(at(2026, 10, 6, 9, 0), id=BIG, status="done")
+    series = make_item(rrule="FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", rec_active=True)
+    text, kb = check_view(views.reminder_done(series, occ, prefs, now))
+    assert lines(text) == [
+        "✅ <s>Купить наушники</s>",
+        "<i>сегодня 09:00 · сделано</i>",
+        "🔁 каждый день в 09:00 и 18:00",
     ]
-    assert "🌙 Вечером" not in [
-        label for label, _ in buttons(views.reminder_message(make_item(), occ, None, prefs, now)[1])
+    assert buttons(kb) == [("↩️ Не сделано", f"o:undone:{BIG}"), ("⏹ Больше не повторять", f"o:stop:{BIG}")]
+    stopped = make_item(rrule="FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", rec_active=False)
+    text, kb = check_view(views.reminder_done(stopped, occ, prefs, now))
+    assert lines(text)[-1] == "🔁 повтор остановлен"
+    assert buttons(kb) == [("↩️ Не сделано", f"o:undone:{BIG}")]
+
+
+def test_day_picker(prefs, now, make_item, make_occ, check_view, buttons):
+    item = make_item(id=BIG, period_kind="week", period_start=date(2026, 10, 5), period_end=date(2026, 10, 11))
+    occ = make_occ(now, id=BIG, item_id=BIG, precision="period")
+    days = [date(2026, 10, 6) + timedelta(days=i) for i in range(7)]
+    text, kb = check_view(views.day_picker(item, occ, days, prefs, now, parent_title="Переезд"))
+    assert lines(text) == [
+        "🔔 <b>Купить наушники</b>",
+        "🗓 на этой неделе (до вс 11 окт)",
+        "↳ шаг из «Переезд»",
+        "",
+        "📅 На какой день перенести?",
     ]
+    assert buttons(kb) == [
+        ("вт 6", f"dy:{BIG}:20261006"),
+        ("ср 7", f"dy:{BIG}:20261007"),
+        ("чт 8", f"dy:{BIG}:20261008"),
+        ("пт 9", f"dy:{BIG}:20261009"),
+        ("сб 10", f"dy:{BIG}:20261010"),
+        ("вс 11", f"dy:{BIG}:20261011"),
+        ("пн 12", f"dy:{BIG}:20261012"),
+        ("Другая дата…", f"i:time:{BIG}"),
+        ("← Назад", f"o:rem:{BIG}"),
+    ]
+    assert [len(row) for row in kb.inline_keyboard] == [4, 3, 1, 1]
+
+
+def test_reminder_moved_someday_and_stopped(prefs, now, at, make_item, make_occ, make_reminder, check_view, buttons):
+    item = make_item(period_kind="week", period_start=date(2026, 10, 12), period_end=date(2026, 10, 18))
+    occ = make_occ(at(2026, 10, 16, 19, 0), precision="period")
+    rems = [make_reminder(occ, 0), make_reminder(occ, 0, id=7, fire_at=at(2026, 10, 12, 10, 0))]
+    text, kb = check_view(views.reminder_moved(item, occ, rems, prefs, now))
+    assert lines(text) == [
+        "🔔 <b>Купить наушники</b>",
+        "➡️ перенёс · 🗓 на следующей неделе (до вс 18 окт) · 🔔 пн 10:00, пт 16 окт 19:00",
+    ]
+    assert kb is None
+    day = make_occ(at(2026, 10, 8, 19, 0))
+    text, _ = check_view(views.reminder_moved(make_item(), day, [make_reminder(day)], prefs, now))
+    assert lines(text)[1] == "➡️ перенёс · 🔔 чт 8 окт 19:00"
+    assert check_view(views.reminder_someday(make_item(title="A<B")))[0] == (
+        "🔔 <b>A&lt;B</b>\n💤 отложил на когда-нибудь — запись в /someday"
+    )
+    assert check_view(views.reminder_stopped(make_item()))[0] == (
+        "🔔 <b>Купить наушники</b>\n⏹ повтор остановлен — больше не напомню"
+    )
 
 
 @pytest.mark.parametrize(
@@ -827,7 +913,9 @@ def test_help_text_lists_all_commands(check_view):
         assert f"\n{command} " in text
     assert "«?»" in text and "reply" in text
     assert "аудиофайлы (до 5 мин)" in text and "кружочки сохраняю без распознавания" in text
-    assert "🌙 на вечер" in text and "✅ 1 ✅ 2" in text and "↩️" in text  # iteration 3: §4 and §2
+    assert "✅ 1 ✅ 2" in text and "↩️" in text  # iteration 3, §2 (§4's 🌙 is gone: iteration 4, §3)
+    assert "⏰ на 1 или 3 часа" in text and "📅 выбрать день" in text and "💤 когда-нибудь" in text  # iteration 4, §3
+    assert "«каждый день в 9 и 18»" in text and "«⏹ Хватит повторять»" in text  # §2
 
 
 # --- settings ----------------------------------------------------------------------------------------------------
@@ -1032,6 +1120,6 @@ def test_all_builders_with_huge_ids(prefs, now, make_item, make_occ, make_remind
     ]
     for view in built:
         check_view(view)
-    occ_cbs = {OccCb(a=a, id=BIG).pack() for a in ("done", "s60", "eve", "tmr")}
+    occ_cbs = {OccCb(a=a, id=BIG).pack() for a in ("done", "s60", "stop")}  # a series' reminder
     reminder_kb = built[5][1]
     assert {b.callback_data for row in reminder_kb.inline_keyboard for b in row} == occ_cbs

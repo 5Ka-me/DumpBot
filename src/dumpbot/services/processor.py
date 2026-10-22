@@ -57,7 +57,7 @@ import io
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 from typing import Any, Final
 
 import aiohttp
@@ -75,8 +75,8 @@ from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QueryS
 from dumpbot.ai.stt import GarbageTranscript
 from dumpbot.bot import cards, sender, views
 from dumpbot.context import AppContext
-from dumpbot.db.models import Job, OnceKey, RawMessage
-from dumpbot.domain import quiet, timeresolve
+from dumpbot.db.models import Item, Job, OnceKey, RawMessage
+from dumpbot.domain import phrases, quiet, recurrence, timeresolve
 from dumpbot.domain.fmt import fmt_date
 from dumpbot.domain.kinds import ACTIONABLE, SourceKind
 from dumpbot.domain.prefs import Prefs
@@ -247,19 +247,23 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         return
     prefs = await _prefs(ctx)
     now = _msg_now(raw)
+    out: ExtractOutput | None = None
     try:
         # A picked candidate re-reads an already processed message: reuse its OCR text instead of the pictures.
         content = await _gather(ctx, [raw], prefs, with_images=not raw.image_text)
         if content.unheard:  # a voice reply that is not speech: no edit, "Не разобрал" with [🔁 Ещё раз]
             await _unheard(ctx, [raw], prefs, {"kind": "edit", "payload": {"raw_id": raw.id, "item_id": item_id}})
             return
-        await _check_budget(ctx, prefs, [raw])
         async with ctx.sessionmaker() as session:
             snapshot = await items_svc.item_snapshot(session, item_id, prefs, now)
-        out = await _extract(ctx, prefs, _extract_input(content, raw, prefs, reply_item=snapshot))
-        if out.extraction.intent == "query" and out.extraction.query is not None:  # "?…" wins over the reply
-            await _reply_query(ctx, [raw], content, out.extraction.query, prefs, _image_text(out.extraction))
-            return
+        # «Закрывай вообще», «хватит повторять» and nothing more (iteration 4, §2): no AI needed to stop the series
+        # (a one-off: done) — nor any budget.
+        if content.force_query or content.images or not phrases.only_stop_request(content.text):
+            await _check_budget(ctx, prefs, [raw])
+            out = await _extract(ctx, prefs, _extract_input(content, raw, prefs, reply_item=snapshot))
+            if out.extraction.intent == "query" and out.extraction.query is not None:  # "?…" wins over the reply
+                await _reply_query(ctx, [raw], content, out.extraction.query, prefs, _image_text(out.extraction))
+                return
     except items_svc.NotFoundError:
         await _tell(ctx, [raw], ITEM_GONE_TEXT, prefs=prefs, purpose="answer")
         await _mark_done(ctx, [raw], None)
@@ -274,8 +278,11 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         await _give_up(ctx, prefs, [raw], FAILED_EDIT_TEXT, e, reply_to=raw.message_id)
         return
 
-    patch = out.extraction.edit or EditPatch()
-    image_text = _image_text(out.extraction)
+    if out is None:
+        patch, image_text = EditPatch(action="stop_recurrence"), None
+    else:
+        patch = stop_phrase_patch(out.extraction.edit or EditPatch(), content.text)
+        image_text = _image_text(out.extraction)
     if patch.action == "split":  # "разбей на шаги" in reply to the card
         await _split(ctx, prefs, item_id, now=now, note=content.text, raws=[raw], once_key=key, image_text=image_text)
         return
@@ -283,6 +290,8 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         if not await try_once(session, key):
             return  # applied concurrently
         result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
+        if patch.rrule and (lost := lost_times_warning(content.text, result.item)) is not None:
+            result.warnings.append(lost)
         view = await _patch_view(session, result, prefs, heard=_heard([raw]))
         fresh = await _reload(session, [raw])
         _finish(fresh, image_text)
@@ -784,7 +793,8 @@ async def _save(
         else:
             created = await items_svc.create_items(session, raw=head, **kwargs)
         quiet_chat = ask is not None or _is_app(fresh)  # the Mini App reads the items, no cards
-        shown = [] if quiet_chat else await _cards(session, created, prefs, now_view, every=note is not None)
+        lost = _lost_times(content.text, created, prefs)
+        shown = [] if quiet_chat else await _cards(session, created, prefs, now_view, every=note is not None, lost=lost)
         if ask is not None:
             head.raw_json = {**(head.raw_json or {}), ASK_KEY: ask.model_dump(mode="json")}
         _finish(fresh, image_text)
@@ -828,19 +838,83 @@ async def _save(
 
 
 async def _cards(
-    session: AsyncSession, created: Sequence[CreatedItem], prefs: Prefs, now: datetime, *, every: bool = False
+    session: AsyncSession,
+    created: Sequence[CreatedItem],
+    prefs: Prefs,
+    now: datetime,
+    *,
+    every: bool = False,
+    lost: dict[int, str] | None = None,
 ) -> list[tuple[CreatedItem, View]]:
     """Cards for items with reminders, actionable kinds, a checklist or related items, or something to confirm
-    (``every``: all items); the rest only get 👌."""
+    (``every``: all items); the rest only get 👌. ``lost``: one more warning by item id (``_lost_times``)."""
     out: list[tuple[CreatedItem, View]] = []
     for c in created:
         res = c.resolution
+        warnings = [*res.warnings, *filter(None, [(lost or {}).get(c.item.id)])]
         extras = await query.card_extras(session, c.item)
-        shown = every or c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or res.warnings
+        shown = every or c.reminders or c.item.kind in ACTIONABLE or res.needs_confirm or warnings
         if shown or extras.steps or extras.related:
-            view = views.item_card(c.item, c.occurrence, c.reminders, prefs, now, warnings=res.warnings, extras=extras)
+            view = views.item_card(c.item, c.occurrence, c.reminders, prefs, now, warnings=warnings, extras=extras)
             out.append((c, view))
     return out
+
+
+def _lost_times(text: str, created: Sequence[CreatedItem], prefs: Prefs) -> dict[int, str]:
+    """«⚠️ понял только 09:00» for the series of a message that named more times than its items kept (iteration 4,
+    §2: "каждый день в 9:00 и 18:00" saved with 09:00 only). The times of all items of the message count — "в 9 пить
+    таблетки, в 18 гулять" may well be two series — compared on a 12-hour dial (``phrases.lost_times``)."""
+    named = phrases.clock_times(text)
+    series = [c.item for c in created if c.item.rec_active and c.item.rrule]
+    if len(named) < 2 or not series:
+        return {}
+    kept = {c.item.id: _kept_times(c, prefs) for c in created}
+    if not phrases.lost_times(named, [t for times in kept.values() for t in times]):
+        return {}
+    return {item.id: phrases.understood_only(kept[item.id]) for item in series if kept[item.id]}
+
+
+def _kept_times(created: CreatedItem, prefs: Prefs) -> list[time]:
+    """The times of day an item keeps: a series its rule's ones (``_series_times``), a one-off at a time of day the
+    time stated for it."""
+    item, res = created.item, created.resolution
+    if item.rrule:
+        return _series_times(item)
+    at = res.stated_at or res.due_at
+    if at is None or res.precision not in ("exact", "slot", "relative"):
+        return []
+    return [at.astimezone(prefs.zone).time()]
+
+
+def _series_times(item: Item) -> list[time]:
+    """The times of day of a series: its rule's own ("каждый день в 9 и 18"), else the one it started at."""
+    start = item.rec_dtstart_local
+    return list(recurrence.rule_times(item.rrule)) or ([start.time()] if start is not None else [])
+
+
+def lost_times_warning(text: str, item: Item) -> str | None:
+    """«понял только 09:00» for a series an edit gave a rule ("каждый день в 9 и 18" in reply to a card) that kept
+    fewer times than the message named; None when nothing was lost (or the item is no active series)."""
+    if not (item.rec_active and item.rrule):
+        return None
+    named = phrases.clock_times(text)
+    kept = _series_times(item)
+    if len(named) < 2 or not kept or not phrases.lost_times(named, kept):
+        return None
+    return phrases.understood_only(kept)
+
+
+def stop_phrase_patch(patch: EditPatch, text: str) -> EditPatch:
+    """«Больше не напоминай», «закрывай вообще», «хватит повторять», «останови повтор» (iteration 4, §2) are a stop
+    whatever the model made of them: "done" or "no_reminder" (or an update without a new time) become
+    ``stop_recurrence`` — a series stops and its instance already due is closed, a one-off is done
+    (``items.apply_patch``). A patch with a new time, a split or a delete stays as it is."""
+    if not phrases.stop_request(text):
+        return patch
+    timed = patch.when is not None or bool(patch.rrule) or bool(patch.lead)
+    if patch.action in ("done", "no_reminder") or (patch.action == "update" and not timed):
+        return patch.model_copy(update={"action": "stop_recurrence"})
+    return patch
 
 
 async def _send_ask(ctx: AppContext, prefs: Prefs, raws: list[RawMessage], ask: Ask) -> None:
@@ -944,7 +1018,7 @@ async def _edit_by_target(
     task worded like an edit («удалить приложение банка»). New items the model found in the same message ("купил
     молоко, хлеба не было — купить завтра") are saved as well, after the edit (``_with_items``)."""
     primary = raws[0]
-    patch = out.extraction.edit or EditPatch()
+    patch = stop_phrase_patch(out.extraction.edit or EditPatch(), content.text)
     image_text = _image_text(out.extraction)
     now = _msg_now(primary)
     target = patch.target or ""
@@ -1013,6 +1087,8 @@ async def _apply_edit(
         item = await items_svc.get_item(session, item_id)
         if item is not None and item.status != "deleted":
             applied = await undo.apply(session, item_id, patch, prefs, now)
+            if patch.rrule and (lost := lost_times_warning(_said(raws), applied.result.item)) is not None:
+                applied.result.warnings.append(lost)
         fresh = await _reload(session, raws)
         _finish(fresh, image_text)
         if applied is None:
@@ -1844,6 +1920,11 @@ async def _react(ctx: AppContext, raws: Sequence[RawMessage], emoji: str) -> Non
 def _clarified_key(raw_id: int) -> str:
     """once_keys marker of an applied clarification (not the job's dedupe key ``clarify:{raw_id}``)."""
     return f"clarify-done:{raw_id}"
+
+
+def _said(raws: Sequence[RawMessage]) -> str:
+    """What the owner said in a message: its texts and voice transcripts."""
+    return _join(*(part for raw in raws for part in (raw.text, raw.transcript)))
 
 
 def _heard(raws: Sequence[RawMessage]) -> str | None:

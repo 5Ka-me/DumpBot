@@ -85,7 +85,7 @@ async def test_due_reminder_is_sent_with_buttons_and_marked_sent(
     assert msg["text"] == "🔔 <b>Созвон</b>"  # no "через 5 мин": it comes at the item's time
     occ_id = meeting.occurrence.id
     assert OccCb(a="done", id=occ_id).pack() in buttons(msg)
-    assert OccCb(a="eve", id=occ_id).pack() in buttons(msg)  # 10:55: [🌙 Вечером] rather than [⏰ 15 мин]
+    assert OccCb(a="s180", id=occ_id).pack() in buttons(msg)  # iteration 4, §3: [⏰ 3 часа], no 🌙 any more
     stored = await get(Reminder, reminder.id)
     assert (stored.status, stored.sent_at, stored.tg_message_id, stored.claimed_at) == ("sent", now, 9001, None)
     [bm] = await bot_messages()

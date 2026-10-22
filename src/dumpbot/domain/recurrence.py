@@ -3,6 +3,10 @@
 Rules are RFC 5545 RRULEs without DTSTART. They are expanded with a *naive* local DTSTART so a 09:00 rule stays
 09:00 across DST switches, and every occurrence is then mapped to UTC with ``localize``.
 
+Several times a day (docs/features/iteration-4.md §2: "каждый день в 9:00 и 18:00") are one rule with ``BYHOUR`` /
+``BYMINUTE`` (every hour with every minute, as RFC 5545 says); times whose minutes differ ("в 8:30 и 20:00") are picked
+out of that product by ``BYSETPOS`` of a daily rule (``with_times``). ``rule_times`` reads them back.
+
 ``localize`` lives here (and is re-exported by ``domain.timeresolve``, its contract home) because both this module
 and ``domain.quiet`` need it while ``timeresolve`` imports them.
 """
@@ -10,18 +14,21 @@ and ``domain.quiet`` need it while ``timeresolve`` imports them.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Final
 from zoneinfo import ZoneInfo
 
 from dateutil.rrule import rrule, rrulestr
 
-from dumpbot.domain.fmt import MONTHS_SHORT, WEEKDAYS_SHORT, plural_ru
+from dumpbot.domain.fmt import MONTHS_SHORT, WEEKDAYS_SHORT, fmt_time, plural_ru
 
 ALLOWED_KEYS: Final[frozenset[str]] = frozenset(
-    {"FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "BYSETPOS", "COUNT", "UNTIL", "WKST"}
+    {"FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "BYSETPOS", "COUNT", "UNTIL", "WKST", "BYHOUR", "BYMINUTE"}
 )
 DAY_CODES: Final[tuple[str, ...]] = ("MO", "TU", "WE", "TH", "FR", "SA", "SU")
+TIME_KEYS: Final[frozenset[str]] = frozenset({"BYHOUR", "BYMINUTE"})
+MAX_DAY_TIMES: Final = 24  # times of day one rule may name (BYHOUR x BYMINUTE)
 
 _INT_RE = re.compile(r"^[+-]?\d{1,4}$")
 _BYDAY_RE = re.compile(r"^([+-]?\d{1,2})?(MO|TU|WE|TH|FR|SA|SU)$")
@@ -68,6 +75,8 @@ def normalize_rrule(rule: str) -> str:
         raise ValueError("RRULE without FREQ")
     if "COUNT" in parts and "UNTIL" in parts:
         raise ValueError("RRULE with both COUNT and UNTIL")
+    if len(_ints(parts.get("BYHOUR", "0"))) * len(_ints(parts.get("BYMINUTE", "0"))) > MAX_DAY_TIMES:
+        raise ValueError("RRULE names too many times of day")
     normalized = _join({"FREQ": parts.pop("FREQ"), **parts})
     _ensure_occurs(normalized)
     return normalized
@@ -96,7 +105,8 @@ def next_occurrence(
 
 def describe_rrule_ru(rule: str) -> str:
     """Human description: "каждый день", "каждый понедельник", "по пн и чт", "каждые 2 недели",
-    "5-го числа каждого месяца", "в последнюю пятницу месяца", "каждый год 1 янв", "…, 5 раз", "…, до 31 дек 2026".
+    "5-го числа каждого месяца", "в последнюю пятницу месяца", "каждый год 1 янв", "…, 5 раз", "…, до 31 дек 2026";
+    a rule with times of day of its own names them: "каждый день в 09:00 и 18:00" (iteration 4, §2).
 
     Rules this function cannot phrase are returned as the (normalized) RRULE text.
     """
@@ -104,11 +114,13 @@ def describe_rrule_ru(rule: str) -> str:
         normalized = normalize_rrule(rule)
     except ValueError:
         return (rule or "").strip()
-    parts = _split(normalized)
+    parts = _split(without_times(normalized))
     try:
         text = _describe_base(parts)
     except _Exotic:
         return normalized
+    if times := rule_times(normalized):
+        text += " в " + _list_ru([fmt_time(t) for t in times])
     if "COUNT" in parts:
         n = int(parts["COUNT"])
         text += f", {n} {plural_ru(n, 'раз', 'раза', 'раз')}"
@@ -118,11 +130,84 @@ def describe_rrule_ru(rule: str) -> str:
     return text
 
 
+def rule_times(rule: str | None) -> tuple[time, ...]:
+    """The times of day a rule names itself (``BYHOUR`` x ``BYMINUTE``, a daily ``BYSETPOS`` picking some of them),
+    earliest first; () when its time comes from DTSTART (no BYHOUR / BYMINUTE) or the rule is invalid. A missing
+    BYMINUTE (or BYHOUR) is DTSTART's, read here as 0: ``complete_times`` writes it into the rule of a new series."""
+    try:
+        parts = _split(normalize_rrule(rule or ""))
+    except ValueError:
+        return ()
+    if not TIME_KEYS & parts.keys():
+        return ()
+    hours = sorted(_ints(parts.get("BYHOUR", "0")))
+    minutes = sorted(_ints(parts.get("BYMINUTE", "0")))
+    product = [time(h, m) for h in hours for m in minutes]
+    if _time_setpos(parts):
+        picked = {p - 1 if p > 0 else len(product) + p for p in _ints(parts["BYSETPOS"])}
+        product = [t for i, t in enumerate(product) if i in picked]
+    return tuple(product)
+
+
+def complete_times(rule: str, at: time) -> str:
+    """The rule with both ``BYHOUR`` and ``BYMINUTE`` when it has one of them: the other one is taken from ``at``
+    (the series' DTSTART time, as RFC 5545 does), so the stored rule names its times by itself ("в 9:30 и 18:30" read
+    as BYHOUR=9,18 at 09:30 -> BYMINUTE=30). Other rules are returned normalized. Raises ValueError for a bad rule."""
+    parts = _split(normalize_rrule(rule))
+    if TIME_KEYS & parts.keys():
+        parts.setdefault("BYHOUR", str(at.hour))
+        parts.setdefault("BYMINUTE", str(at.minute))
+    return normalize_rrule(_join(parts))
+
+
+def with_times(rule: str, times: Sequence[time]) -> str | None:
+    """The rule naming exactly ``times`` on each day it falls on, or None when that cannot be written. One time, or
+    several sharing their minutes, are ``BYHOUR`` / ``BYMINUTE``; others ("8:30 и 20:00") are their product picked by
+    ``BYSETPOS``, which selects per day only in a daily rule — a weekly one every week with its days in BYDAY is
+    written as the daily rule with that BYDAY; a rule already using BYSETPOS for its days cannot take it. Raises
+    ValueError for a bad rule."""
+    wanted = sorted(set(times))
+    if not wanted:
+        return None
+    parts = _split(without_times(rule))
+    if "BYSETPOS" in parts and len(wanted) > 1:  # it picks days ("в первый будний день"): it would pick one time
+        return None
+    hours = sorted({t.hour for t in wanted})
+    minutes = sorted({t.minute for t in wanted})
+    parts["BYHOUR"] = ",".join(map(str, hours))
+    parts["BYMINUTE"] = ",".join(map(str, minutes))
+    product = [time(h, m) for h in hours for m in minutes]
+    if len(product) == len(wanted):
+        return normalize_rrule(_join(parts))
+    if parts["FREQ"] == "WEEKLY":
+        if parts.get("INTERVAL", "1") != "1" or "BYDAY" not in parts or any(p for p, _ in _byday(parts)):
+            return None
+        parts["FREQ"] = "DAILY"
+        parts.pop("WKST", None)
+    if parts["FREQ"] != "DAILY":
+        return None
+    parts["BYSETPOS"] = ",".join(str(product.index(t) + 1) for t in wanted)
+    return normalize_rrule(_join(parts))
+
+
+def without_times(rule: str) -> str:
+    """The rule without times of day of its own: the days it falls on only. Raises ValueError for a bad rule."""
+    parts = _split(normalize_rrule(rule))
+    if _time_setpos(parts):
+        parts.pop("BYSETPOS")
+    return _join({k: v for k, v in parts.items() if k not in TIME_KEYS})
+
+
 # --- parsing / validation ---------------------------------------------------------------------------------
 
 
 def _split(rule: str) -> dict[str, str]:
     return dict(chunk.split("=", 1) for chunk in rule.split(";") if chunk)
+
+
+def _time_setpos(parts: dict[str, str]) -> bool:
+    """BYSETPOS picks times of day (a daily rule with BYHOUR / BYMINUTE), not days of a month or a year."""
+    return parts.get("FREQ") == "DAILY" and "BYSETPOS" in parts and bool(TIME_KEYS & parts.keys())
 
 
 def _join(parts: dict[str, str]) -> str:
@@ -159,6 +244,10 @@ def _check_value(key: str, value: str) -> None:
             _check_range(_ints(value), 1, 12, signed=False)
         case "BYSETPOS":
             _check_range(_ints(value), 1, 366, signed=True)
+        case "BYHOUR":
+            _check_clock(_ints(value), 23)
+        case "BYMINUTE":
+            _check_clock(_ints(value), 59)
         case "BYDAY":
             for item in value.split(","):
                 m = _BYDAY_RE.match(item)
@@ -169,6 +258,12 @@ def _check_value(key: str, value: str) -> None:
                 raise ValueError(f"bad WKST: {value}")
         case "UNTIL":
             _parse_until(value)
+
+
+def _check_clock(values: list[int], high: int) -> None:
+    """BYHOUR 0..23 / BYMINUTE 0..59: no signs, no repeats."""
+    if len(set(values)) != len(values) or any(not 0 <= v <= high for v in values):
+        raise ValueError(f"bad time values: {values}")
 
 
 def _one_int(value: str) -> list[int]:

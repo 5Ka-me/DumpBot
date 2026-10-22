@@ -21,7 +21,7 @@ from aiogram import BaseMiddleware
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from dumpbot.bot.cbdata import ItemCb, KindCb, ListCb, OccCb, PickCb, SubCb, UndoCb
+from dumpbot.bot.cbdata import DayCb, ItemCb, KindCb, ListCb, OccCb, PickCb, SubCb, UndoCb
 from dumpbot.services import events
 
 if TYPE_CHECKING:
@@ -42,7 +42,7 @@ ITEM_FIELD: Final[dict[type[CallbackData], str]] = {
     UndoCb: "item",
     ListCb: "i",
 }
-OCC_FIELD: Final[dict[type[CallbackData], str]] = {OccCb: "id", ListCb: "o"}
+OCC_FIELD: Final[dict[type[CallbackData], str]] = {OccCb: "id", ListCb: "o", DayCb: "id"}
 
 
 class CommandJournal(BaseMiddleware):

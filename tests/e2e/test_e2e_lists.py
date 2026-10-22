@@ -1,8 +1,8 @@
 """End-to-end: [✅ N] under /today and the digests, [🌙 Вечером] in reminders (docs/features/iteration-3.md §2, §4).
 
 /today -> [✅ 2] -> the same list edited in place (the line struck through, [↩️ 2]) -> [↩️ 2] -> open again; the evening
-digest's [✅ 1] next to [📅 Перенести невыполненное на завтра]; a reminder at 10:00 offers [🌙 Вечером], which moves the
-item to 19:00, while the one at 18:30 offers [⏰ 15 мин].
+digest's [✅ 1] next to [📅 Перенести невыполненное на завтра]; new reminders offer [⏰ 1 час] [⏰ 3 часа] [📅 Завтра]
+(iteration 4, §3), while an old [🌙 Вечером] still moves the item to 19:00.
 
 Harness: conftest.py (``e2e``); the clock starts on Tue 2026-10-06 10:12 Europe/Warsaw.
 """
@@ -123,35 +123,36 @@ async def test_evening_button_on_a_morning_reminder(e2e: Any) -> None:
     )
     bank = await e2e.item("Позвонить в банк")
 
-    # Wed 10:00: the evening is far -> [⏰ 1 час] [🌙 Вечером] [📅 Завтра]
+    # Wed 10:00: [⏰ 1 час] [⏰ 3 часа] [📅 Завтра] (iteration 4, §3: no 🌙 on new reminders)
     sent_before = len(e2e.tg.sent)
     await e2e.tick(local(2026, 10, 7, 10, 0))
     [reminder] = [c for c in e2e.tg.sent[sent_before:] if c.text.startswith("🔔 ")]
     assert reminder.text == "🔔 <b>Позвонить в банк</b>"
-    assert labels(reminder) == ["✅ Готово", "⏰ 1 час", "🌙 Вечером", "📅 Завтра"]
+    assert labels(reminder) == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
 
-    # [🌙 Вечером] at 10:01: the item moves to 19:00 today
+    # an old [🌙 Вечером] (a reminder sent before) at 10:01: the item moves to 19:00 today
     e2e.clock.set(local(2026, 10, 7, 10, 1))
-    edit = await press(e2e, reminder, reminder.button("o:eve:"))
+    [occ] = await e2e.occurrences(bank.id)
+    edit = await press(e2e, reminder, f"o:eve:{occ.id}")
     assert edit.text == "🔔 <b>Позвонить в банк</b>\n💤 отложено · напомню сегодня в 19:00"
     assert edit.buttons == []
     assert e2e.tg.toasts() == ["🌙 Напомню сегодня 19:00"]
     [occ] = await e2e.occurrences(bank.id)
     assert (wall(occ.due_at), occ.status) == ("2026-10-07 19:00", "open")
 
-    # 18:30: less than an hour before the evening -> [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]
+    # 18:30: the same buttons at any hour
     sent_before = len(e2e.tg.sent)
     await e2e.tick(local(2026, 10, 7, 18, 30))
     [parcel] = e2e.tg.sent[sent_before:]
     assert parcel.text == "🔔 <b>Забрать посылку</b>"
-    assert labels(parcel) == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
+    assert labels(parcel) == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
 
     # 19:00: the bank call comes again
     sent_before = len(e2e.tg.sent)
     await e2e.tick(local(2026, 10, 7, 19, 0))
     [again] = e2e.tg.sent[sent_before:]
     assert again.text == "🔔 <b>Позвонить в банк</b>"
-    assert labels(again) == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
+    assert labels(again) == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
     assert [(r.status, wall(r.fire_at)) for r in await e2e.reminders(bank.id)] == [
         ("sent", "2026-10-07 10:00"),
         ("sent", "2026-10-07 19:00"),

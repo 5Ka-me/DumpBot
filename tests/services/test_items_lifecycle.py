@@ -575,7 +575,8 @@ async def test_stop_recurrence_patch_cancels_the_next_instance_too(session, make
     [c] = await make(DAILY_9, now=local(2026, 10, 6, 8, 0))
     await items.ensure_recurring(session, prefs, local(2026, 10, 6, 9, 1))
     await items.apply_patch(session, c.item.id, EditPatch(action="stop_recurrence"), prefs, local(2026, 10, 6, 12, 0))
-    assert [o.status for o in await occurrences_of(c.item.id)] == ["open", "cancelled"]
+    # iteration 4, §2: a stop asked for by an edit also closes the instance already due
+    assert [o.status for o in await occurrences_of(c.item.id)] == ["done", "cancelled"]
 
 
 async def test_move_to_tomorrow_after_midnight_is_the_day_that_has_started(session, make, local, now, prefs):

@@ -9,10 +9,26 @@ from typing import Final, Literal
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-from dumpbot.bot.cbdata import DIGEST_DAY_FMT, SNOOZE_EVENING, DigestCb, ItemCb, ListCb, OccCb, SubCb, UndoCb
+from dumpbot.bot.cbdata import (
+    DIGEST_DAY_FMT,
+    OCC_BACK,
+    OCC_PICK,
+    OCC_SOMEDAY,
+    OCC_STOP,
+    DayCb,
+    DigestCb,
+    ItemCb,
+    ListCb,
+    OccCb,
+    SubCb,
+    UndoCb,
+)
+from dumpbot.domain.fmt import WEEKDAYS_SHORT
 
 # Button colours (Bot API 9.4); clients that do not support them show a normal button.
 Style = Literal["success", "danger", "primary"]
+# Reminder keyboards by the item's type (docs/features/iteration-4.md §3, ``views.reminder_kind``).
+ReminderKind = Literal["timed", "span", "series"]
 
 BUTTON_TEXT_MAX: Final = 64  # longer labels get cut by clients anyway
 
@@ -20,6 +36,10 @@ BACK = "← Назад"
 UNDO_LABEL: Final = "↩️ Отменить"
 STEP_BUTTONS_PER_ROW: Final = 4
 LIST_BUTTONS_PER_ROW: Final = 5
+DAY_BUTTONS_PER_ROW: Final = 4
+STOP_SERIES_LABEL: Final = "⏹ Хватит повторять"
+NO_MORE_LABEL: Final = "⏹ Больше не повторять"
+OTHER_DAY_LABEL: Final = "Другая дата…"
 
 
 def clip_label(text: str, limit: int = BUTTON_TEXT_MAX) -> str:
@@ -82,22 +102,54 @@ def item_card_keyboard(
     return markup(*chunked(toggles, STEP_BUTTONS_PER_ROW), first, second, extra, last)
 
 
-def reminder_keyboard(occurrence_id: int, *, evening: bool = False) -> InlineKeyboardMarkup:
-    """[✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]; with ``evening`` (the evening slot is still more than an hour
-    away) [✅ Готово] / [⏰ 1 час] [🌙 Вечером] [📅 Завтра]."""
-    snooze = [
-        button("⏰ 1 час", OccCb(a="s60", id=occurrence_id)),
-        button("📅 Завтра", OccCb(a="tmr", id=occurrence_id)),
-    ]
-    if evening:
-        snooze.insert(1, button("🌙 Вечером", OccCb(a=SNOOZE_EVENING, id=occurrence_id)))
+def reminder_keyboard(occurrence_id: int, *, kind: ReminderKind = "timed", month: bool = False) -> InlineKeyboardMarkup:
+    """[✅ Готово] and a row by the item's type (docs/features/iteration-4.md §3):
+    - ``timed`` (a one-off at a time): [⏰ 1 час] [⏰ 3 часа] [📅 Завтра];
+    - ``span`` (a week / month / season, "на днях", a deadline): [➡️ След. неделя] ([➡️ След. месяц] with ``month``)
+      [📅 Выбрать день] [💤 Когда-нибудь];
+    - ``series``: [⏰ 1 час] [⏹ Хватит повторять].
+    Reminders sent before had [⏰ 15 мин] / [🌙 Вечером]: those buttons keep working (``OccCb`` ``s15`` / ``eve``)."""
+    if kind == "span":
+        nxt = "nm" if month else "nw"
+        row = [
+            button("➡️ След. месяц" if month else "➡️ След. неделя", OccCb(a=nxt, id=occurrence_id)),
+            button("📅 Выбрать день", OccCb(a=OCC_PICK, id=occurrence_id)),
+            button("💤 Когда-нибудь", OccCb(a=OCC_SOMEDAY, id=occurrence_id)),
+        ]
+    elif kind == "series":
+        row = [
+            button("⏰ 1 час", OccCb(a="s60", id=occurrence_id)),
+            button(STOP_SERIES_LABEL, OccCb(a=OCC_STOP, id=occurrence_id)),
+        ]
     else:
-        snooze.insert(0, button("⏰ 15 мин", OccCb(a="s15", id=occurrence_id)))
-    return markup([button("✅ Готово", OccCb(a="done", id=occurrence_id), style="success")], snooze)
+        row = [
+            button("⏰ 1 час", OccCb(a="s60", id=occurrence_id)),
+            button("⏰ 3 часа", OccCb(a="s180", id=occurrence_id)),
+            button("📅 Завтра", OccCb(a="tmr", id=occurrence_id)),
+        ]
+    return markup([button("✅ Готово", OccCb(a="done", id=occurrence_id), style="success")], row)
 
 
-def undone_keyboard(occurrence_id: int) -> InlineKeyboardMarkup:
-    return markup([button("↩️ Не сделано", OccCb(a="undone", id=occurrence_id))])
+def undone_keyboard(occurrence_id: int, *, stop: bool = False) -> InlineKeyboardMarkup:
+    """[↩️ Не сделано]; ``stop`` (a done instance of a series that still repeats): [⏹ Больше не повторять] too."""
+    row = [button("↩️ Не сделано", OccCb(a="undone", id=occurrence_id))]
+    if stop:
+        row.append(button(NO_MORE_LABEL, OccCb(a=OCC_STOP, id=occurrence_id)))
+    return markup(row)
+
+
+def day_picker_keyboard(occurrence_id: int, item_id: int, days: Sequence[date]) -> InlineKeyboardMarkup:
+    """[📅 Выбрать день]: [пн 26] [вт 27] … (DayCb), [Другая дата…] (the "🕒 Время" text prompt, ItemCb ``time``),
+    [← Назад] (the reminder again)."""
+    buttons = [
+        button(f"{WEEKDAYS_SHORT[d.weekday()]} {d.day}", DayCb(id=occurrence_id, d=d.strftime(DIGEST_DAY_FMT)))
+        for d in days
+    ]
+    return markup(
+        *chunked(buttons, DAY_BUTTONS_PER_ROW),
+        [button(OTHER_DAY_LABEL, ItemCb(a="time", id=item_id))],
+        [button(BACK, OccCb(a=OCC_BACK, id=occurrence_id))],
+    )
 
 
 def undo_keyboard(raw_id: int, item_id: int) -> InlineKeyboardMarkup:

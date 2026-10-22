@@ -29,7 +29,7 @@ def _line(prefix: str) -> str:
 
 
 def test_prompt_version():
-    assert PROMPT_VERSION == "v8"
+    assert PROMPT_VERSION == "v9"
 
 
 def test_lead_example_keeps_the_stated_time_in_the_title_and_notifies_before_it():
@@ -111,11 +111,12 @@ def test_static_prompt_size_budget():
     # ~2450 tokens: English ~4 chars/token, Cyrillic ~3 chars/token. v2 added the period grammar and its examples
     # (~350 tokens), v3 related items and steps (~300), v4 deadlines by a season / month (~60), v5 the 24h-hour and
     # stricter related rules (~35), v6 the notification time and its leads (~80), v7 the past-tense "done" line
-    # (~45), v8 its limit to a message that only reports it and an example with the candidates (~60); the static
-    # prompt is a cacheable prefix.
+    # (~45), v8 its limit to a message that only reports it and an example with the candidates (~60), v9 several
+    # times a day in one rule and the stop phrases, with an example each (~130); the static prompt is a cacheable
+    # prefix.
     cyrillic = len(re.findall("[а-яА-ЯёЁ]", SYSTEM_PROMPT))
     estimate = cyrillic / 3 + (len(SYSTEM_PROMPT) - cyrillic) / 4
-    assert estimate < 2530
+    assert estimate < 2680
 
 
 def test_past_tense_done_of_an_open_task_is_an_edit():
@@ -358,3 +359,25 @@ def test_json_schema_offers_the_period_to_the_model():
     when = extraction_json_schema()["$defs"]["When"]["properties"]["period"]
     patterns = [opt.get("pattern") for opt in when.get("anyOf", [when])]
     assert any(p and "this_week" in p and "someday" in p for p in patterns)
+
+
+def test_several_times_a_day_are_one_series():
+    """v9 (iteration 4, §2): "каждый день в 9:00 и 18:00" is one item, both times in its rule; it resolves to one
+    series naming both."""
+    assert "several times a day: ONE item, all times in the rule (BYHOUR=9,18;BYMINUTE=0)" in _line("- rrule only")
+    [out] = [out for src, out in EXAMPLES if src.startswith("каждый день в 9:00 и 18:00")]
+    [item] = Extraction.model_validate(out).items
+    assert (item.rrule, item.when.time) == ("FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", "09:00")
+    now = datetime(2026, 10, 6, 12, 5, tzinfo=UTC)  # Tue 14:05 in Warsaw
+    res = resolve_item(item, now, WARSAW, source="text")
+    assert res.due_at == datetime(2026, 10, 6, 16, 0, tzinfo=UTC)  # this evening's 18:00
+
+
+def test_stop_phrases_are_a_stop_of_the_repetition():
+    """v9: «больше не напоминай», «закрывай вообще», «хватит повторять» -> edit action stop_recurrence (the code
+    closes this time with it, and turns it into "done" for a one-off)."""
+    line = _line("edit = {")
+    for phrase in ("больше не напоминай", "закрывай вообще", "хватит повторять"):
+        assert phrase in line, phrase
+    [out] = [out for src, out in EXAMPLES if src.endswith("| закрывай вообще")]
+    assert Extraction.model_validate(out).edit.action == "stop_recurrence"

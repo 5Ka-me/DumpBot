@@ -98,7 +98,13 @@ async def test_this_week_card_digest_section_and_friday_reminder(e2e: Any) -> No
     await e2e.tick(local(2026, 10, 9, 19, 0))
     [reminder_msg] = e2e.tg.sent[sent_before:]
     assert reminder_msg.text == "🔔 <b>Посмотреть Raspberry Pi</b>\n🗓 на этой неделе (до вс 11 окт)"
-    assert [text for text, _ in reminder_msg.buttons] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
+    # a span's reminder (iteration 4, §3): next week, a day, or someday
+    assert [text for text, _ in reminder_msg.buttons] == [
+        "✅ Готово",
+        "➡️ След. неделя",
+        "📅 Выбрать день",
+        "💤 Когда-нибудь",
+    ]
     [reminder] = await e2e.reminders(item.id)
     assert (reminder.status, reminder.tg_message_id) == ("sent", reminder_msg.message_id)
 

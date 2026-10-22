@@ -22,9 +22,14 @@ ItemCb    ``i:<a>:<item id>``           Item card actions (``a``):
                                         ``split``   🪄 break the task into steps (job "split" -> the AI)
                                         ``rel``     🔗 send the cards of the related items (up to 3)
 OccCb     ``o:<a>:<occurrence id>``     Occurrence actions (cards and reminders): ``done``, ``undone``,
-                                        ``s15`` / ``s60`` (snooze 15 / 60 min), ``tmr`` (snooze to tomorrow),
-                                        ``eve`` (🌙 snooze to today's ``Prefs.slot_evening``; offered while it
-                                        is more than an hour away, instead of ``s15``)
+                                        ``s60`` / ``s180`` (snooze 1 / 3 h), ``tmr`` (snooze to tomorrow);
+                                        reminders by item type (docs/features/iteration-4.md §3): ``nw`` /
+                                        ``nm`` (➡️ the item to the next week / month), ``smd`` (💤 когда-нибудь),
+                                        ``pick`` (📅 the message turns into a 7-day picker, DayCb), ``rem``
+                                        (← back from the picker to the reminder), ``stop`` (⏹ stop the series
+                                        and close this instance; also after ✅ on a series' reminder).
+                                        Old reminders still carry ``s15`` (snooze 15 min) and ``eve`` (🌙 today's
+                                        ``Prefs.slot_evening``): both keep working
 KindCb    ``k:<item id>:<kind>``        Set the item's category; ``k`` is a ``domain.kinds.Kind`` code
 AskCb     ``a:<raw id>:<n>``            Answer option ``n`` (index in ``Ask.options``) of a clarifying question
                                         about raw message ``raw`` (-> job "clarify")
@@ -52,6 +57,9 @@ UndoCb    ``u:<raw id>:<item id>``      [↩️ Отменить] under "✅ З�
 AgainCb   ``vr:<raw id>``               [🔁 Ещё раз] under "🎤 Не разобрал голосовое…": transcribe the voice note of
                                         raw message ``raw`` again (docs/features/iteration-4.md §1;
                                         ``processor.retry_unheard``)
+DayCb     ``dy:<occurrence id>:<d>``    A day of the [📅 Выбрать день] picker (docs/features/iteration-4.md §3):
+                                        move the item of the occurrence to local day ``d`` (``YYYYMMDD``) at its
+                                        own time of day, or ``task_default_time`` (``items.move_to_day``)
 ========  ============================  =============================================================================
 
 Removed 2026-10-07 (an item's time is its notification time): ``ItemCb`` ``lead`` (the "⏱ Напомнить за…" menu) and
@@ -84,11 +92,20 @@ ITEM_ACTIONS: Final[frozenset[str]] = frozenset(
     }
 )
 STEP_ACTIONS: Final[frozenset[str]] = frozenset({"done", "undo"})
-OCC_ACTIONS: Final[frozenset[str]] = frozenset({"done", "undone", "s15", "s60", "tmr", "eve"})
 SNOOZE_EVENING: Final = "eve"
 # Snooze actions -> minutes (None = tomorrow, same local time); "eve" is today's evening slot.
-SNOOZE_MINUTES: Final[dict[str, int | None]] = {"s15": 15, "s60": 60, "tmr": None}
+SNOOZE_MINUTES: Final[dict[str, int | None]] = {"s15": 15, "s60": 60, "s180": 180, "tmr": None}
 SNOOZE_ACTIONS: Final[frozenset[str]] = frozenset({*SNOOZE_MINUTES, SNOOZE_EVENING})
+# Reminders of a span / "на днях" / a deadline (docs/features/iteration-4.md §3): next week / month, someday, the
+# day picker and back from it; ⏹ of a series.
+NEXT_SPAN: Final[dict[str, str]] = {"nw": "next_week", "nm": "next_month"}
+OCC_SOMEDAY: Final = "smd"
+OCC_PICK: Final = "pick"
+OCC_BACK: Final = "rem"
+OCC_STOP: Final = "stop"
+OCC_ACTIONS: Final[frozenset[str]] = frozenset(
+    {"done", "undone", *SNOOZE_ACTIONS, *NEXT_SPAN, OCC_SOMEDAY, OCC_PICK, OCC_BACK, OCC_STOP}
+)
 DIGEST_ACTIONS: Final[frozenset[str]] = frozenset({"tmr"})
 DIGEST_DAY_FMT: Final = "%Y%m%d"  # DigestCb.d, ListCb.d
 LIST_ACTIONS: Final[frozenset[str]] = frozenset({"done", "undo"})
@@ -158,6 +175,11 @@ class AgainCb(CallbackData, prefix="vr"):
     raw: int
 
 
+class DayCb(CallbackData, prefix="dy"):
+    id: int  # occurrence id
+    d: str  # local day, DIGEST_DAY_FMT
+
+
 ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     ItemCb,
     OccCb,
@@ -170,4 +192,5 @@ ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     ListCb,
     UndoCb,
     AgainCb,
+    DayCb,
 )

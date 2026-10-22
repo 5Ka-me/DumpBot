@@ -437,7 +437,7 @@ def test_recurring_low_confidence(now: datetime, prefs: Prefs):
 @pytest.mark.parametrize(
     "rule",
     [
-        "FREQ=WEEKLY;BYHOUR=9",  # key outside the allowlist
+        "FREQ=WEEKLY;BYSECOND=9",  # key outside the allowlist
         "FREQ=WEEKLY;BYDAY=XX",
         "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30",  # never happens
         "FREQ=DAILY;UNTIL=20260101",  # already over
@@ -453,7 +453,7 @@ def test_invalid_rrule_degrades_to_one_off(rule: str, now: datetime, prefs: Pref
 
 
 def test_invalid_rrule_note_without_time(now: datetime, prefs: Prefs):
-    res = resolve_item(item("note", rrule="FREQ=WEEKLY;BYHOUR=9"), now, prefs, source="text")
+    res = resolve_item(item("note", rrule="FREQ=WEEKLY;BYSECOND=9"), now, prefs, source="text")
     assert (res.due_at, res.rrule, res.warnings) == (None, None, (WARN_BAD_RRULE,))
 
 
@@ -463,3 +463,83 @@ def test_recurring_due_across_dst(prefs: Prefs):
     res = resolve_item(it, now, prefs, source="text")
     assert res.due_at == datetime(2026, 10, 26, 8, 0, tzinfo=UTC)  # 09:00 CET
     assert res.reminders[0].fire_at == res.due_at
+
+
+# --- several times a day (docs/features/iteration-4.md §2) ----------------------------------------------------------
+
+
+def test_two_times_a_day_are_one_series(now: datetime, prefs: Prefs):
+    """ "каждый день в 9:00 и 18:00" at 14:05: one series, its rule names both times; the next one is today's 18:00."""
+    it = item(when={"text": "каждый день в 9:00 и 18:00", "time": "09:00"}, rrule="FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0")
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.rrule == "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0"
+    assert res.due_at == L(2026, 10, 6, 18, 0)
+    assert res.precision == "exact"
+    assert res.rec_dtstart_local == datetime(2026, 10, 6, 9, 0)  # the day starts at its first time
+    assert res.reminders == (ReminderPlan(fire_at=L(2026, 10, 6, 18, 0), lead_minutes=0, auto=False),)
+    assert recurrence.rule_times(res.rrule) == (time(9, 0), time(18, 0))
+
+
+def test_bare_hours_take_the_minutes_of_the_time(now: datetime, prefs: Prefs):
+    it = item(when={"text": "в 9:30 и 18:30", "time": "09:30"}, rrule="FREQ=DAILY;BYHOUR=9,18")
+    assert resolve_item(it, now, prefs, source="text").rrule == "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=30"
+
+
+def test_hours_without_a_time_are_whole_hours_and_exact(now: datetime, prefs: Prefs):
+    """No when.time (the model put the times in the rule only): BYMINUTE=0, the instances are exact (not the
+    automatic 19:00 of a task without a time)."""
+    res = resolve_item(item(rrule="FREQ=DAILY;BYHOUR=9,21"), now, prefs, source="text")
+    assert (res.rrule, res.precision) == ("FREQ=DAILY;BYHOUR=9,21;BYMINUTE=0", "exact")
+    assert res.due_at == L(2026, 10, 6, 21, 0)
+    assert res.reminders[0].auto is False
+
+
+def test_different_minutes_are_paired_by_the_phrase(now: datetime, prefs: Prefs):
+    """ "в 8:30 и 20:00" written as hours x minutes would be four times: the ones the phrase names stay."""
+    it = item(
+        when={"text": "каждый день в 8:30 и 20:00", "time": "08:30"}, rrule="FREQ=DAILY;BYHOUR=8,20;BYMINUTE=30,0"
+    )
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.rrule == "FREQ=DAILY;BYHOUR=8,20;BYMINUTE=0,30;BYSETPOS=2,3"
+    assert recurrence.rule_times(res.rrule) == (time(8, 30), time(20, 0))
+    assert res.due_at == L(2026, 10, 6, 20, 0)
+
+
+def test_a_product_the_phrase_does_not_name_stays(now: datetime, prefs: Prefs):
+    it = item(when={"text": "каждые полчаса", "time": "09:00"}, rrule="FREQ=DAILY;BYHOUR=9,10;BYMINUTE=0,30")
+    res = resolve_item(it, now, prefs, source="text")
+    assert recurrence.rule_times(res.rrule) == (time(9, 0), time(9, 30), time(10, 0), time(10, 30))
+
+
+def test_a_monthly_rule_picking_a_day_keeps_one_time(now: datetime, prefs: Prefs):
+    """BYSETPOS of "в первый будний день" would pick one of the times anyway: the rule says so (the card then warns
+    «понял только 09:00»)."""
+    rule = "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1;BYHOUR=9,18;BYMINUTE=0"
+    res = resolve_item(item(when={"time": "09:00"}, rrule=rule), now, prefs, source="text")
+    assert res.rrule == "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=1;BYHOUR=9;BYMINUTE=0"
+
+
+def test_times_with_a_start_day_count_today_while_one_is_ahead(now: datetime, prefs: Prefs):
+    """ "по вторникам в 9 и 18" said on Tuesday 14:05: this evening's 18:00 is the first (not next Tuesday)."""
+    it = item(when={"day": "TU", "time": "09:00"}, rrule="FREQ=WEEKLY;BYDAY=TU;BYHOUR=9,18;BYMINUTE=0")
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.due_at == L(2026, 10, 6, 18, 0)
+
+
+def test_times_and_count_start_at_the_next_time(now: datetime, prefs: Prefs):
+    """COUNT counts from DTSTART: 09:00 has passed at 14:05, so the three are today's 18:00, then tomorrow's two."""
+    it = item(when={"time": "09:00"}, rrule="FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0;COUNT=3")
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.rec_dtstart_local == datetime(2026, 10, 6, 18, 0)
+    assert res.due_at == L(2026, 10, 6, 18, 0)
+    start = res.rec_dtstart_local
+    assert recurrence.next_occurrence(res.rrule, start, TZ, L(2026, 10, 7, 8, 0)) == L(2026, 10, 7, 9, 0)
+    assert recurrence.next_occurrence(res.rrule, start, TZ, L(2026, 10, 7, 9, 0)) == L(2026, 10, 7, 18, 0)
+    assert recurrence.next_occurrence(res.rrule, start, TZ, L(2026, 10, 7, 18, 0)) is None
+
+
+def test_times_with_a_lead_shift_every_instance(now: datetime, prefs: Prefs):
+    it = item(when={"time": "09:00"}, rrule="FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0", lead=[15])
+    res = resolve_item(it, now, prefs, source="text")
+    assert res.due_at == L(2026, 10, 6, 17, 45)
+    assert res.stated_at == L(2026, 10, 6, 18, 0)

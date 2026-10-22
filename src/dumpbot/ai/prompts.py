@@ -22,6 +22,10 @@ RELATED CANDIDATES is an edit ``{target: X, action: done}`` (applied at once whe
 v8: only when the message just reports that; one that also asks for something new ("купил молоко, хлеба не было —
 купить завтра") is a save, so nothing it says is lost (the code saves the items of an edit too); an example with the
 candidates.
+v9 (iteration 4, docs/features/iteration-4.md §2): several times a day are one repeating item with all of them in the
+rule ("каждый день в 9:00 и 18:00" -> FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0, when.time = the first); «больше не
+напоминай», «закрывай вообще», «хватит повторять», «останови повтор» are edit action stop_recurrence (a repeating item
+stops and this time is closed; a one-off is just done — the code reads these phrases too, ``domain.phrases``).
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ from typing import Any
 
 from dumpbot.domain.prefs import Prefs
 
-PROMPT_VERSION = "v8"
+PROMPT_VERSION = "v9"
 
 # Telegram caps text at 4096 and captions at 1024 chars, so a real message is always sent in full;
 # this only guards against pathological inputs.
@@ -76,6 +80,19 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
                     "title": "Вынести мусор",
                     "when": {"text": "каждый понедельник"},
                     "rrule": "FREQ=WEEKLY;BYDAY=MO",
+                }
+            ]
+        },
+    ),
+    (
+        "каждый день в 9:00 и 18:00 пить таблетки",
+        {
+            "items": [
+                {
+                    "kind": "task",
+                    "title": "Выпить таблетки",
+                    "when": {"text": "каждый день в 9:00 и 18:00", "time": "09:00"},
+                    "rrule": "FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0",
                 }
             ]
         },
@@ -238,6 +255,10 @@ EXAMPLES: tuple[tuple[str, dict[str, Any]], ...] = (
         {"intent": "edit", "edit": {"when": {"text": "на следующей неделе", "period": "next_week"}}},
     ),
     (
+        'REPLYING TO ITEM {"id":3,"title":"Таблетки","rrule":"FREQ=DAILY"} | закрывай вообще',
+        {"intent": "edit", "edit": {"action": "stop_recurrence"}},
+    ),
+    (
         'REPLYING TO ITEM {"id":5,"title":"Ремонт на кухне"} | разбей на шаги',
         {"intent": "edit", "edit": {"action": "split"}},
     ),
@@ -308,7 +329,8 @@ MM-DD: 06-01, 10-01; only "до конца недели/месяца" → period
 [1440, 60]; when = the stated time, also kept in the title: "Встреча с Олегом (15:00)"; with a lead of a day or \
 more the title keeps the day too: "Стоматолог (пт 10:30)".
 - rrule only for explicit repetition (каждый, по понедельникам, every): RFC 5545 without DTSTART; time of day \
-still in when.time.
+still in when.time; several times a day: ONE item, all times in the rule (BYHOUR=9,18;BYMINUTE=0), when.time \
+the first.
 - Past facts (звонил, был) get no when; no time mentioned → no when.
 ask: only if a reminder would likely be wrong; 2-4 options; item = index in items.
 
@@ -323,9 +345,10 @@ range: today|tomorrow|yesterday|this_week|next_week|last_week|this_month|last_mo
 |YYYY-MM-DD..YYYY-MM-DD
 
 edit = {{target (which item, only without REPLYING TO ITEM), action: update|done|undone|delete|no_reminder\
-|stop_recurrence|split (разбей на шаги), title, kind, tags_add, tags_remove, when (the new time to notify; if only \
-the time changes, keep the date of due_local as day YYYY-MM-DD), rrule, lead ("напомни за час": notify that long \
-before the item's time; with a new when: before it)}}
+|stop_recurrence (больше не напоминай, закрывай вообще, хватит повторять, also for a one-off)|split (разбей на \
+шаги), title, kind, tags_add, tags_remove, when (the new time to notify; if only the time changes, keep the date \
+of due_local as day YYYY-MM-DD), rrule, lead ("напомни за час": notify that long before the item's time; with a new \
+when: before it)}}
 
 EXAMPLES (NOW 2026-10-06T14:05 Tue)
 {_render_examples()}

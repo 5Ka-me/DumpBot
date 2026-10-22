@@ -398,6 +398,8 @@ async def test_no_reminders_delete_restore_stoprec(api, make_items) -> None:
 
     reply = await api.post(f"{path}/stoprec")
     assert reply.data["message"] == "⏹ Повтор остановлен" and reply.data["item"]["rec_active"] is False
+    # iteration 4, §2: Monday's instance, still ahead, is cancelled too — nothing is left to do
+    assert reply.data["item"]["status"] == "done"
 
     reply = await api.post(f"{path}/delete")
     assert reply.data["message"] == "🗑 Удалено" and reply.data["item"]["status"] == "deleted"
@@ -409,7 +411,7 @@ async def test_no_reminders_delete_restore_stoprec(api, make_items) -> None:
     assert (await api.post(f"{path}/when", {"text": "завтра"})).status == 409
 
     reply = await api.post(f"{path}/restore")
-    assert reply.data["message"] == "↩️ Восстановлено" and reply.data["item"]["status"] == "open"
+    assert reply.data["message"] == "↩️ Восстановлено" and reply.data["item"]["status"] == "done"  # as it was
 
 
 async def test_snooze(api, make_items, db) -> None:

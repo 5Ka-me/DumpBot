@@ -8,8 +8,9 @@
 «за 5 минут» по умолчанию, явный «за N» сдвигает само время записи, «⏰ / 📅» переносят запись. Контракты ниже уже
 описаны в этой модели.
 Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
-Итерация 4 ([features/iteration-4.md](features/iteration-4.md)): сделанное (§1 фильтр мусорных расшифровок, §5 журнал
-действий) отмечено в контрактах ниже.
+Итерация 4 ([features/iteration-4.md](features/iteration-4.md)): сделанное (§1 фильтр мусорных расшифровок, §2 повторы:
+фразы остановки и несколько времён в день, §3 кнопки напоминания по типу записи, §5 журнал действий) отмечено в
+контрактах ниже.
 
 ## 1. Общая схема
 
@@ -100,6 +101,7 @@ src/dumpbot/
     recurrence.py          RRULE: нормализация, следующее повторение, описание по-русски             [domain]
     quiet.py               тихие часы                                                                [domain]
     fmt.py                 русское форматирование дат/длительностей                                  [domain]
+    phrases.py             фразы, которые код читает сам: «хватит повторять», времена суток (итерация 4) [domain]
   ai/
     schemas.py                                                                                        [foundation ✔]
     client.py              ChutesClient (chat completions, цены, учёт расходов)                      [ai]
@@ -281,11 +283,20 @@ def tomorrow(now: datetime, prefs: Prefs) -> date
 которого прошёл только момент «за N», остаётся и напоминает в само время — и считается в COUNT, как без «за N»);
 precision `slot`/`exact`/`default`; напоминания для этого повторения — как обычно. Невалидный RRULE → запись без повтора +
 warning «не понял правило повтора», needs_confirm.
+Итерация 4, §2 — несколько времён в день: правило называет их само (`BYHOUR`/`BYMINUTE`, «каждый день в 9:00 и 18:00» →
+`FREQ=DAILY;BYHOUR=9,18;BYMINUTE=0`). `series_rule(rule, at, text)` — правило, как оно хранится: недостающий из
+BYHOUR/BYMINUTE берётся из времени серии (`at`; без `when.time` — целые часы); произведение часов на минуты, дающее больше
+времён, чем названо во фразе (`when.text`, «в 8:30 и 20:00» → BYHOUR=8,20;BYMINUTE=0,30), сужается до названных
+(`BYSETPOS` дневного правила, `recurrence.with_times`); правило, чей BYSETPOS выбирает дни («в первый будний день»),
+оставляет одно время. `rec_dtstart_local` — день старта в первое время правила (сегодня считается, пока впереди хоть
+одно его время), precision `exact` (или `slot`) и без `when.time`; COUNT отсчитывается от ближайшего ещё не прошедшего
+времени.
 
 ### 4.2 domain/recurrence.py  [domain]
 
 ```python
-ALLOWED_KEYS = {"FREQ","INTERVAL","BYDAY","BYMONTHDAY","BYMONTH","BYSETPOS","COUNT","UNTIL","WKST"}
+ALLOWED_KEYS = {"FREQ","INTERVAL","BYDAY","BYMONTHDAY","BYMONTH","BYSETPOS","COUNT","UNTIL","WKST",
+                "BYHOUR","BYMINUTE"}                    # итерация 4: не больше MAX_DAY_TIMES (24) времён в день
 def normalize_rrule(rule: str) -> str            # убирает "RRULE:", upper, проверяет ключи и парсинг; ValueError
 def next_occurrence(rule: str, dtstart_local: datetime, tz: ZoneInfo, after: datetime,
                     *, inclusive: bool = False) -> datetime | None
@@ -293,7 +304,13 @@ def next_occurrence(rule: str, dtstart_local: datetime, tz: ZoneInfo, after: dat
     в naive локальном времени (сохраняет 09:00 через смену DST), затем localize(). UNTIL приводится к naive local.
     None — правило исчерпано (COUNT/UNTIL)."""
 def describe_rrule_ru(rule: str) -> str          # "каждый день", "каждый понедельник", "по пн и чт",
-                                                 # "каждые 2 недели", "5-го числа каждого месяца", "каждый год 1 янв"
+                                                 # "каждые 2 недели", "5-го числа каждого месяца", "каждый год 1 янв",
+                                                 # итерация 4: "каждый день в 09:00 и 18:00"
+def rule_times(rule) -> tuple[time, ...]         # времена суток правила (BYHOUR × BYMINUTE, дневной BYSETPOS); () — из DTSTART
+def complete_times(rule, at: time) -> str        # BYHOUR без BYMINUTE (и наоборот) дополняется из `at`
+def with_times(rule, times) -> str | None        # правило ровно с этими временами (разные минуты — BYSETPOS дневного
+                                                 # правила; еженедельное каждую неделю с BYDAY → дневное с тем же BYDAY)
+def without_times(rule) -> str                   # только дни, без своих времён
 ```
 
 ### 4.3 domain/quiet.py  [domain]
@@ -433,7 +450,9 @@ PROMPT_VERSION: str  # "v8" (итерация 2: when.period; related / steps / 
                      # v6: время — момент уведомления, lead = «за N до названного», названное время — в title;
                      # v7 (итерация 3, §3): «купил X», «сделал X», «готово: X» про открытую задачу из RELATED
                      # CANDIDATES → edit {target: X, action: done}, иначе — прошедший факт;
-                     # v8: только если сообщение лишь об этом; просит ещё что-то новое → save, ничего не теряется)
+                     # v8: только если сообщение лишь об этом; просит ещё что-то новое → save, ничего не теряется;
+                     # v9 (итерация 4, §2): несколько времён в день — один item, все в rrule (BYHOUR/BYMINUTE);
+                     # «больше не напоминай», «закрывай вообще», «хватит повторять» → edit.action stop_recurrence)
 
 @dataclass
 class ExtractInput:
@@ -564,7 +583,7 @@ SRC_REMINDER, SRC_DIGEST, SRC_MINIAPP                             # events.sourc
 | `command` | `bot.journal.CommandJournal` (inner middleware роутера commands) | data `{"name": "today"}` — без аргументов |
 | `button` | `bot.journal.ButtonJournal` (inner middleware `dp.callback_query`: все роутеры) | source = purpose сообщения с кнопкой (reminder / digest / list / card / …); ids из CallbackData (`ItemCb`/`KindCb`/`SubCb`.id, `PickCb`/`UndoCb`.item, `ListCb`.i/o, `OccCb`.id); data `{"action": "o:done", "cb": <callback_data>}` (+ `"error"`, если обработчик упал) |
 | `miniapp` | `web.server.journal_middleware` (внешний) | source `miniapp`; item = `{id}` у `/api/items/…`, `/api/steps/…`; data `{"route": "POST /api/items/{id}/done", "status": 200}`; только прошедшие initData (не 401/403), без опросов `GET /api/jobs/{id}`, `GET /api/inbox/{id}` и картинок; ответ уходит (`prepare` + `write_eof`) до записи |
-| `reminder_sent` | `Scheduler._deliver` после `sent` | source `reminder`; item, occurrence; data `{"reminder": id, "late_min": N, "held"?: true}` |
+| `reminder_sent` | `Scheduler._deliver` после `sent` | source `reminder`; item, occurrence; data `{"reminder": id, "late_min": N, "kb": "timed"\|"span"\|"series", "held"?: true}` (`kb` — набор кнопок, `views.reminder_kind`) |
 | `digest_item` | `Scheduler._send_digest` после отправки | source `digest`; строка раздела (`views.morning_sections` без сделанных / `views.evening_sections`): item, occurrence; data `{"digest": "morning", "sec": "o"}` |
 
 ### 4.10 services/items.py  [items]
@@ -636,9 +655,18 @@ async def apply_patch(session, item_id: int, patch: EditPatch, prefs: Prefs, now
     «(пт 9 окт 15:00)»), как при создании. kind стал ACTIONABLE без времени → напоминание по умолчанию (19:00);
     kind перестал быть ACTIONABLE (задача → идея) без when/rrule и вне активного повтора → open occurrences с
     precision `default` → cancelled вместе с pending-напоминаниями (время, заданное владельцем, остаётся)."""
-async def stop_recurrence(session, item_id: int, now: datetime | None = None) -> Item
-    """rec_active=False; текущее (самое раннее) open остаётся, уже созданные следующие (due_at > now) → cancelled
-    вместе с напоминаниями (следующее появляется сразу, как только текущее наступило)."""
+async def stop_recurrence(session, item_id: int, now: datetime | None = None, *, close: bool = False,
+                          occurrence_id: int | None = None, prefs: Prefs | None = None) -> Item
+    """Итерация 4, §2: rec_active=False; **все** open-повторения впереди (due_at > now — и созданное заранее) →
+    cancelled вместе с pending-напоминаниями. Уже наступившее остаётся open, а с `close` → done: `occurrence_id`
+    (напоминание, на котором нажали ⏹, даже отложенное вперёд), иначе самое раннее open с due_at ≤ now. Не осталось
+    открытых → запись done. Кнопка карточки / `/recurring` / Mini App — без `close`; фраза и ⏹ напоминания — с ним."""
+def day_time(item, occ, prefs) -> time             # итерация 4, §3: время суток для «📅 Выбрать день» — названное
+                                                   # время записи (due + lead), у записи без своего — task_default_time
+def picker_days(item, occ, prefs, now) -> list[date]   # 7 дней: с сегодня, пока day_time сегодня впереди, иначе с завтра
+async def move_to_day(session, occurrence_id, day: date, prefs, now) -> PatchResult
+    """День из «📅 Выбрать день»: apply_patch с when {day, time=day_time, role записи} и её явными lead (у записи со
+    своим временем) — дальше обычная датированная запись (срок сбрасывается, дедлайн остаётся дедлайном)."""
 async def ensure_recurring(session, prefs: Prefs, now: datetime) -> int
     """Для каждой записи rec_active и status!=deleted: если нет open-повторения с due_at > now → создать следующее
     (next_occurrence после названного времени последнего, max(due_at) + lead_shift, и после now) с напоминаниями
@@ -941,6 +969,17 @@ temperature 0 и фиксированный seed — повтор дал бы т
 нет `UNHEARD_KEY.job` → already; иначе у raw (и всех частей альбома) убираются ключ и расшифровки голосовых, статус
 `new`, задача ставится снова (без dedupe: двойное нажатие останавливают блокировка строки и снятый ключ).
 
+Итерация 4, §2 — повторы: фразы остановки («больше не напоминай», «закрывай вообще», «хватит повторять», «останови
+повтор», `domain.phrases`). Ответ на карточку / напоминание, который **только** такая фраза (`only_stop_request`, без
+картинок и «?»), ИИ не вызывает и бюджет не проверяет: `EditPatch(action="stop_recurrence")`. Иначе после ИИ
+`stop_phrase_patch`: фраза в тексте и правка модели `done` / `no_reminder` / `update` без нового времени →
+`stop_recurrence` (так же для правки описанием). `items.apply_patch(stop_recurrence)`: активный повтор → стоп + закрыть
+наступивший раз (`stop_recurrence(close=True)`), разовая (или уже остановленная) запись → done; `views.edit_applied` —
+«⏹ Остановил повтор «…» и закрыл этот раз» / «✅ Закрыл «…»». Несколько времён в день: `_save` сравнивает времена
+сообщения (`phrases.clock_times`, ≥ 2) с временами всех созданных записей (у серии — `rule_times`, у разовой —
+названное время), на 12-часовом циферблате; не хватает → у каждой серии сообщения предупреждение «понял только 09:00»
+(`phrases.understood_only`) в карточке. Ответ / правка описанием с rrule — так же (`lost_times_warning`).
+
 `handle_album(ctx, {"media_group_id"})` — все raw с этим media_group_id (по message_id), одна обработка: подпись(и) +
 до 4 картинок; результат привязывается к первому raw; остальные raw → done.
 `handle_edit(ctx, {"raw_id","item_id"})` — `extract(reply_item=item_snapshot)` → `apply_patch` → обновить карточку
@@ -1086,9 +1125,16 @@ def kind_menu(item: Item) -> tuple[str, InlineKeyboardMarkup]             # 9 к
 def reminder_message(item: Item, occ: Occurrence, reminder: Reminder, prefs: Prefs, now: datetime)
     # "🔔 <b>Купить наушники</b>" (+ «🗓 на этой неделе (до вс 11 окт)» / «⏳ срок: завтра»; без «через 5 мин»;
     # пришедшее позже своего времени больше чем на 2 мин — «⏰ сегодня 13:00 · опоздал на 5 ч»)
-    # [✅ Готово] / [⏰ 15 мин] [⏰ 1 час] [📅 Завтра]; итерация 3, §4: пока до `slot_evening` больше часа
-    # (`offers_evening`) — [✅ Готово] / [⏰ 1 час] [🌙 Вечером] [📅 Завтра]
+    # итерация 4, §3 — кнопки по типу записи (reminder_kind(item, occ) -> "timed" | "span" | "series"):
+    # разовая со временем / датой / без даты — [✅ Готово] / [⏰ 1 час] [⏰ 3 часа] [📅 Завтра];
+    # срок (неделя / месяц / сезон), «на днях», дедлайн — [✅ Готово] / [➡️ След. неделя] (месяц: «След. месяц»)
+    # [📅 Выбрать день] [💤 Когда-нибудь]; повтор — [✅ Готово] / [⏰ 1 час] [⏹ Хватит повторять].
+    # 🌙 «Вечером» и «⏰ 15 мин» у новых напоминаний нет (старые кнопки работают). day_picker(item, occ, days, …) —
+    # напоминание + «📅 На какой день перенести?», [пн 26] … (DayCb), [Другая дата…] (ItemCb time), [← Назад];
+    # reminder_moved(item, occ, reminders, …) — «➡️ перенёс · <строка времени карточки>» без кнопок;
+    # reminder_someday(item), reminder_stopped(item) — без кнопок
 def done_text(...)/ отметки: после "Готово" сообщение редактируется: "✅ <s>Купить наушники</s>" [↩️ Не сделано]
+    # (итерация 4, §2: у активного повтора ещё [⏹ Больше не повторять])
 def reminder_snoozed(item: Item, reminder: Reminder, prefs: Prefs, now: datetime) -> tuple[str, None]
     # после [⏰ 15 мин] / [⏰ 1 час] / [📅 Завтра]: "🔔 <b>…</b>\n💤 отложено · напомню сегодня в 13:15" без кнопок
     # (отложенное напоминание придёт заново со своими; время записи уже переехало на это время)
@@ -1175,6 +1221,15 @@ UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: в
 Итерация 4: AgainCb `vr:<raw>` [🔁 Ещё раз] — `processor.retry_unheard`, сообщение → «🎤 Распознаю ещё раз…» без
 кнопок, 👀 на голосовое, тост «🔁 Распознаю ещё раз» (второе нажатие — «Уже распознаю ещё раз…»). Каждая команда и
 каждое нажатие кнопки после обработки пишутся в журнал (`bot.journal`, §5).
+Итерация 4, §2-3 — кнопки напоминания: OccCb `s180` [⏰ 3 часа] (`snooze(minutes=180)`); `nw` / `nm` [➡️ След. неделя /
+месяц] — `apply_patch(when={period: next_week / next_month})` (срок с ролью `event`, как ответ «давай на следующей
+неделе»), сообщение → `reminder_moved`; `smd` [💤 Когда-нибудь] — `apply_patch(when={period: someday})`; `pick`
+[📅 Выбрать день] — сообщение → `day_picker` (`items.picker_days`), `rem` [← Назад] — снова напоминание; DayCb
+`dy:<occ>:<YYYYMMDD>` — `items.move_to_day` (прошедший день — тост «Этот день уже прошёл…» и пикер заново);
+[Другая дата…] — ItemCb `time` (диалог «🕒 Время»); `stop` [⏹ Хватит повторять] / [⏹ Больше не повторять] —
+`stop_recurrence(close=True, occurrence_id=…)`, сообщение → `reminder_done` (или `reminder_stopped`, если этот раз уже
+не open), повтор уже остановлен — тост. Не open occurrence у кнопок срока — «Уже сделано» / «Напоминание уже
+неактуально». DayCb пишется в журнал с occurrence (`bot.journal.OCC_FIELD`).
 Кнопки убранного «⏱ Напомнить за…» в старых сообщениях (ItemCb `lead`, `LeadCb` `l:…`, SetCb `lead`, `ask`
 `lead_minutes`) отвечают «Кнопка устарела» и ничего не меняют.
 

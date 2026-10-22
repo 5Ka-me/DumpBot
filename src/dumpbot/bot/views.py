@@ -17,8 +17,7 @@ Rules:
   toggle each; a step's card and reminder name the parent; list rows read "📌 Заказать машину (из «Переезд»)" and
   "📌 Переезд (2/5)"; "🔗 похоже на: «Купить наушники Sony» (12 сен)" with a [🔗 Похожее] button;
 - iteration 3 (docs/features/iteration-3.md): /today, /tasks and the digests number their open lines with [✅ N]
-  buttons (§2, "numbered lists" below); a reminder offers [🌙 Вечером] instead of [⏰ 15 мин] while the evening slot
-  is more than an hour away (§4, ``offers_evening``); an edit applied by description is answered with a short line
+  buttons (§2, "numbered lists" below); an edit applied by description is answered with a short line
   ("✅ Закрыл «…»", "🕒 Перенёс «…» на …", "🗑 Удалил «…»") and [↩️ Отменить] (§3, ``edit_applied``); after a
   downtime one silent "😴 Меня не было с 19:00 до 23:19…" (§5, ``downtime_notice``), a missed evening digest shows up
   in the next morning digest as "🌙 Вчерашний итог (не успел прислать)" (``morning_sections``), a reminder held over
@@ -27,14 +26,22 @@ Rules:
   gets "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] for each of them (``heard_item``);
 - iteration 4 (docs/features/iteration-4.md §1): a voice note whose transcript was not speech (twice) gets no items
   but "🎤 Не разобрал голосовое — повтори или напиши текстом" with [🔁 Ещё раз] (``unheard``; after the press:
-  ``unheard_again``); the voice settings mark the local mode «(недоступен)» while the local Whisper is paused.
+  ``unheard_again``); the voice settings mark the local mode «(недоступен)» while the local Whisper is paused;
+- iteration 4, §2-3: a reminder's buttons follow the item's type (``reminder_kind``): a one-off at a time [⏰ 1 час]
+  [⏰ 3 часа] [📅 Завтра] (🌙 «Вечером» is gone from new reminders), a span / "на днях" / a deadline [➡️ След.
+  неделя] (a month: «След. месяц») [📅 Выбрать день] [💤 Когда-нибудь], a series [⏰ 1 час] [⏹ Хватит повторять];
+  ✅ on a series' reminder adds [⏹ Больше не повторять]. A series with several times a day reads "🔁 каждый день в
+  09:00 и 18:00" (``describe_rrule_ru``).
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
   pending reminders (a done occurrence shows "✅ сделано" and [↩️ Не сделано]);
-- reminder message after ``OccCb done`` -> ``reminder_done`` (alias ``done_text``); after ``undone`` ->
-  ``reminder_message(item, occ, None, ...)``; after ``s15``/``s60``/``tmr``/``eve`` -> ``reminder_snoozed`` with the
-  new reminder returned by ``items.snooze`` (no buttons: the snoozed reminder brings its own);
+- reminder message after ``OccCb done`` -> ``reminder_done`` (alias ``done_text``; a series: with [⏹ Больше не
+  повторять]); after ``undone`` / ``rem`` -> ``reminder_message(item, occ, None, ...)``; after
+  ``s15``/``s60``/``s180``/``tmr``/``eve`` -> ``reminder_snoozed`` with the new reminder returned by ``items.snooze``
+  (no buttons: the snoozed reminder brings its own); after ``nw`` / ``nm`` / ``DayCb`` -> ``reminder_moved``; after
+  ``smd`` -> ``reminder_someday``; ``pick`` -> ``day_picker``; ``stop`` -> ``reminder_done`` of the closed instance
+  (or ``reminder_stopped``);
 - after ``ItemCb del`` -> ``deleted_card``; after ``undel`` -> ``item_card``;
 - the reply to an edit by description after ``UndoCb`` -> ``item_card`` of the item as it is again;
 - a list after ``ListCb`` -> ``today_list`` / ``tasks_list`` / ``morning_digest`` / ``evening_digest`` with the
@@ -92,10 +99,12 @@ from dumpbot.bot.cbdata import (
 )
 from dumpbot.bot.keyboards import (
     BACK,
+    ReminderKind,
     back_to_card_row,
     button,
     chunked,
     clip_label,
+    day_picker_keyboard,
     digest_move_row,
     item_card_keyboard,
     list_buttons,
@@ -104,7 +113,6 @@ from dumpbot.bot.keyboards import (
     undo_keyboard,
     undone_keyboard,
 )
-from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import MONTHS_SHORT, fmt_date, fmt_day, fmt_dt, fmt_duration, fmt_time, plural_ru
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS, KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import SLOT_LABELS, SLOT_NAMES, Prefs
@@ -166,8 +174,6 @@ _SEASON_WORDS: Final[dict[int, tuple[str, str]]] = {
 }
 NEEDS_CONFIRM_HINT: Final = "проверь, правильно ли я понял"
 LATE_AFTER: Final = timedelta(minutes=2)  # a reminder sent later than this after its time says so
-# A reminder offers [🌙 Вечером] (instead of [⏰ 15 мин]) while the evening slot is more than this far away.
-EVENING_OFFER_BEFORE: Final = timedelta(hours=1)
 
 # --- text helpers ------------------------------------------------------------------------------------------------
 
@@ -739,7 +745,7 @@ def edit_applied(
     else:
         if item.title != title_before:
             lines.append(f"✏️ Переименовал «{q(title_before, LIST_TITLE_MAX)}» → «{title}»")
-        if patch.action == "done":
+        if patch.action == "done" or (patch.action == "stop_recurrence" and not item.rrule):
             done_line = _closed_line(item, occ, title, steps_closed, prefs, now)
             lines.append(done_line if changed else f"✅ «{title}» — уже сделано")
         elif patch.action == "undone":
@@ -753,8 +759,9 @@ def edit_applied(
             lines += _time_change_lines(item, occ, reminders, patch, title, prefs, now, moved=moved)
         if patch.action == "no_reminder":
             lines.append(f"🔕 Выключил напоминания «{title}»")
-        elif patch.action == "stop_recurrence":
-            lines.append(f"⏹ Остановил повтор «{title}»")
+        elif patch.action == "stop_recurrence" and item.rrule:
+            closed = occ is not None and occ.status == "done" and occ.done_at == item.done_at  # closed with it
+            lines.append(f"⏹ Остановил повтор «{title}»" + (" и закрыл этот раз" if closed else ""))
     if not lines:
         lines.append(f"✏️ Изменил «{title}»" if changed else f"🤷 В «{title}» ничего не изменилось")
     if timed and patch.action != "delete":
@@ -851,12 +858,28 @@ def reminder_message(
 ) -> MenuView:
     """Reminder: "🔔 <b>Купить наушники</b>" (the item's time is this notification, so no time line), then for a span
     "🗓 на этой неделе (до вс 11 окт)", for a deadline "⏳ срок: завтра" / "⏳ срок: сегодня в 15:00"; a reminder
-    that comes noticeably late (``_late_line``) says when it was for; then [✅ Готово] / [⏰ 1 час] [🌙 Вечером]
-    [📅 Завтра] while this evening is more than an hour away (``offers_evening``), later [✅ Готово] / [⏰ 15 мин]
-    [⏰ 1 час] [📅 Завтра]. A step of a checklist names its parent (``parent_title``): "↳ шаг из «Переезд»".
+    that comes noticeably late (``_late_line``) says when it was for. A step of a checklist names its parent
+    (``parent_title``): "↳ шаг из «Переезд»". The buttons follow the item's type (``reminder_kind``,
+    ``keyboards.reminder_keyboard``, docs/features/iteration-4.md §3): [✅ Готово] / [⏰ 1 час] [⏰ 3 часа]
+    [📅 Завтра] for a one-off at a time, [➡️ След. неделя] (or «След. месяц») [📅 Выбрать день] [💤 Когда-нибудь] for
+    a span, "на днях" or a deadline, [⏰ 1 час] [⏹ Хватит повторять] for a series.
 
     ``reminder`` is the one being sent (None when the message is re-rendered, e.g. after "↩️ Не сделано").
     """
+    text = _reminder_text(item, occ, reminder, prefs, now, parent_title=parent_title)
+    kind = reminder_kind(item, occ)
+    return text, reminder_keyboard(occ.id, kind=kind, month=kind == "span" and item.period_kind == "month")
+
+
+def _reminder_text(
+    item: Item,
+    occ: Occurrence,
+    reminder: Reminder | None,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    parent_title: str | None = None,
+) -> str:
     lines = [f"🔔 <b>{q(item.title)}</b>"]
     lines += filter(
         None,
@@ -868,13 +891,49 @@ def reminder_message(
             _details_line(item),
         ],
     )
-    return fit("\n".join(lines)), reminder_keyboard(occ.id, evening=offers_evening(prefs, now))
+    return fit("\n".join(lines))
 
 
-def offers_evening(prefs: Prefs, now: datetime) -> bool:
-    """[🌙 Вечером] on a reminder: this evening (``Prefs.slot_evening``) is more than ``EVENING_OFFER_BEFORE`` away
-    (docs/features/iteration-3.md §4)."""
-    return now < timeresolve.tonight(now, prefs) - EVENING_OFFER_BEFORE
+def reminder_kind(item: Item, occ: Occurrence) -> ReminderKind:
+    """Which buttons a reminder of this occurrence gets (docs/features/iteration-4.md §3): ``series`` (an active
+    repetition), ``span`` (a week / month / season, "на днях", a deadline), ``timed`` (any other one-off: an exact time,
+    a slot, "через N минут", a bare date or the bot's default time)."""
+    if item.rec_active and item.rrule:
+        return "series"
+    if occ.precision in ("period", "soon") or _is_deadline(item, occ):
+        return "span"
+    return "timed"
+
+
+def day_picker(
+    item: Item, occ: Occurrence, days: Sequence[date], prefs: Prefs, now: datetime, *, parent_title: str | None = None
+) -> MenuView:
+    """[📅 Выбрать день] pressed: the reminder with "📅 На какой день перенести?" and the days (``items.picker_days``),
+    [Другая дата…] (asked as text, like "🕒 Время") and [← Назад]."""
+    text = _reminder_text(item, occ, None, prefs, now, parent_title=parent_title)
+    return fit(f"{text}\n\n📅 На какой день перенести?"), day_picker_keyboard(occ.id, item.id, days)
+
+
+def reminder_moved(
+    item: Item, occ: Occurrence | None, reminders: Sequence[Reminder], prefs: Prefs, now: datetime
+) -> View:
+    """A reminder after [➡️ След. неделя] / [➡️ След. месяц] or a day of the picker: "🔔 <b>…</b>" and "➡️ перенёс ·
+    🗓 на следующей неделе (до вс 1 ноя) · 🔔 пн 10:00, пт 19:00" (the card's time line), without buttons: the moved
+    item reminds again then."""
+    line = _time_line(item, occ, reminders, prefs, now) if occ is not None else None
+    lines = [f"🔔 <b>{q(item.title)}</b>", f"➡️ перенёс · {line}" if line else "➡️ перенёс"]
+    return fit("\n".join(lines)), None
+
+
+def reminder_someday(item: Item) -> View:
+    """A reminder after [💤 Когда-нибудь]: no date, no reminders any more; the item waits in /someday."""
+    return fit(f"🔔 <b>{q(item.title)}</b>\n💤 отложил на когда-нибудь — запись в /someday"), None
+
+
+def reminder_stopped(item: Item) -> View:
+    """A series' reminder after [⏹ Хватит повторять] when its instance could not be closed (no longer open): the
+    repetition is stopped, nothing more comes."""
+    return fit(f"🔔 <b>{q(item.title)}</b>\n⏹ повтор остановлен — больше не напомню"), None
 
 
 def _reminder_context(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> str | None:
@@ -916,7 +975,8 @@ def _rough_duration(minutes: int) -> str:
 
 
 def reminder_done(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> MenuView:
-    """Reminder edited after "Готово": "✅ <s>Купить наушники</s>" [↩️ Не сделано]."""
+    """Reminder edited after "Готово": "✅ <s>Купить наушники</s>" [↩️ Не сделано]; an instance of a series that still
+    repeats also gets [⏹ Больше не повторять] (docs/features/iteration-4.md §2)."""
     lines = [f"✅ <s>{q(item.title)}</s>"]
     head = _period_head(item, occ, _local(now, prefs.zone).date()) if occ.due_at is not None else None
     if head is not None and occ.precision == "period":
@@ -926,7 +986,7 @@ def reminder_done(item: Item, occ: Occurrence, prefs: Prefs, now: datetime) -> M
     rec = _recurrence_line(item)
     if rec:
         lines.append(rec)
-    return fit("\n".join(lines)), undone_keyboard(occ.id)
+    return fit("\n".join(lines)), undone_keyboard(occ.id, stop=bool(item.rec_active and item.rrule))
 
 
 done_text = reminder_done  # contract name (architecture §4.18)
@@ -1424,11 +1484,11 @@ def help_text() -> str:
             "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
             " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
-            "• в напоминании: ✅ Готово, ⏰ на 1 час, 🌙 на вечер (19:00; позже — ⏰ 15 мин), 📅 на завтра — запись"
-            " переезжает на новое время (и в плане, и в приложении); напоминание заранее (накануне срока, «за день»)"
-            " просто придёт ещё раз",
-            "• если не нажать «Готово», повторно не напомню — задача попадёт в вечерний итог",
-            "• повторяющиеся задачи: «Готово» закрывает текущий раз, следующий создаётся сам",
+            "• в напоминании: ✅ Готово, ⏰ на 1 или 3 часа, 📅 на завтра (запись переезжает);"
+            " у дел «на неделе», «до пятницы» — ➡️ на след. неделю, 📅 выбрать день, 💤 когда-нибудь",
+            "• не нажал «Готово» — повторно не напомню, задача будет в вечернем итоге",
+            "• повторы: «каждый день в 9 и 18» — один повтор; «Готово» закрывает текущий раз;"
+            " «⏹ Хватит повторять» или «больше не напоминай» — стоп",
             "• в тихие часы приходят только напоминания с явно заданным временем",
             "• компьютер спал: опоздавшее ночью напоминание придёт утром без звука, итог дня — в утреннем"
             " дайджесте, и я коротко напишу, что меня не было",

@@ -42,7 +42,7 @@ async def test_a_sent_reminder_is_journaled(ctx, no_digests, make_items, t0, bot
         created.item.id,
         created.occurrence.id,
     )
-    assert row.data == {"reminder": reminder.id, "late_min": 3}
+    assert row.data == {"reminder": reminder.id, "late_min": 3, "kb": "timed"}  # its buttons: a one-off's
     assert row.created_at == now
 
 
@@ -58,7 +58,7 @@ async def test_a_reminder_held_over_quiet_hours_says_so(ctx, no_digests, make_it
     await Scheduler(ctx).tick(local(2026, 10, 7, 8, 0))
 
     [row] = await _events(db)
-    assert row.data == {"reminder": reminder.id, "late_min": 560, "held": True}
+    assert row.data == {"reminder": reminder.id, "late_min": 560, "kb": "timed", "held": True}
 
 
 async def test_a_failed_send_is_not_journaled(ctx, no_digests, make_items, t0, bot, local, db) -> None:
@@ -124,3 +124,21 @@ async def test_the_evening_digest_journals_done_and_not_done(
 async def test_an_empty_digest_journals_nothing(ctx, bot, local, db) -> None:
     await Scheduler(ctx).tick(local(2026, 10, 7, 9, 0))
     assert bot.sent == [] and await _events(db) == []
+
+
+@pytest.mark.parametrize(
+    ("spec", "kb"),
+    [
+        ({"kind": "task", "title": "Таблетки", "rrule": "FREQ=DAILY", "when": {"time": "10:55"}}, "series"),
+        ({"kind": "task", "title": "Отчёт", "when": {"text": "до пятницы", "day": "+0", "role": "deadline"}}, "span"),
+    ],
+)
+async def test_the_journal_says_which_buttons_a_reminder_had(
+    ctx, no_digests, make_items, t0, bot, frozen, local, db, spec, kb
+) -> None:
+    """Iteration 4, §3: reminders get buttons by item type; the journal keeps which, for the next review."""
+    [created] = await make_items(spec, now=t0)
+    [reminder] = created.reminders
+    await Scheduler(ctx).tick(frozen.set(reminder.fire_at))
+    [row] = await _events(db)
+    assert row.data["kb"] == kb

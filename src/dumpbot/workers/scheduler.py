@@ -376,7 +376,7 @@ class Scheduler:
                 if item.parent_id is not None:  # a step of a checklist names its parent
                     parent_title = await session.scalar(select(Item.title).where(Item.id == item.parent_id))
                 text, markup = views.reminder_message(item, occ, reminder, prefs, now, parent_title=parent_title)
-                item_id, occ_id = item.id, occ.id
+                item_id, occ_id, keyboard = item.id, occ.id, views.reminder_kind(item, occ)
             # No transaction is held while waiting for Telegram.
             message_id = await sender.send(
                 self._ctx, text, markup, purpose="reminder", item_id=item_id, occurrence_id=occ_id, silent=held
@@ -388,7 +388,8 @@ class Scheduler:
             self._affect("late", reminder_id, fire_at)
         log.info("reminder %s sent", reminder_id)
         late_min = max(0, int((now - own_time).total_seconds() // 60))
-        info: dict[str, Any] = {"reminder": reminder_id, "late_min": late_min}
+        # "kb": which buttons it had (iteration 4, §3: timed / span / series), to see which ones get pressed.
+        info: dict[str, Any] = {"reminder": reminder_id, "late_min": late_min, "kb": keyboard}
         if held:
             info["held"] = True
         entry = events.Entry(

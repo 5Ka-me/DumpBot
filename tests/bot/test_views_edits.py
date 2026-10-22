@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 
 from dumpbot.ai.schemas import EditPatch
 from dumpbot.bot import views
@@ -133,7 +133,16 @@ def test_series_rename_kind_tags_and_more(prefs, now, at, make_item, make_occ, m
 
     text, _ = check_view(render(make_item(), None, [], patch(action="no_reminder"), prefs, now))
     assert text == "🔕 Выключил напоминания «Купить наушники»"
+    # a stop of a one-off is "done" (iteration 4, §2); of a series it says whether this time was closed with it
     text, _ = check_view(render(make_item(), None, [], patch(action="stop_recurrence"), prefs, now))
+    assert text == "✅ Закрыл «Купить наушники»"
+    series = make_item(rrule="FREQ=DAILY", rec_active=False, status="done", done_at=now)
+    text, _ = check_view(
+        render(series, make_occ(now, status="done", done_at=now), [], patch(action="stop_recurrence"), prefs, now)
+    )
+    assert text == "⏹ Остановил повтор «Купить наушники» и закрыл этот раз"
+    earlier = make_occ(now - timedelta(hours=5), status="done", done_at=now - timedelta(hours=5))
+    text, _ = check_view(render(series, earlier, [], patch(action="stop_recurrence"), prefs, now))
     assert text == "⏹ Остановил повтор «Купить наушники»"
     text, _ = check_view(render(make_item(), None, [], patch(), prefs, now, changed=False))
     assert text == "🤷 В «Купить наушники» ничего не изменилось"

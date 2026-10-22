@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Final
 
 from dateutil.relativedelta import relativedelta
 
-from dumpbot.domain import quiet, recurrence
+from dumpbot.domain import phrases, quiet, recurrence
 from dumpbot.domain.kinds import ACTIONABLE, Precision, SourceKind
 from dumpbot.domain.recurrence import localize
 from dumpbot.dto import ReminderPlan, Resolution
@@ -53,6 +53,7 @@ __all__ = [
     "resolve_item",
     "resolve_range",
     "resolve_when",
+    "series_rule",
     "shift_back",
     "shift_forward",
     "tomorrow",
@@ -429,32 +430,41 @@ def _resolve_recurring(
     item: ExtractedItem, when: When | None, role: str, now_utc: datetime, prefs: Prefs, source: SourceKind
 ) -> Resolution | None:
     """Resolution for an item with an RRULE, or None if the rule is invalid or already exhausted."""
-    try:
-        rule = recurrence.normalize_rrule(item.rrule or "")
-    except ValueError:
-        return None
     t, precision = prefs.task_default_time, "default"
     if when is not None and when.time:
         try:
             t, precision = _time_of(when, prefs)
         except (ValueError, KeyError):
             pass  # keep the default time; the rule itself is fine
+    try:
+        # A bare BYHOUR ("в 9 и 18") means whole hours unless the time said otherwise ("в 9:30 и 18:30").
+        at = t if precision != "default" else t.replace(minute=0)
+        rule = series_rule(item.rrule or "", at, when.text if when is not None else None)
+    except ValueError:
+        return None
+    # "каждый день в 9:00 и 18:00": the rule names its times of day (iteration 4, §2); the first one starts it.
+    day_times = recurrence.rule_times(rule) or (t,)
+    if len(day_times) > 1 or day_times[0] != t:
+        t = day_times[0]
+        precision = precision if precision == "slot" else "exact"
     tz = prefs.zone
     now_local = now_utc.astimezone(tz)
     start = now_local.date()
     if when is not None and when.day:
         # "с понедельника каждый день", "каждые 2 недели, начиная со следующей пятницы": the series starts there,
-        # and an interval rule keeps the phase of DTSTART. A day in the past (or unreadable) starts today.
+        # and an interval rule keeps the phase of DTSTART. A day in the past (or unreadable) starts today — and today
+        # counts while one of its times is still ahead.
         try:
-            first, _, _ = _resolve_day(when.day, t, now_local, prefs, timed=precision != "default")
+            first, _, _ = _resolve_day(when.day, day_times[-1], now_local, prefs, timed=precision != "default")
             start = max(first.date(), start)
         except (ValueError, KeyError):
             pass
     dtstart_local = datetime.combine(start, t)
-    if ";COUNT=" in f";{rule}" and localize(dtstart_local.date(), t, tz) < now_utc:
-        # COUNT is counted from DTSTART: today's instance, already past, must not use one up
+    if ";COUNT=" in f";{rule}":
+        # COUNT is counted from DTSTART: today's instances, already past, must not use one up
         # ("каждый день в 9, 2 раза" sent at 10:00 means tomorrow and the day after).
-        dtstart_local += timedelta(days=1)
+        ahead = [x for x in day_times if localize(start, x, tz) >= now_utc]
+        dtstart_local = datetime.combine(start, ahead[0]) if ahead else datetime.combine(start, t) + timedelta(days=1)
     # "каждый понедельник в 10, напомни за 15 минут": the series keeps the stated times, each instance is due (and
     # notifies) its lead earlier. Today's instance whose lead moment has already passed (sent at 09:50) still counts —
     # and uses up its COUNT: it notifies at its stated time, as the same message without "каждый" would.
@@ -471,12 +481,41 @@ def _resolve_recurring(
         precision=precision,
         reminders=plan_reminders(due, precision, role, list(leads), prefs, now_utc, catch_up=True),
         rrule=rule,
-        rec_time_local=t,
+        rec_time_local=dtstart_local.time(),
         rec_dtstart_local=dtstart_local,
         needs_confirm=confirm,
         leads=leads or None,
         stated_at=shift_forward(due, shift, tz) if shift else None,
     )
+
+
+def series_rule(rule: str, at: time, text: str | None = None) -> str:
+    """A series' rule as it is stored (iteration 4, §2): normalized, naming both BYHOUR and BYMINUTE when it names
+    times of day at all (the missing one from ``at``, the series' time: ``recurrence.complete_times``). Times given
+    as hours x minutes that make more than the message said ("в 8:30 и 20:00" read as BYHOUR=8,20;BYMINUTE=0,30, four
+    times) keep only the ones ``text`` (the time phrase) names (``recurrence.with_times``); a rule whose BYSETPOS picks
+    days keeps one time (it would pick one anyway). Raises ValueError for an invalid rule."""
+    rule = recurrence.complete_times(rule, at)
+    times = recurrence.rule_times(rule)
+    if len(times) < 2:
+        return rule
+    picked = _named_times(times, phrases.clock_times(text))
+    if 2 <= len(picked) < len(times) and (paired := recurrence.with_times(rule, picked)) is not None:
+        return paired
+    if "BYSETPOS" in recurrence.without_times(rule):
+        return recurrence.with_times(rule, times[:1]) or rule
+    return rule
+
+
+def _named_times(times: Sequence[time], named: Sequence[time]) -> list[time]:
+    """The times of a rule the phrase names: each named time itself, or the one time on the same 12-hour dial ("в 8"
+    for 20:00); a named time that matches none or several of them ("в 8" with both 08:00 and 20:00) names nothing."""
+    picked: list[time] = []
+    for n in named:
+        match = [x for x in times if x == n] or [x for x in times if (x.hour % 12, x.minute) == (n.hour % 12, n.minute)]
+        if len(match) == 1 and match[0] not in picked:
+            picked.append(match[0])
+    return sorted(picked)
 
 
 # --- When -> local datetime -------------------------------------------------------------------------------------

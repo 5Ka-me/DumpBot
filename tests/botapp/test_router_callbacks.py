@@ -105,11 +105,14 @@ async def test_undone_on_a_reminder_shows_the_reminder_again(feed, updates, seed
 
     [edit] = tg.edits
     assert edit.text.startswith("🔔 <b>Купить наушники</b>")
-    # 10:00: the evening is still far, so [🌙 Вечером] instead of [⏰ 15 мин]
-    assert ("🌙 Вечером", OccCb(a="eve", id=created.occurrence.id).pack()) in get_buttons(edit.reply_markup)
+    # a one-off at a time (iteration 4, §3): [⏰ 1 час] [⏰ 3 часа] [📅 Завтра]
+    assert ("⏰ 3 часа", OccCb(a="s180", id=created.occurrence.id).pack()) in get_buttons(edit.reply_markup)
 
 
-@pytest.mark.parametrize(("action", "delta"), [("s15", timedelta(minutes=15)), ("s60", timedelta(hours=1))])
+@pytest.mark.parametrize(
+    ("action", "delta"),
+    [("s15", timedelta(minutes=15)), ("s60", timedelta(hours=1)), ("s180", timedelta(hours=3))],
+)
 async def test_snooze_minutes_moves_the_time(feed, updates, seed, tg, frozen, ctx, action, delta) -> None:
     created = await seed.item(when=When(text="сегодня в 10:30", time="10:30"))  # due (and reminded) at 10:30
     frozen.advance(hours=1)  # 11:00: the reminder came; "⏰ 15 мин" / "⏰ 1 час" on it
@@ -158,7 +161,7 @@ async def test_evening_pressed_after_the_evening_offers_the_other_buttons(
     assert tg.toasts == ["🌙 Вечер уже наступил — выбери другое время"]
     [edit] = tg.edits
     assert edit.text.startswith("🔔 <b>Купить наушники</b>")
-    assert [label for label, _ in get_buttons(edit.reply_markup)] == ["✅ Готово", "⏰ 15 мин", "⏰ 1 час", "📅 Завтра"]
+    assert [label for label, _ in get_buttons(edit.reply_markup)] == ["✅ Готово", "⏰ 1 час", "⏰ 3 часа", "📅 Завтра"]
 
 
 async def test_snooze_to_tomorrow(feed, updates, seed, tg, frozen) -> None:
