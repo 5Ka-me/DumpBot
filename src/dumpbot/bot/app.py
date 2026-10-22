@@ -46,6 +46,7 @@ from dumpbot import logging_setup
 from dumpbot.ai.client import ChutesClient
 from dumpbot.ai.stt import ChutesWhisperSTT, LocalWhisperSTT, RoutedSTT
 from dumpbot.bot import quiet_requests
+from dumpbot.bot.journal import ButtonJournal
 from dumpbot.bot.middlewares import InFlight, OwnerOnly
 from dumpbot.bot.routers import make_routers
 from dumpbot.bot.routers.commands import bot_commands
@@ -293,12 +294,14 @@ async def on_error(event: ErrorEvent) -> bool:
 
 
 def build_dispatcher(ctx: AppContext, *, lifecycle: Lifecycle | None = None) -> Dispatcher:
-    """Dispatcher with MemoryStorage FSM, the owner whitelist, ``ctx`` for handlers and the routers."""
+    """Dispatcher with MemoryStorage FSM, the owner whitelist, ``ctx`` for handlers, the journal of button presses
+    (``bot.journal``) and the routers."""
     dp = Dispatcher(storage=MemoryStorage())
     dp["ctx"] = ctx
     dp.update.outer_middleware(lifecycle.in_flight if lifecycle is not None else InFlight())
     dp.update.outer_middleware(OwnerOnly(ctx.owner_id))
     dp.errors.register(on_error)
+    dp.callback_query.middleware(ButtonJournal())  # inner: every router's button handlers (iteration 4, §5)
     dp.include_routers(*make_routers())
     if lifecycle is not None:
         dp.startup.register(lifecycle.startup)

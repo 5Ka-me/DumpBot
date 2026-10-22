@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 from dumpbot import clock
 from dumpbot.ai.extract import ExtractInput, ExtractOutput, SplitInput, SplitOutput
 from dumpbot.ai.schemas import ExtractedItem, Extraction, StepSpec
-from dumpbot.ai.stt import RoutedSTT
+from dumpbot.ai.stt import GarbageTranscript, RoutedSTT
 from dumpbot.config import Settings
 from dumpbot.context import AppContext
 from dumpbot.db.models import BotMessage, Item, Job, Occurrence, RawMessage, Reminder
@@ -152,16 +152,34 @@ class FakeBot:
 
 
 class FakeSTT:
+    """A speech-to-text backend: each call pops the next result (text or exception), else ``default``. Like the real
+    backends, a ``judge`` (``RoutedSTT`` with ``screen``) rejecting the text raises ``GarbageTranscript``;
+    ``paused_for`` > 0 plays a local Whisper that could not be connected to (``pause_left``)."""
+
     def __init__(self, default: str = "голосовой транскрипт") -> None:
         self.calls: list[dict[str, Any]] = []
         self.results: list[str | BaseException] = []
         self.default = default
+        self.paused_for = 0.0
 
-    async def transcribe(self, audio: bytes, *, mime_type: str | None = None, language: str | None = None) -> str:
+    def pause_left(self) -> float:
+        return self.paused_for
+
+    async def transcribe(
+        self,
+        audio: bytes,
+        *,
+        mime_type: str | None = None,
+        language: str | None = None,
+        judge: Callable[[str], str | None] | None = None,
+    ) -> str:
         self.calls.append({"audio": audio, "mime_type": mime_type, "language": language})
         result = self.results.pop(0) if self.results else self.default
         if isinstance(result, BaseException):
             raise result
+        reason = judge(result.strip()) if judge is not None else None
+        if reason is not None:
+            raise GarbageTranscript(reason, result.strip())
         return result
 
 

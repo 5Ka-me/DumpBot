@@ -72,6 +72,7 @@ from dumpbot.ai.client import AIBadResponse, AIConfigError, AIUnavailable
 from dumpbot.ai.extract import ExtractInput, ExtractOutput, SplitInput, SplitOutput, answer_query, extract, split_steps
 from dumpbot.ai.linkinfo import fetch_titles
 from dumpbot.ai.schemas import Ask, EditPatch, ExtractedItem, Extraction, QuerySpec, When
+from dumpbot.ai.stt import GarbageTranscript
 from dumpbot.bot import cards, sender, views
 from dumpbot.context import AppContext
 from dumpbot.db.models import Job, OnceKey, RawMessage
@@ -82,8 +83,8 @@ from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import BudgetState, CreatedItem, PatchResult, Row
 from dumpbot.services import items as items_svc
 from dumpbot.services import query, undo, usage
-from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY, EDIT_KEY
-from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, try_once
+from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY, EDIT_KEY, UNHEARD_KEY
+from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, enqueue, try_once
 from dumpbot.workers.jobs import WATCH_NAME as JOBS_WATCH
 
 __all__ = [
@@ -97,6 +98,7 @@ __all__ = [
     "handle_message",
     "handle_split",
     "on_dead",
+    "retry_unheard",
     "run_question",
     "split_budget_block",
 ]
@@ -165,6 +167,7 @@ class _Content:
     forward_origin: dict[str, Any] | None = None
     link_titles: dict[str, str] = field(default_factory=dict)
     force_query: bool = False
+    unheard: bool = False  # a voice note's transcript was not speech (twice): nothing is saved, "Не разобрал"
 
     @property
     def empty(self) -> bool:
@@ -247,6 +250,9 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     try:
         # A picked candidate re-reads an already processed message: reuse its OCR text instead of the pictures.
         content = await _gather(ctx, [raw], prefs, with_images=not raw.image_text)
+        if content.unheard:  # a voice reply that is not speech: no edit, "Не разобрал" with [🔁 Ещё раз]
+            await _unheard(ctx, [raw], prefs, {"kind": "edit", "payload": {"raw_id": raw.id, "item_id": item_id}})
+            return
         await _check_budget(ctx, prefs, [raw])
         async with ctx.sessionmaker() as session:
             snapshot = await items_svc.item_snapshot(session, item_id, prefs, now)
@@ -635,6 +641,9 @@ async def _process(ctx: AppContext, raws: list[RawMessage], *, clarification: st
     try:
         # A clarification reuses the stored OCR text instead of paying for the pictures again.
         content = await _gather(ctx, raws, prefs, with_images=not (replace and primary.image_text))
+        if content.unheard:
+            await _unheard(ctx, raws, prefs, _job_of(raws))
+            return
         if content.empty and not replace:
             await _save_without_ai(ctx, raws, prefs)
             return
@@ -1198,6 +1207,7 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
     urls: list[str] = []
     images: list[tuple[bytes, str]] = []
     origin: dict[str, Any] | None = None
+    unheard = False
     for raw in raws:
         if raw.text and raw.text.strip():
             texts.append(raw.text.strip())
@@ -1205,7 +1215,9 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
         origin = origin or raw.forward_origin
         if raw.content_type in VOICE_TYPES:
             transcript = await _transcript(ctx, raw, prefs, raws)
-            if transcript:
+            if _is_unheard(raw):
+                unheard = True
+            elif transcript:
                 texts.append(transcript)
         elif raw.content_type in IMAGE_TYPES and with_images and len(images) < MAX_IMAGES:
             room = MAX_REQUEST_IMAGE_BYTES - sum(len(data) for data, _ in images)
@@ -1226,6 +1238,7 @@ async def _gather(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, *, with
         forward_origin=origin,
         link_titles=await _link_titles(ctx, primary, urls),
         force_query=force_query,
+        unheard=unheard,
     )
 
 
@@ -1236,6 +1249,10 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
     before chutes (paid; exhausted -> ``raws`` deferred, ``RetryLater``), the local Whisper is free.
     Audio longer than ``stt_max_duration_s`` is not transcribed by either (chutes bills GPU seconds, and a long file
     outlasts the timeouts): it is saved by its caption, or as «Аудио: name» / «Голосовое сообщение».
+
+    A transcript that is not speech (docs/features/iteration-4.md §1: ``RoutedSTT`` with ``screen`` already tried a
+    second path) is kept for analysis — in ``transcript``, the tries in ``raw_json[UNHEARD_KEY]`` — and "" is
+    returned; ``_is_unheard`` tells the caller (a re-run of the job reads the same from the stored raw).
     """
     if raw.transcript is not None:
         return raw.transcript
@@ -1252,9 +1269,19 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
     async def before_paid() -> None:
         await _check_budget(ctx, prefs, raws)
 
-    text = await ctx.stt.transcribe(
-        audio, mime_type=raw.mime_type, language=prefs.stt_language, mode=prefs.stt_mode, before_paid=before_paid
-    )
+    try:
+        text = await ctx.stt.transcribe(
+            audio,
+            mime_type=raw.mime_type,
+            language=prefs.stt_language,
+            mode=prefs.stt_mode,
+            before_paid=before_paid,
+            screen=True,
+            duration=raw.duration,
+        )
+    except GarbageTranscript as garbage:
+        await _keep_unheard(ctx, raw, garbage)
+        return ""
     text = text.strip()
     async with ctx.sessionmaker() as session:
         await session.execute(update(RawMessage).where(RawMessage.id == raw.id).values(transcript=text))
@@ -1262,6 +1289,106 @@ async def _transcript(ctx: AppContext, raw: RawMessage, prefs: Prefs, raws: list
     raw.transcript = text
     log.info("message %s transcribed (%d chars)", raw.message_id, len(text))
     return text
+
+
+# --- voice notes that are not speech (docs/features/iteration-4.md §1) ------------------------------------------
+
+
+async def _keep_unheard(ctx: AppContext, raw: RawMessage, garbage: GarbageTranscript) -> None:
+    """Commit the rejected transcript and the tries (``UNHEARD_KEY``) right away, like a usable transcript: a re-run
+    of the job does not pay for STT again."""
+    marker = {"tries": garbage.tries}
+    async with ctx.sessionmaker() as session:
+        fresh = await session.get(RawMessage, raw.id)
+        if fresh is not None:
+            fresh.transcript = garbage.text
+            fresh.raw_json = {**(fresh.raw_json or {}), UNHEARD_KEY: marker}
+            await session.commit()
+    raw.transcript = garbage.text
+    raw.raw_json = {**(raw.raw_json or {}), UNHEARD_KEY: marker}
+    reasons = ", ".join(t.get("reason") or t.get("error") or "?" for t in garbage.tries)
+    log.info("message %s: the transcript is not speech (%s), nothing saved", raw.message_id, reasons)
+
+
+def _is_unheard(raw: RawMessage) -> bool:
+    """The voice note's transcript was rejected as not speech (``UNHEARD_KEY``)."""
+    return isinstance((raw.raw_json or {}).get(UNHEARD_KEY), dict)
+
+
+def _job_of(raws: Sequence[RawMessage]) -> dict[str, Any]:
+    """The job that processes ``raws`` again (``retry_unheard``): an album or one message."""
+    primary = raws[0]
+    if len(raws) > 1 and primary.media_group_id:
+        return {"kind": "album", "payload": {"media_group_id": primary.media_group_id, "chat_id": primary.chat_id}}
+    return {"kind": "message", "payload": {"raw_id": primary.id}}
+
+
+async def _unheard(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, job: dict[str, Any]) -> None:
+    """No items: the raws are done, the first one keeps ``job`` (what [🔁 Ещё раз] queues again), the owner gets
+    "🎤 Не разобрал голосовое — повтори или напиши текстом" with [🔁 Ещё раз] and 🤔."""
+    primary = raws[0]
+    async with ctx.sessionmaker() as session:
+        fresh = await _reload(session, raws)
+        if fresh:
+            head = fresh[0]
+            data = dict(head.raw_json or {})
+            data[UNHEARD_KEY] = {**(data.get(UNHEARD_KEY) or {}), "job": job}
+            head.raw_json = data
+        _finish(fresh, None)
+        _app_update(fresh, note=views.UNHEARD_TEXT)
+        await session.commit()
+    if not _is_app(raws):
+        text, markup = views.unheard(primary.id)
+        await _send(
+            ctx,
+            text,
+            markup,
+            prefs=prefs,
+            reply_to=primary.message_id,
+            purpose=sender.PURPOSE_UNHEARD,
+            raw_message_id=primary.id,
+        )
+    await _react(ctx, raws, sender.REACT_ASK)
+    ctx.scheduler_wakeup.set()
+
+
+RETRY_QUEUED: Final = "queued"
+RETRY_ALREADY: Final = "already"
+RETRY_MISSING: Final = "missing"
+
+
+async def retry_unheard(session: AsyncSession, raw_id: int) -> str:
+    """[🔁 Ещё раз] under "🎤 Не разобрал…": the same voice note is transcribed again. The message (an album: all of
+    its parts) forgets its transcripts and the rejection and goes back to ``new``, and the job that processed it
+    (``UNHEARD_KEY`` "job") is queued again. ``RETRY_QUEUED``; ``RETRY_ALREADY`` when it was retried already (a
+    second press: the raw row is locked, so it waits for the first one and then finds nothing to retry);
+    ``RETRY_MISSING`` without the message. Does not commit."""
+    raw = await session.get(RawMessage, raw_id, with_for_update=True, populate_existing=True)
+    if raw is None:
+        return RETRY_MISSING
+    marker = (raw.raw_json or {}).get(UNHEARD_KEY)
+    job = marker.get("job") if isinstance(marker, dict) else None
+    if not isinstance(job, dict) or not isinstance(job.get("payload"), dict) or job.get("kind") not in HANDLERS:
+        return RETRY_ALREADY
+    raws = [raw]
+    if raw.media_group_id:
+        stmt = select(RawMessage).where(
+            RawMessage.media_group_id == raw.media_group_id, RawMessage.chat_id == raw.chat_id, RawMessage.id != raw.id
+        )
+        raws += list((await session.scalars(stmt.with_for_update())).all())
+    for part in raws:
+        data = dict(part.raw_json or {})
+        data.pop(UNHEARD_KEY, None)
+        part.raw_json = data
+        if part.content_type in VOICE_TYPES:
+            part.transcript = None
+        part.status = "new"
+        part.processed_at = None
+    # No dedupe key: the lock and the removed marker keep a double press from queueing it twice, and a voice note
+    # rejected again may be retried again.
+    await enqueue(session, str(job["kind"]), dict(job["payload"]))
+    log.info("message %s: transcribing again", raw.message_id)
+    return RETRY_QUEUED
 
 
 async def _image(ctx: AppContext, raw: RawMessage, *, max_bytes: int) -> tuple[bytes, str] | None:

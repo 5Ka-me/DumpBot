@@ -15,6 +15,9 @@ reopen that line without the AI and re-render the list from its buttons (``bot.l
 (``OccCb`` ``eve``) moves the item to this evening's ``slot_evening`` like the other snooze buttons; [↩️ Отменить]
 (``UndoCb``) of an edit applied by description puts back what it changed (``services.undo``).
 
+Iteration 4 (docs/features/iteration-4.md §1): [🔁 Ещё раз] (``AgainCb``) under "🎤 Не разобрал голосовое…"
+transcribes the same voice note again (``processor.retry_unheard``).
+
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
 
@@ -44,6 +47,7 @@ from dumpbot.bot.cbdata import (
     SNOOZE_EVENING,
     SNOOZE_MINUTES,
     STEP_ACTIONS,
+    AgainCb,
     AskCb,
     DigestCb,
     ItemCb,
@@ -79,6 +83,8 @@ EVENING_PASSED: Final = "🌙 Вечер уже наступил — выбер�
 SPLITTING: Final = "Уже разбиваю на шаги…"
 UNDO_ALREADY: Final = "Уже отменено"
 UNDO_STALE: Final = "🤷 Запись уже изменилась — отменить нельзя"
+AGAIN_QUEUED: Final = "🔁 Распознаю ещё раз"
+AGAIN_ALREADY: Final = "Уже распознаю ещё раз…"
 # Digest buttons sent before the digest day was part of the callback data ("d:tmr").
 OLD_DIGEST_DATA: Final = frozenset(f"{DigestCb.__prefix__}:{a}" for a in DIGEST_ACTIONS)
 
@@ -108,6 +114,7 @@ def make_router() -> Router:
     router.callback_query.register(on_step, SubCb.filter())
     router.callback_query.register(on_list, ListCb.filter())
     router.callback_query.register(on_undo, UndoCb.filter())
+    router.callback_query.register(on_again, AgainCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     # Buttons of an older version (the removed "⏱ Напомнить за…" menu: ItemCb "lead", "l:…"), garbage data.
@@ -545,6 +552,31 @@ async def on_undo(callback: CallbackQuery, callback_data: UndoCb, ctx: AppContex
         return Outcome(await common.card_view(session, item, prefs, now), "↩️ Отменено", wake_scheduler=True)
 
     await run(callback, ctx, op)
+
+
+# --- [🔁 Ещё раз] of a voice note that was not understood ------------------------------------------------------------
+
+
+async def on_again(callback: CallbackQuery, callback_data: AgainCb, ctx: AppContext) -> None:
+    """[🔁 Ещё раз] under "🎤 Не разобрал голосовое…" (docs/features/iteration-4.md §1): the same file is transcribed
+    again (``processor.retry_unheard`` queues its job), the message turns into "🎤 Распознаю ещё раз…" and the voice
+    note gets 👀; the outcome comes as a reply to the voice note, like the first time. A second press: a toast only."""
+    voice: list[int] = []
+
+    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
+        outcome = await processor.retry_unheard(session, callback_data.raw)
+        if outcome == processor.RETRY_MISSING:
+            return Outcome(None, common.STALE)
+        if outcome == processor.RETRY_ALREADY:
+            return Outcome(None, AGAIN_ALREADY)
+        raw = await session.get(RawMessage, callback_data.raw)
+        if raw is not None and raw.message_id > 0:
+            voice.append(raw.message_id)
+        return Outcome(views.unheard_again(), AGAIN_QUEUED, wake_jobs=True)
+
+    await run(callback, ctx, op)
+    for message_id in voice:
+        await sender.react(ctx, message_id, sender.REACT_SEEN)
 
 
 def _without_buttons(callback: CallbackQuery) -> views.View | None:

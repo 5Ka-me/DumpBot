@@ -12,6 +12,7 @@ Overview:
 - ai_usage      — every AI call with tokens and cost (monthly budget)
 - once_keys     — "send at most once" markers (digests per day, budget alerts per month)
 - app_state     — small values that must survive a restart (the scheduler's last tick)
+- events        — journal of commands, button presses, Mini App calls, reminders sent, digest lines
 - user_settings — Prefs JSONB per owner
 - external_refs — links to items in external systems (Google Calendar, Notion...) for future sync
 """
@@ -305,6 +306,30 @@ class AppState(Base):
     key: Mapped[str] = mapped_column(Text, primary_key=True)  # e.g. "scheduler:last_tick"
     value: Mapped[Any] = mapped_column(JSONB, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now(), onupdate=func.now())
+
+
+class Event(Base):
+    """The journal of what the owner did and what the bot showed (docs/features/iteration-4.md §5): commands, button
+    presses, Mini App API calls, reminders sent, items listed in a digest. Read by the "stale items" question (§4) and
+    by the next usage review; written best effort (``services.events``) — a failed write never breaks the action.
+    ``data`` is a short JSON of codes and ids, never message text. No foreign keys: the journal outlives what it
+    mentions."""
+
+    __tablename__ = "events"
+    __table_args__ = (
+        Index("ix_events_type_created", "type", "created_at"),
+        Index("ix_events_item_created", "item_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(TZ, server_default=func.now())
+    # command | button | miniapp | reminder_sent | digest_item | stale_ask | … (services.events)
+    type: Mapped[str] = mapped_column(String(16))
+    # where it happened: reminder | digest | list | card | miniapp | … (the bot message's purpose for a button)
+    source: Mapped[str | None] = mapped_column(String(16))
+    item_id: Mapped[int | None] = mapped_column(BigInteger)
+    occurrence_id: Mapped[int | None] = mapped_column(BigInteger)
+    data: Mapped[dict[str, Any] | None] = mapped_column(JSONB(none_as_null=True))  # None -> SQL NULL
 
 
 class ExternalRef(Base):

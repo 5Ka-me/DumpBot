@@ -39,6 +39,7 @@ __all__ = [
     "CANDIDATES_KEY",
     "EDIT_KEY",
     "UNDO_KEY",
+    "UNHEARD_KEY",
     "enqueue_processing",
     "extract_urls",
     "message_raw_ids",
@@ -63,6 +64,9 @@ EDIT_KEY: Final = "_edit"
 # [↩️ Отменить] of an edit applied by description: {item id: what the edit changed} (``services.undo``).
 UNDO_KEY: Final = "_undo"
 APP_KEY: Final = "_app"  # a message from the Mini App: what the owner was told about it ({note, answer, edited})
+# A voice note whose transcript was not speech (docs/features/iteration-4.md §1): {"tries": [{stt, reason, text} …],
+# "job": {"kind", "payload"}} — the job [🔁 Ещё раз] queues again; the rejected transcript stays in ``transcript``.
+UNHEARD_KEY: Final = "_unheard"
 APP_SOURCE: Final = "app"  # RawMessage.source of "закинуть в свалку" from the Mini App ("telegram" otherwise)
 _TEXT_URL_RE: Final = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"'«»]+")
 _URL_TAIL: Final = ".,;:!?)]}…"

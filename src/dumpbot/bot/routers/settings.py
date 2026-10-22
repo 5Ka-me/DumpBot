@@ -261,8 +261,11 @@ def parse_money(text: str) -> float:
 
 
 def _view(ctx: AppContext, name: str, prefs: Prefs) -> views.MenuView:
-    """``views.settings_view`` with whether the local Whisper is configured (``LOCAL_STT_URL``)."""
-    return views.settings_view(name, prefs, local_stt=bool(ctx.settings.local_stt_url.strip()))
+    """``views.settings_view`` with whether the local Whisper is configured (``LOCAL_STT_URL``) and whether it is
+    paused as unreachable (iteration 4, §1)."""
+    local_stt = bool(ctx.settings.local_stt_url.strip())
+    local_down = local_stt and ctx.stt is not None and ctx.stt.local_paused
+    return views.settings_view(name, prefs, local_stt=local_stt, local_down=local_down)
 
 
 async def _load_prefs(ctx: AppContext) -> Prefs:

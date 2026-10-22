@@ -30,6 +30,9 @@
    (``views.downtime_notice``);
 6. heartbeat file (its mtime feeds the Docker healthcheck).
 
+Every reminder sent and every line of a sent digest go into the events journal (docs/features/iteration-4.md §5,
+``services.events``: ``reminder_sent``, ``digest_item``) after the message went out; a failed write is only logged.
+
 ``run`` registers with ``ctx.watchdog`` and beats before every tick, step and reminder. Silence for
 ``stall_limit_s`` means the loop is stuck (no single step legitimately takes that long): the process exits. A PC that
 slept is no stall: the watchdog sees that the whole process was frozen and starts every limit afresh.
@@ -59,7 +62,7 @@ from dumpbot.context import AppContext
 from dumpbot.db.models import Item, Occurrence, OnceKey, Reminder
 from dumpbot.domain import quiet, timeresolve
 from dumpbot.domain.prefs import Prefs
-from dumpbot.services import app_state, digest, items
+from dumpbot.services import app_state, digest, events, items
 from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, try_once
 
 __all__ = [
@@ -355,6 +358,7 @@ class Scheduler:
                     await self._finish(reminder_id, status="cancelled")
                     return True
                 fire_at, held = reminder.fire_at, reminder.held_from is not None
+                own_time = reminder.held_from or fire_at
                 if now - fire_at > timedelta(minutes=prefs.missed_grace_minutes):
                     log.info("reminder %s missed (fire_at %s)", reminder_id, fire_at.isoformat())
                     await self._finish(reminder_id, status="missed")
@@ -383,6 +387,14 @@ class Scheduler:
         if now - fire_at > views.LATE_AFTER:
             self._affect("late", reminder_id, fire_at)
         log.info("reminder %s sent", reminder_id)
+        late_min = max(0, int((now - own_time).total_seconds() // 60))
+        info: dict[str, Any] = {"reminder": reminder_id, "late_min": late_min}
+        if held:
+            info["held"] = True
+        entry = events.Entry(
+            events.REMINDER_SENT, source=events.SRC_REMINDER, item_id=item_id, occurrence_id=occ_id, data=info
+        )
+        await events.record(self._ctx.sessionmaker, entry)
         return True
 
     async def _send_failed(self, reminder_id: int, error: Exception) -> bool:
@@ -466,6 +478,7 @@ class Scheduler:
                 await session.commit()
                 raise
         log.info("%s digest for %s sent", kind, day)
+        await events.record(self._ctx.sessionmaker, *digest_entries(kind, data, now))
 
     async def _fold_missed_evening(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
         """An evening digest the bot was down for (no tick between ``since`` and its target) that can no longer go
@@ -546,6 +559,26 @@ class Scheduler:
         if nxt is None:
             return interval
         return max(MIN_SLEEP_S, min(interval, (nxt - now).total_seconds()))
+
+
+def digest_entries(kind: str, data: digest.DigestData, now: datetime) -> list[events.Entry]:
+    """``digest_item`` events of a sent digest: a line per row of its sections as the view shows them
+    (``views.morning_sections`` without the done ones / ``views.evening_sections``)."""
+    if kind == "morning":
+        sections = {s: rows for s, rows in views.morning_sections(data).items() if s != views.SEC_DONE}
+    else:
+        sections = views.evening_sections(data.agenda, now)
+    return [
+        events.Entry(
+            events.DIGEST_ITEM,
+            source=events.SRC_DIGEST,
+            item_id=row.item_id,
+            occurrence_id=row.occurrence_id,
+            data={"digest": kind, "sec": section},
+        )
+        for section, rows in sections.items()
+        for row in rows
+    ]
 
 
 def _parse_time(value: Any) -> datetime | None:

@@ -17,6 +17,7 @@ from dumpbot.bot.cbdata import (
     SNOOZE_ACTIONS,
     SNOOZE_MINUTES,
     STEP_ACTIONS,
+    AgainCb,
     AskCb,
     DigestCb,
     ItemCb,
@@ -43,7 +44,8 @@ def _roundtrip(cb: CallbackData) -> str:
 
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
-    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u"]  # "l" (LeadCb) is retired: never reuse it
+    # "l" (LeadCb) is retired: never reuse it
+    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u", "vr"]
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -182,3 +184,8 @@ async def test_router_filters_match_actions():
     assert await snooze(_query(f"o:done:{BIG}")) is False
     assert await snooze(_query(f"i:s15:{BIG}")) is False  # other prefix
     assert await SetCb.filter(F.key == "close")(_query("s:close:")) == {"callback_data": SetCb(key="close")}
+
+
+def test_again_carries_the_voice_note():
+    """[🔁 Ещё раз] under "🎤 Не разобрал голосовое…" (iteration 4, §1)."""
+    assert _roundtrip(AgainCb(raw=BIG)) == f"vr:{BIG}"

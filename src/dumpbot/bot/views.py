@@ -24,7 +24,10 @@ Rules:
   in the next morning digest as "🌙 Вчерашний итог (не успел прислать)" (``morning_sections``), a reminder held over
   quiet hours says how late it is from its own time; a reply to a voice note shows what was heard, "🎤 «…»" (§6,
   ``heard_line``, ``with_heard``; cards through ``CardExtras.heard``), and a voice note that gave only notes / ideas
-  gets "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] for each of them (``heard_item``).
+  gets "🎤 «…» → 💡 Идея «…»" with [✏️ Изменить] [🗑 Не то — удалить] for each of them (``heard_item``);
+- iteration 4 (docs/features/iteration-4.md §1): a voice note whose transcript was not speech (twice) gets no items
+  but "🎤 Не разобрал голосовое — повтори или напиши текстом" with [🔁 Ещё раз] (``unheard``; after the press:
+  ``unheard_again``); the voice settings mark the local mode «(недоступен)» while the local Whisper is paused.
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -80,6 +83,7 @@ from dumpbot.bot.cbdata import (
     LIST_MORNING,
     LIST_TASKS,
     LIST_TODAY,
+    AgainCb,
     AskCb,
     ItemCb,
     KindCb,
@@ -673,6 +677,21 @@ def heard_item(heard: str, item: Item) -> MenuView:
         ]
     )
     return fit(f"🎤 «{q(heard, HEARD_MAX)}» → {label}"), kb
+
+
+UNHEARD_TEXT: Final = "🎤 Не разобрал голосовое — повтори или напиши текстом"
+UNHEARD_AGAIN_TEXT: Final = "🎤 Распознаю ещё раз…"
+
+
+def unheard(raw_id: int) -> MenuView:
+    """A voice note whose transcript was not speech, twice (docs/features/iteration-4.md §1): nothing was saved;
+    [🔁 Ещё раз] transcribes the same file again (``AgainCb``)."""
+    return UNHEARD_TEXT, markup([button("🔁 Ещё раз", AgainCb(raw=raw_id))])
+
+
+def unheard_again() -> View:
+    """The "Не разобрал" message after [🔁 Ещё раз]: the outcome comes as a reply to the voice note itself."""
+    return UNHEARD_AGAIN_TEXT, None
 
 
 def steps_closed_text(title: str) -> str:
@@ -1377,8 +1396,8 @@ def help_text() -> str:
             "<b>Что присылать</b>",
             "• текст, голосовые и аудиофайлы (до 5 мин), фото и скриншоты (можно файлом), ссылки, пересланные посты",
             "• кружочки сохраняю без распознавания (с подписью — разберу подпись)",
-            "• в ответе на голосовое — 🎤 «…»: что я расслышал; заметку из голосового показываю коротко"
-            " с кнопкой «🗑 Не то — удалить»",
+            "• в ответе на голосовое — 🎤 «…»: что я расслышал (заметку — с кнопкой «🗑 Не то — удалить»);"
+            " шум без речи не сохраняю — «🔁 Ещё раз»",
             "• в одном сообщении может быть несколько дел — разберу на отдельные записи",
             "• «завтра в 15 созвон», «купить молоко», «каждый понедельник в 9 планёрка»",
             "• заметки, идеи, мемы и ссылки отмечаю реакцией 👌, задачи и события — карточкой с кнопками",
@@ -1463,6 +1482,7 @@ STT_MODE_CHOICES: Final[dict[str, tuple[str, str]]] = {
     "chutes": ("только chutes", "☁️ Только chutes"),
 }
 NOT_CONFIGURED: Final = " (не настроен)"
+UNREACHABLE: Final = " (недоступен)"  # the local Whisper could not be connected to: paused (iteration 4, §1)
 SETTINGS_NOTE: Final = "<i>Изменения действуют для новых напоминаний — уже созданные не перепланируются.</i>"
 
 
@@ -1634,9 +1654,10 @@ def settings_digest_menu(prefs: Prefs) -> MenuView:
     return text, kb
 
 
-def settings_stt_menu(prefs: Prefs, *, local_stt: bool = False) -> MenuView:
+def settings_stt_menu(prefs: Prefs, *, local_stt: bool = False, local_down: bool = False) -> MenuView:
     """Voice: the language and the speech-to-text mode. ``local_stt``: the local Whisper is configured
-    (``LOCAL_STT_URL``); without it "local" is marked «(не настроен)» and every mode works as chutes."""
+    (``LOCAL_STT_URL``); without it "local" is marked «(не настроен)» and every mode works as chutes. ``local_down``:
+    it could not be connected to and is paused (``RoutedSTT.local_paused``): "local" is marked «(недоступен)»."""
     language = prefs.stt_language or "auto"
     mode = prefs.stt_mode if prefs.stt_mode in STT_MODE_CHOICES else "auto"
     lines = [
@@ -1652,16 +1673,27 @@ def settings_stt_menu(prefs: Prefs, *, local_stt: bool = False) -> MenuView:
         lines.append(
             "<i>Локальный Whisper не настроен (LOCAL_STT_URL пуст): все режимы работают как «только chutes».</i>"
         )
+    elif local_down:
+        lines.append("<i>Локальный Whisper сейчас недоступен — пока распознаю через chutes, проверю снова позже.</i>")
     languages = [button(f"{_check(code == language)}{label}", SetCb(key="stt", v=code)) for code, label in STT_CHOICES]
     modes = [
-        [button(f"{_check(code == mode)}{label}{_stt_mode_note(code, local_stt)}", SetCb(key="stt_mode", v=code))]
+        [
+            button(
+                f"{_check(code == mode)}{label}{_stt_mode_note(code, local_stt, local_down)}",
+                SetCb(key="stt_mode", v=code),
+            )
+        ]
         for code, (_, label) in STT_MODE_CHOICES.items()
     ]
     return "\n".join(lines), markup(languages, *modes, _back_row())
 
 
-def _stt_mode_note(code: str, local_stt: bool) -> str:
-    return NOT_CONFIGURED if code == "local" and not local_stt else ""
+def _stt_mode_note(code: str, local_stt: bool, local_down: bool = False) -> str:
+    if code != "local":
+        return ""
+    if not local_stt:
+        return NOT_CONFIGURED
+    return UNREACHABLE if local_down else ""
 
 
 def settings_budget_menu(prefs: Prefs) -> MenuView:
@@ -1691,11 +1723,11 @@ SETTINGS_MENUS: Final[dict[str, Callable[[Prefs], MenuView]]] = {
 }
 
 
-def settings_view(name: str, prefs: Prefs, *, local_stt: bool = False) -> MenuView:
+def settings_view(name: str, prefs: Prefs, *, local_stt: bool = False, local_down: bool = False) -> MenuView:
     """Menu for ``SetCb(key="menu", v=name)``; unknown names fall back to the main menu. ``local_stt``: the local
-    Whisper is configured (the voice menu shows it)."""
+    Whisper is configured, ``local_down``: it is paused as unreachable (the voice menu shows both)."""
     if name == "stt":
-        return settings_stt_menu(prefs, local_stt=local_stt)
+        return settings_stt_menu(prefs, local_stt=local_stt, local_down=local_down)
     return SETTINGS_MENUS.get(name, settings_menu)(prefs)
 
 

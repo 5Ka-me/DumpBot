@@ -6,6 +6,8 @@ This router runs first, so commands (``/cancel`` in particular) work in the midd
 ``/search`` and ``/ask`` picked from the command menu arrive without text: they answer with a prompt that asks for
 a reply (``ForceReply``); the capture router turns the reply into the search / the question (``sender.PURPOSE_*``),
 so the search text is never saved as a note.
+
+Every handled command goes into the events journal by its name only (``bot.journal.CommandJournal``, iteration 4 §5).
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ from aiogram.types import BotCommand, ForceReply, Message
 from dumpbot import clock
 from dumpbot.bot import lists, sender, views
 from dumpbot.bot.cbdata import LIST_TASKS, LIST_TODAY
+from dumpbot.bot.journal import CommandJournal
 from dumpbot.bot.routers import common
 from dumpbot.services import ingest, query
 
@@ -81,6 +84,7 @@ async def is_command(message: Message) -> bool:
 def make_router() -> Router:
     router = Router(name="commands")
     router.message.filter(F.chat.type == ChatType.PRIVATE)
+    router.message.middleware(CommandJournal())  # a "command" event after each (iteration 4, §5)
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_cancel, Command("cancel"))

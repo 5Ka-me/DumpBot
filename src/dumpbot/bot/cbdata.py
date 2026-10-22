@@ -49,6 +49,9 @@ ListCb    ``ld:<a>:<k>:<d>:<s>:<n>:``   [✅ N] / [↩️ N] under a list (docs/
 UndoCb    ``u:<raw id>:<item id>``      [↩️ Отменить] under "✅ Закрыл «…»": undo the edit of ``item`` that raw
                                         message ``raw`` asked for by description (docs/features/iteration-3.md §3;
                                         what it changed is stored with the raw message, ``services.undo``)
+AgainCb   ``vr:<raw id>``               [🔁 Ещё раз] under "🎤 Не разобрал голосовое…": transcribe the voice note of
+                                        raw message ``raw`` again (docs/features/iteration-4.md §1;
+                                        ``processor.retry_unheard``)
 ========  ============================  =============================================================================
 
 Removed 2026-10-07 (an item's time is its notification time): ``ItemCb`` ``lead`` (the "⏱ Напомнить за…" menu) and
@@ -151,6 +154,10 @@ class UndoCb(CallbackData, prefix="u"):
     item: int
 
 
+class AgainCb(CallbackData, prefix="vr"):
+    raw: int
+
+
 ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     ItemCb,
     OccCb,
@@ -162,4 +169,5 @@ ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     SubCb,
     ListCb,
     UndoCb,
+    AgainCb,
 )

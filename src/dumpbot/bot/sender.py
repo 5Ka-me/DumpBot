@@ -50,6 +50,8 @@ PURPOSE_EDITED: Final = "edited"
 # "🎤 «…» → 💡 Идея «…»": a voice note that gave only notes / ideas (iteration 3, §6). item_id when it is one item (a
 # reply to it edits the item); not a "card", so a checklist change never redraws it into one.
 PURPOSE_HEARD: Final = "heard"
+# "🎤 Не разобрал голосовое…" [🔁 Ещё раз] (iteration 4, §1): nothing was saved (raw_message_id = the voice note).
+PURPOSE_UNHEARD: Final = "unheard"
 
 _NOT_MODIFIED: Final = "message is not modified"
 _CANT_EDIT: Final[tuple[str, ...]] = (

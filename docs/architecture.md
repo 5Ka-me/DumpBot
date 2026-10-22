@@ -8,6 +8,8 @@
 «за 5 минут» по умолчанию, явный «за N» сдвигает само время записи, «⏰ / 📅» переносят запись. Контракты ниже уже
 описаны в этой модели.
 Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
+Итерация 4 ([features/iteration-4.md](features/iteration-4.md)): сделанное (§1 фильтр мусорных расшифровок, §5 журнал
+действий) отмечено в контрактах ниже.
 
 ## 1. Общая схема
 
@@ -104,11 +106,13 @@ src/dumpbot/
     prompts.py             системные промпты                                                         [ai]
     extract.py             extract(), answer_query()                                                 [ai]
     stt.py                 SpeechToText / ChutesWhisperSTT / LocalWhisperSTT / RoutedSTT             [ai]
+    garbage.py             расшифровка — не речь? (итерация 4, §1)                                    [ai]
     linkinfo.py            заголовки страниц по ссылкам                                              [ai]
   db/ base.py models.py engine.py                                                                     [foundation ✔]
   services/
     settings_repo.py                                                                                  [foundation ✔]
     usage.py               запись ai_usage, траты за месяц, состояние бюджета                        [ai]
+    events.py              журнал действий: таблица events, запись best effort (итерация 4, §5)       [workers]
     items.py               жизненный цикл записей/повторений/напоминаний                             [items]
     query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
     related.py             «предметные» лексемы для «🔗 похоже на» (без инфинитивов и общих слов)     [items]
@@ -125,12 +129,13 @@ src/dumpbot/
     middlewares.py  cbdata.py  keyboards.py  states.py  views.py  sender.py                           [bot]
     cards.py               карточка + CardExtras (чек-лист, похожие, родитель), 🎉 после закрытия шагов   [bot]
     lists.py               списки с [✅ N]: /today, /tasks, дайджесты; перерисовка по кнопкам сообщения     [bot]
+    journal.py             middlewares журнала: команды (CommandJournal), кнопки (ButtonJournal)        [bot]
     routers/ commands.py capture.py callbacks.py settings.py edit.py                                 [bot]
   web/                     Mini App: server.py (aiohttp, статика, WebServer) auth.py (initData) http.py  [web]
                            api_lists.py api_items.py api_inbox.py files.py (превью, LRU) serialize.py
 migrations/  alembic (0001 initial, 0002 item periods, 0003 subtasks + item_links, 0004 mini app,      [infra]
              0005 notification time: данные — «за 5 минут» → само время, явные «за …» → время записи,
-             0006 downtime: таблица app_state, reminders.held_from)
+             0006 downtime: таблица app_state, reminders.held_from; 0007 events: журнал действий)
 whisper/     app.py Dockerfile requirements.txt — локальный Whisper (compose profile whisper)        [infra]
 tailscale/   serve.json — Funnel для Mini App (compose profile miniapp)                              [infra]
 webapp/      фронтенд Mini App: src/ (api, lib, screens, components) mock/ (мок-API для dev и тестов)   [webapp]
@@ -394,6 +399,32 @@ class RoutedSTT:                           # ctx.stt
 иначе `AIConfigError`, иначе последняя. `before_paid` (проверка бюджета процессором) вызывается перед chutes и может
 прервать распознавание (`RetryLater`).
 
+Итерация 4, §1 ([iteration-4.md](features/iteration-4.md)) — расшифровка, которая не речь, и недоступный локальный
+Whisper:
+
+```python
+def garbage.garbage_reason(text, *, duration=None, language=None) -> str | None
+    # любой признак: одна буква подряд ≥ 15 раз; > 40 символов на секунду записи (duration Telegram); при language
+    # "ru" — кириллица < 30 % букв; вся расшифровка — известная галлюцинация Whisper («Продолжение следует…»,
+    # «Субтитры сделал …», «Thank you for watching», «[Музыка]»…; без регистра, пунктуации, ё→е). Пустая — не мусор.
+class GarbageTranscript(AIError):   # reason, text (последняя отвергнутая), tries: [{stt, reason, text} | {stt, error}]
+backend.transcribe(audio, *, mime_type=None, language=None, judge: Callable[[str], str | None] | None = None)
+    # judge отверг текст → ai_usage(ok=false, error="garbage transcript", цена как у успеха) → GarbageTranscript
+RoutedSTT.transcribe(..., screen: bool = False, duration: float | None = None) -> str
+RoutedSTT.local_paused -> bool      # LOCAL_STT_URL задан, но сервис на паузе
+LocalWhisperSTT(..., pause_s=LOCAL_PAUSE_S, monotonic=time.monotonic).pause_left() -> float
+```
+`screen=True` (процессор): judge с duration и языком попытки; мусор → ещё одна попытка другим путём — следующий
+бэкенд порядка (ещё не пробованный), иначе тот же с аудио, сконвертированным в WAV (ffmpeg; нет ffmpeg — исходное
+аудио), и `language="ru"` (если язык и так ru, а WAV не вышло — второй попытки нет). Годная — возвращается; мусор
+снова или ошибка второй попытки → `GarbageTranscript` с обеими попытками. Платная вторая попытка тоже проходит
+`before_paid`. Chutes с `STT_CONVERT_WAV` уже WAV не конвертирует.
+Локальный Whisper, до которого не достучаться (`ClientConnectorError` — DNS, отказ; `ConnectionTimeoutError` —
+`LOCAL_CONNECT_TIMEOUT_S` = 10 с на соединение), — пауза `LOCAL_PAUSE_S` (600 с, в памяти процесса): `order()`
+пропускает бэкенды с `pause_left() > 0` (сразу chutes), WARNING `local STT cannot be reached` один раз за паузу;
+таймаут ответа и статус ошибки паузы не дают, любой ответ сервиса её снимает. `/settings` → «🎙 Голос»: у
+«Локальный» пометка «(недоступен)» и строка об этом, пока идёт пауза.
+
 ### 4.7 ai/extract.py  [ai]
 
 ```python
@@ -512,6 +543,29 @@ async def month_spend(session, prefs: Prefs, now: datetime) -> float   # тек�
 async def budget_state(session, prefs: Prefs, now: datetime) -> BudgetState
 def next_month_start(now: datetime, prefs: Prefs) -> datetime         # aware UTC начало следующего месяца по prefs.tz
 ```
+
+### 4.9a services/events.py  [workers] (итерация 4, §5)
+
+```python
+@dataclass(frozen=True)
+class Entry: type: str; source: str | None = None; item_id: int | None = None; occurrence_id: int | None = None
+             data: dict | None = None; message: tuple[int, int] | None = None   # (chat_id, message_id) бота
+async def record(sessionmaker, *entries: Entry) -> None   # своя сессия + commit; ошибки только в лог (WARNING, тип)
+COMMAND, BUTTON, MINIAPP, REMINDER_SENT, DIGEST_ITEM, STALE_ASK   # events.type
+SRC_REMINDER, SRC_DIGEST, SRC_MINIAPP                             # events.source
+```
+Таблица `events` (миграция 0007, без внешних ключей): `created_at` (`clock.utcnow()`), `type`, `source`, `item_id`,
+`occurrence_id`, `data` JSONB (коды и id, никогда текст сообщений; None → SQL NULL); индексы (type, created_at),
+(item_id, created_at). `message` → источник = `bot_messages.purpose` этого сообщения (подзапрос в самом INSERT);
+`occurrence_id` без `item_id` → item этого occurrence (тоже подзапросом). Пишется всегда после действия:
+
+| type | где | source / ids / data |
+|---|---|---|
+| `command` | `bot.journal.CommandJournal` (inner middleware роутера commands) | data `{"name": "today"}` — без аргументов |
+| `button` | `bot.journal.ButtonJournal` (inner middleware `dp.callback_query`: все роутеры) | source = purpose сообщения с кнопкой (reminder / digest / list / card / …); ids из CallbackData (`ItemCb`/`KindCb`/`SubCb`.id, `PickCb`/`UndoCb`.item, `ListCb`.i/o, `OccCb`.id); data `{"action": "o:done", "cb": <callback_data>}` (+ `"error"`, если обработчик упал) |
+| `miniapp` | `web.server.journal_middleware` (внешний) | source `miniapp`; item = `{id}` у `/api/items/…`, `/api/steps/…`; data `{"route": "POST /api/items/{id}/done", "status": 200}`; только прошедшие initData (не 401/403), без опросов `GET /api/jobs/{id}`, `GET /api/inbox/{id}` и картинок; ответ уходит (`prepare` + `write_eof`) до записи |
+| `reminder_sent` | `Scheduler._deliver` после `sent` | source `reminder`; item, occurrence; data `{"reminder": id, "late_min": N, "held"?: true}` |
+| `digest_item` | `Scheduler._send_digest` после отправки | source `digest`; строка раздела (`views.morning_sections` без сделанных / `views.evening_sections`): item, occurrence; data `{"digest": "morning", "sec": "o"}` |
 
 ### 4.10 services/items.py  [items]
 
@@ -810,6 +864,7 @@ EDIT_KEY = "_edit"; UNDO_KEY = "_undo"   # итерация 3, §3: понята
 async def save_app_text(session, chat_id: int, text: str, now: datetime) -> RawMessage   # итерация 2, D
     # source="app", message_id = -id, urls из текста (text_urls), "?" в начале -> force_query
 APP_KEY = "_app"   # raw_json сообщения из приложения: {note, answer: {text, title, item_ids}, edited: [item_id]}
+UNHEARD_KEY = "_unheard"   # итерация 4, §1: {tries: [{stt, reason, text}…], job: {kind, payload}} — голосовое не речь
 ```
 
 ### 4.14 services/processor.py  [workers]
@@ -875,6 +930,16 @@ temperature 0 и фиксированный seed — повтор дал бы т
 остаются как есть (тот же ответ + 😢); для `edit`/`edit_time` — сразу «😢 Не смог применить изменение…», raw `failed`.
 `ExtractOutput.missing_model` (основная модель 404, ответила запасная) → уведомление «модели X нет, работаю на
 запасной» один раз в сутки (once_key `aimodel:YYYY-MM-DD`), обработка продолжается.
+
+Итерация 4, §1 — голосовое, которое не речь: `_transcript` зовёт `stt.transcribe(screen=True, duration=raw.duration)`;
+`GarbageTranscript` → отвергнутая расшифровка в `raw.transcript`, попытки в `raw_json[UNHEARD_KEY]` (commit сразу:
+повтор задачи не платит за STT снова и видит то же). Любая такая часть (`_Content.unheard`) → записи **не
+создаются**, ИИ не вызывается: raws `done`, у первого в `UNHEARD_KEY.job` — задача для повтора (`message` / `album` /
+`edit` с item), ответ `views.unheard` «🎤 Не разобрал голосовое — повтори или напиши текстом» [🔁 Ещё раз] (AgainCb,
+`purpose="unheard"`) reply на голосовое и 🤔 (у альбома — на все части). Голосовой reply-правка — так же, правка не
+применяется. `retry_unheard(session, raw_id) -> "queued" | "already" | "missing"` ([🔁 Ещё раз]): raw `FOR UPDATE`,
+нет `UNHEARD_KEY.job` → already; иначе у raw (и всех частей альбома) убираются ключ и расшифровки голосовых, статус
+`new`, задача ставится снова (без dedupe: двойное нажатие останавливают блокировка строки и снятый ключ).
 
 `handle_album(ctx, {"media_group_id"})` — все raw с этим media_group_id (по message_id), одна обработка: подпись(и) +
 до 4 картинок; результат привязывается к первому raw; остальные raw → done.
@@ -966,6 +1031,8 @@ now в тихих часах и (`auto` или опоздало больше `HO
 `views.downtime_notice` (`purpose="notice"`), только если что-то задело — опоздавшие (отправлены поздно / ждут
 конца тихих часов), устаревшие (`missed`), свёрнутый итог; не ушло — повтор на следующем тике (в пределах grace);
 (6) heartbeat: записать время в `settings.heartbeat_file`.
+Итерация 4, §5: отправленное напоминание (`reminder_sent`) и строки отправленного дайджеста (`digest_item`) пишутся в
+журнал (`services.events`) после отправки; ошибка записи — только в лог.
 `run` регистрирует `"scheduler"` в `ctx.watchdog` (лимит `max(15 мин, 3 × scheduler_interval_s)`) и отмечается перед
 каждым тиком, шагом и напоминанием.
 
@@ -989,7 +1056,8 @@ async def lookup(session, chat_id: int, message_id: int) -> BotMessage | None
 `pick` (список «Какую запись изменить?», raw_message_id), `search_prompt` / `ask_prompt` (/search и /ask без текста,
 ForceReply). `edited` (итерация 3): ответ на правку описанием с [↩️ Отменить] (item_id — reply правит запись; не
 `card`, чтобы перерисовка чек-листа не превратила его в карточку). `heard` (итерация 3, §6): «🎤 «…» → 💡 Идея «…»»
-голосового без карточек (item_id, если запись одна).
+голосового без карточек (item_id, если запись одна). `unheard` (итерация 4, §1): «🎤 Не разобрал голосовое…»
+[🔁 Ещё раз] (raw_message_id — голосовое).
 
 ### 4.18 bot/views.py  [bot]
 
@@ -1050,6 +1118,9 @@ def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_be
 # успел прислать)», «Сделано X из Y», строки с [✅ N]; напоминание с held_from — «⏰ вчера 20:00 · опоздал на 12 ч».
 # §6: heard_line(text) «🎤 «…»» (≤ HEARD_MAX = 120), item_card — из extras.heard (после тегов), with_heard(view, heard)
 # — строка сверху, heard_item(heard, item) — «🎤 «…» → 💡 Идея «…»» [✏️ Изменить] [🗑 Не то — удалить].
+# Итерация 4, §1: unheard(raw_id) — «🎤 Не разобрал голосовое — повтори или напиши текстом» [🔁 Ещё раз] (AgainCb);
+# unheard_again() — «🎤 Распознаю ещё раз…» без кнопок; settings_stt_menu(prefs, *, local_stt, local_down) —
+# «(недоступен)» у «Локальный» на паузе.
 def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
 def usage_text(summary: UsageSummary) -> str
@@ -1101,6 +1172,9 @@ occurrences)`): закрытые строки сохраняют номер и [
 UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: вернулось → сообщение становится карточкой записи,
 тост «↩️ Отменено»; второе нажатие — «Уже отменено»; устарело — «🤷 Запись уже изменилась — отменить нельзя», кнопка
 убирается, ничего не меняется; снимка нет — «Кнопка устарела».
+Итерация 4: AgainCb `vr:<raw>` [🔁 Ещё раз] — `processor.retry_unheard`, сообщение → «🎤 Распознаю ещё раз…» без
+кнопок, 👀 на голосовое, тост «🔁 Распознаю ещё раз» (второе нажатие — «Уже распознаю ещё раз…»). Каждая команда и
+каждое нажатие кнопки после обработки пишутся в журнал (`bot.journal`, §5).
 Кнопки убранного «⏱ Напомнить за…» в старых сообщениях (ItemCb `lead`, `LeadCb` `l:…`, SetCb `lead`, `ask`
 `lead_minutes`) отвечают «Кнопка устарела» и ничего не меняют.
 
@@ -1115,7 +1189,8 @@ UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: в
 ввод IANA), задача без времени, слоты (утро/обед/день/вечер/после работы/ночь, выходные, дата без времени),
 тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время), бюджет ($),
 «🎙 Голос»: язык (авто/ru/en) и режим распознавания (`stt_mode`: авто/локальный/только chutes; «локальный» с пометкой
-«(не настроен)», пока пуст `LOCAL_STT_URL`). Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
+«(не настроен)», пока пуст `LOCAL_STT_URL`; «(недоступен)», пока локальный Whisper на паузе — `ctx.stt.local_paused`).
+Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
 Существующие напоминания при смене настроек не перепланируются (сказать об этом в тексте меню).
 
 ### 4.20 bot/app.py и __main__.py  [bot]
@@ -1171,4 +1246,5 @@ class Watchdog:                                            # dumpbot/watchdog.py
 - `tests/test_migration_0005.py` — `alembic upgrade` по-настоящему: своя временная база `<тестовая>_mig0005` на том же
   Postgres, данные на ревизии 0004, затем 0005, `alembic check`, downgrade (no-op) и повторный upgrade.
   `tests/test_migration_0006.py` — так же для 0006 (`<тестовая>_mig0006`): app_state, held_from, downgrade и снова.
+  `tests/test_migration_0007.py` — 0007 (`<тестовая>_mig0007`): таблица events, индексы, downgrade и снова.
 - Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@127.0.0.1:55432/dump_test uv run pytest`.

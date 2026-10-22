@@ -7,6 +7,10 @@ gets ``index.html`` (the app's own router). ``GET /healthz`` answers ``ok`` with
 host's health check and the keep-alive ping (``dumpbot.keepalive``). ``WebServer`` runs it with ``AppRunner`` /
 ``TCPSite`` and is started and stopped by ``bot.app.Lifecycle``. The access log is DEBUG only and has no query strings
 (a search is message text).
+
+Every authorized ``/api`` call goes into the events journal (docs/features/iteration-4.md §5, ``services.events``)
+after its answer was sent: ``miniapp`` with the route pattern and the status, the item of ``/api/items/{id}`` and
+``/api/steps/{id}``. Polls (``GET /api/jobs/{id}``, ``GET /api/inbox/{id}``) and pictures are not journaled.
 """
 
 from __future__ import annotations
@@ -21,9 +25,10 @@ from aiohttp.web_request import BaseRequest
 from aiohttp.web_response import StreamResponse
 
 from dumpbot.context import AppContext
+from dumpbot.services import events
 from dumpbot.web import api_inbox, api_items, api_lists, files
 from dumpbot.web.auth import auth_middleware
-from dumpbot.web.http import API_PREFIX, CTX, errors_middleware
+from dumpbot.web.http import API_PREFIX, CTX, Handler, ctx_of, errors_middleware
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +37,10 @@ MAX_BODY: Final = 256 * 1024  # JSON bodies only; the longest is an inbox text o
 SHUTDOWN_TIMEOUT_S: Final = 5.0  # requests still running at shutdown get this long
 ASSETS_CACHE: Final = "public, max-age=31536000, immutable"
 HEALTHZ: Final = "/healthz"
+# Not journaled: the app polls these while it waits (a job, a message from the app), and pictures load with lists.
+UNJOURNALED: Final = frozenset({"GET /api/jobs/{id}", "GET /api/inbox/{id}", "GET /api/files/{id}/{n}"})
+ITEM_ROUTES: Final = ("/api/items/{id}", "/api/steps/{id}")  # their {id} is an item (a step is an item too)
+UNAUTHORIZED: Final = frozenset({401, 403})
 
 
 class _AccessLog(AbstractAccessLogger):
@@ -45,7 +54,8 @@ def build_web_app(ctx: AppContext, *, static_dir: str | Path | None = None) -> w
     """The aiohttp application of the Mini App (not started)."""
     token = ctx.settings.bot_token.get_secret_value()
     app = web.Application(
-        middlewares=[errors_middleware, auth_middleware(token, ctx.owner_id)], client_max_size=MAX_BODY
+        middlewares=[journal_middleware, errors_middleware, auth_middleware(token, ctx.owner_id)],
+        client_max_size=MAX_BODY,
     )
     app[CTX] = ctx
     app[files.IMAGES] = files.ImageCache()
@@ -55,6 +65,43 @@ def build_web_app(ctx: AppContext, *, static_dir: str | Path | None = None) -> w
     app.router.add_get("/{tail:.*}", frontend)
     app.on_response_prepare.append(_headers)
     return app
+
+
+@web.middleware
+async def journal_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
+    """A ``miniapp`` event per authorized ``/api`` call, written after its answer went out (the journal never delays
+    the app; a failed write is only logged)."""
+    response = await handler(request)
+    entry = api_entry(request, response.status)
+    if entry is None:
+        return response
+    try:  # send the answer now; aiohttp sees it is finished and does not send it again
+        await response.prepare(request)
+        await response.write_eof()
+    except ConnectionError:  # the app went away: the call happened all the same
+        pass
+    await events.record(ctx_of(request).sessionmaker, entry)
+    return response
+
+
+def api_entry(request: web.Request, status: int) -> events.Entry | None:
+    """The journal event of an ``/api`` call, or None (not the API, unauthorized, no such route, a poll)."""
+    if not request.path.startswith(API_PREFIX) or status in UNAUTHORIZED:
+        return None
+    resource = request.match_info.route.resource
+    pattern = resource.canonical if resource is not None else None
+    if pattern is None or not pattern.startswith(API_PREFIX):
+        return None
+    route = f"{request.method} {pattern}"
+    if route in UNJOURNALED:
+        return None
+    item_id = None
+    raw_id = request.match_info.get("id", "")
+    if pattern.startswith(ITEM_ROUTES) and raw_id.isdecimal() and len(raw_id) <= 18:
+        item_id = int(raw_id)
+    return events.Entry(
+        events.MINIAPP, source=events.SRC_MINIAPP, item_id=item_id, data={"route": route, "status": status}
+    )
 
 
 async def _headers(request: web.Request, response: web.StreamResponse) -> None:
