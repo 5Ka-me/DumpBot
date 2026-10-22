@@ -24,14 +24,21 @@
    (quiet hours, or its window closed) goes into the next morning digest instead, when that day had something due or
    done (``digest.has_summary``; overdue items alone show up in the morning digest anyway): ``digest.folded_key``
    marks its day, and that morning digest shows the day's summary as "Вчерашний итог (не успел прислать)";
+4a. the weekly review (docs/features/iteration-4.md §6): on Sundays at ``digest_weekly_time``, like a digest —
+   the same target out of quiet hours and window, once-key ``digest:weekly:{YYYY-MM-DD}``, an empty one not sent;
+4b. the stale question (§4): at most one a day (once-key ``stale:{YYYY-MM-DD}``), never in quiet hours nor before
+   that day's morning digest is due: "«Сделать карту» висит 15 дней. Что делаем?" about the first of
+   ``services.stale.candidates``. The morning digest picks it first and shows it even mid-span; the question follows
+   the digest. Without a candidate the check waits ``STALE_CHECK_EVERY``;
 5. after a downtime, once the reminders it delayed are handled: one silent message, only if anything was affected
    (reminders sent late, held for the end of quiet hours or missed; a folded evening digest) — "😴 Меня не было с
    19:00 до 23:19 (компьютер спал?). Опоздало напоминаний: 1. Итог дня — в утреннем дайджесте."
    (``views.downtime_notice``);
 6. heartbeat file (its mtime feeds the Docker healthcheck).
 
-Every reminder sent and every line of a sent digest go into the events journal (docs/features/iteration-4.md §5,
-``services.events``: ``reminder_sent``, ``digest_item``) after the message went out; a failed write is only logged.
+Every reminder sent, every line of a sent digest or weekly review and every stale question go into the events
+journal (docs/features/iteration-4.md §5, ``services.events``: ``reminder_sent``, ``digest_item``, ``stale_ask``) after
+the message went out; a failed write is only logged.
 
 ``run`` registers with ``ctx.watchdog`` and beats before every tick, step and reminder. Silence for
 ``stall_limit_s`` means the loop is stuck (no single step legitimately takes that long): the process exits. A PC that
@@ -55,6 +62,7 @@ from typing import Any, Final
 from aiogram.exceptions import TelegramEntityTooLarge, TelegramNetworkError, TelegramRetryAfter, TelegramServerError
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import InterfaceError, OperationalError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from dumpbot import clock
 from dumpbot.bot import sender, views
@@ -62,7 +70,7 @@ from dumpbot.context import AppContext
 from dumpbot.db.models import Item, Occurrence, OnceKey, Reminder
 from dumpbot.domain import quiet, timeresolve
 from dumpbot.domain.prefs import Prefs
-from dumpbot.services import app_state, digest, events, items
+from dumpbot.services import app_state, digest, events, items, stale
 from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, try_once
 
 __all__ = [
@@ -73,6 +81,7 @@ __all__ = [
     "HOLD_AFTER",
     "LAST_TICK_KEY",
     "MAX_SEND_ATTEMPTS",
+    "STALE_CHECK_EVERY",
     "STALL_AFTER",
     "STUCK_AFTER",
     "Downtime",
@@ -87,6 +96,10 @@ CLAIM_LIMIT: Final = 20
 MAX_SEND_ATTEMPTS: Final = 5
 DIGEST_WINDOW: Final = timedelta(hours=3)
 DIGEST_KINDS: Final = ("morning", "evening")
+WEEKLY: Final = "weekly"
+SUNDAY: Final = 6
+# The stale question (docs/features/iteration-4.md §4): no candidate -> the next look this much later.
+STALE_CHECK_EVERY: Final = timedelta(minutes=10)
 MIN_SLEEP_S: Final = 0.2
 # Watchdog limit (at least 3 intervals). The longest legitimate step is one send under flood control: 4 requests
 # that may each take 60 s to time out, with flood waits of up to 60 s between them (about 7 min).
@@ -146,6 +159,10 @@ class Scheduler:
         self._tick_mark = 0.0
         self._stored_mark: float | None = None
         self._resumed = False  # the stored downtime of an earlier process was looked at
+        # The stale question: the item the morning digest showed for it (local day, candidate), and when to look for
+        # a candidate again after finding none.
+        self._stale_pick: tuple[date, stale.Stale] | None = None
+        self._stale_next: datetime | None = None
 
     @property
     def stall_limit_s(self) -> float:
@@ -181,6 +198,8 @@ class Scheduler:
             await self._step("reminders", self._send_due(now, prefs))
             await self._step("recurring", self._ensure_recurring(now, prefs))
             await self._step("digests", self._digests(now, prefs, since))
+            await self._step("weekly", self._weekly(now, prefs))
+            await self._step("stale", self._ask_stale(now, prefs))
             await self._step("downtime", self._report_downtime(now, prefs))
             await self._progress()
         finally:
@@ -459,14 +478,16 @@ class Scheduler:
                     break
 
     async def _send_digest(self, kind: str, day: str, nominal: datetime, now: datetime, prefs: Prefs) -> None:
-        """Only the caller that inserts ``digest:{kind}:{day}`` sends; the key is dropped again if sending fails."""
+        """Only the caller that inserts ``digest:{kind}:{day}`` sends; the key is dropped again if sending fails. The
+        morning digest picks today's stale question first (if one is due): its item is shown, the question follows."""
         key = f"digest:{kind}:{day}"
         async with self._ctx.sessionmaker() as session:
             if not await try_once(session, key):
                 return
             await session.commit()
             try:
-                data = await digest.build_digest(session, kind, prefs, nominal)
+                ask = await self._stale_candidate(session, now, prefs) if kind == "morning" else None
+                data = await digest.build_digest(session, kind, prefs, nominal, ask=ask.item_id if ask else None)
                 if data is None:
                     log.info("%s digest for %s skipped: nothing to report", kind, day)
                     return
@@ -479,7 +500,111 @@ class Scheduler:
                 await session.commit()
                 raise
         log.info("%s digest for %s sent", kind, day)
+        if ask is not None:
+            self._stale_pick = (_local_day(now, prefs), ask)
         await events.record(self._ctx.sessionmaker, *digest_entries(kind, data, now))
+
+    async def _weekly(self, now: datetime, prefs: Prefs) -> None:
+        """The weekly review on Sundays at ``digest_weekly_time``: target out of quiet hours, sent within
+        ``DIGEST_WINDOW`` (late after a downtime too), never inside quiet hours, once (``digest:weekly:{day}``)."""
+        if not prefs.digest_weekly_enabled:
+            return
+        tz = prefs.zone
+        today = _local_day(now, prefs)
+        for day in (today, today - timedelta(days=1)):  # a time inside quiet hours may be shifted past midnight
+            if day.weekday() != SUNDAY:
+                continue
+            nominal = timeresolve.localize(day, prefs.digest_weekly_time, tz).astimezone(UTC)
+            target = quiet.shift_out_of_quiet(nominal, prefs)
+            if target <= now < target + DIGEST_WINDOW:
+                if not quiet.in_quiet_hours(now, prefs):
+                    await self._send_weekly(day.isoformat(), nominal, now, prefs)
+                break
+
+    async def _send_weekly(self, day: str, nominal: datetime, now: datetime, prefs: Prefs) -> None:
+        key = f"digest:{WEEKLY}:{day}"
+        async with self._ctx.sessionmaker() as session:
+            if not await try_once(session, key):
+                return
+            await session.commit()
+            try:
+                data = await digest.build_weekly(session, prefs, nominal)
+                if data is None:
+                    log.info("weekly review for %s skipped: nothing to report", day)
+                    return
+                text, markup = views.weekly_review(data, prefs, now)
+                await sender.send(self._ctx, text, markup, purpose="digest")
+            except Exception:
+                await session.rollback()
+                await forget_once(session, key)
+                await session.commit()
+                raise
+        log.info("weekly review for %s sent", day)
+        await events.record(self._ctx.sessionmaker, *weekly_entries(data))
+
+    def _stale_due(self, now: datetime, prefs: Prefs) -> bool:
+        """The stale question may go out now: not in quiet hours, today's morning digest due already."""
+        if quiet.in_quiet_hours(now, prefs):
+            return False
+        morning = timeresolve.localize(_local_day(now, prefs), prefs.digest_morning_time, prefs.zone)
+        return now >= quiet.shift_out_of_quiet(morning.astimezone(UTC), prefs)
+
+    async def _stale_candidate(self, session: AsyncSession, now: datetime, prefs: Prefs) -> stale.Stale | None:
+        """The item today's stale question will ask about, when one is due now and none was asked today."""
+        if not self._stale_due(now, prefs) or await session.get(OnceKey, stale_key(_local_day(now, prefs))):
+            return None
+        return await stale.pick(session)
+
+    async def _ask_stale(self, now: datetime, prefs: Prefs) -> None:
+        """At most one "«…» висит N дней. Что делаем?" a day (``stale_key``), never in quiet hours nor before the
+        morning digest is due; the key is dropped again if sending fails. The item the morning digest picked for it
+        goes first; with no candidate the next look is ``STALE_CHECK_EVERY`` later."""
+        today = _local_day(now, prefs)
+        picked = self._stale_pick[1] if self._stale_pick is not None and self._stale_pick[0] == today else None
+        if picked is None and self._stale_next is not None and now < self._stale_next:
+            return
+        if not self._stale_due(now, prefs):
+            return
+        key = stale_key(today)
+        async with self._ctx.sessionmaker() as session:
+            if await session.get(OnceKey, key) is not None:
+                return
+            found = picked or await stale.pick(session)
+            self._stale_pick = None
+            item = await items.get_item(session, found.item_id) if found is not None else None
+            if found is None or item is None or item.status != "open":
+                self._stale_next = now + STALE_CHECK_EVERY
+                return
+            self._stale_next = None
+            occ = await items.current_occurrence(session, item.id)
+            occ = occ if occ is not None and occ.status != "cancelled" else None
+            reminders = await items.pending_reminders(session, occ.id) if occ is not None else []
+            if not await try_once(session, key):
+                return
+            await session.commit()
+            text, markup = views.stale_question(item, occ, reminders, prefs, now, moves=found.moves)
+            try:
+                await sender.send(
+                    self._ctx,
+                    text,
+                    markup,
+                    purpose=events.SRC_STALE,
+                    item_id=item.id,
+                    occurrence_id=occ.id if occ is not None else None,
+                )
+            except Exception:
+                await session.rollback()
+                await forget_once(session, key)
+                await session.commit()
+                raise
+        log.info("stale question about item %s sent", found.item_id)
+        entry = events.Entry(
+            events.STALE_ASK,
+            source=events.SRC_STALE,
+            item_id=found.item_id,
+            data={"digests": found.digests, "moves": found.moves},
+        )
+        await events.record(self._ctx.sessionmaker, entry)
 
     async def _fold_missed_evening(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
         """An evening digest the bot was down for (no tick between ``since`` and its target) that can no longer go
@@ -580,6 +705,30 @@ def digest_entries(kind: str, data: digest.DigestData, now: datetime) -> list[ev
         for section, rows in sections.items()
         for row in rows
     ]
+
+
+def weekly_entries(data: digest.WeeklyData) -> list[events.Entry]:
+    """``digest_item`` events of a sent weekly review: a line per row of its sections."""
+    return [
+        events.Entry(
+            events.DIGEST_ITEM,
+            source=events.SRC_DIGEST,
+            item_id=row.item_id,
+            occurrence_id=row.occurrence_id,
+            data={"digest": WEEKLY, "sec": section},
+        )
+        for section, rows in views.weekly_sections(data).items()
+        for row in rows
+    ]
+
+
+def stale_key(day: date) -> str:
+    """``once_keys`` marker: the stale question of local ``day`` went out."""
+    return f"stale:{day.isoformat()}"
+
+
+def _local_day(now: datetime, prefs: Prefs) -> date:
+    return now.astimezone(prefs.zone).date()
 
 
 def _parse_time(value: Any) -> datetime | None:

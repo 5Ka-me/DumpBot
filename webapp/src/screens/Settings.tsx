@@ -38,6 +38,7 @@ const TIME_KEYS = [
   "night_cutoff",
   "digest_morning_time",
   "digest_evening_time",
+  "digest_weekly_time",
 ] as const satisfies readonly (keyof Prefs)[];
 const SETTINGS_DRAFT = "settings";
 const TZ_FALLBACK = ["Europe/Warsaw", "Europe/Berlin", "Europe/Minsk", "Europe/Kyiv", "Europe/Moscow", "Europe/London"];
@@ -318,6 +319,8 @@ function SettingsForm({ data, onSaved }: { data: SettingsResponse; onSaved: (nex
         {time("digest_morning_time", "Время", undefined, !draft.digest_morning_enabled)}
         <Switch label="Вечерние итоги" checked={draft.digest_evening_enabled} onChange={(v) => set("digest_evening_enabled", v)} />
         {time("digest_evening_time", "Время", undefined, !draft.digest_evening_enabled)}
+        <Switch label="Обзор недели" checked={draft.digest_weekly_enabled} onChange={(v) => set("digest_weekly_enabled", v)} />
+        {time("digest_weekly_time", "Время", "по воскресеньям", !draft.digest_weekly_enabled)}
       </Section>
 
       <Section title="💰 Бюджет на ИИ" footer="0 — ИИ выключен. При исчерпании сообщения ждут следующего месяца.">

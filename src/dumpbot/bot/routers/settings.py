@@ -56,6 +56,8 @@ ERRORS: Final[dict[str, str]] = {
 RETRY: Final = " Попробуй ещё раз или /cancel."
 
 _TIME_RE: Final = re.compile(r"^\s*([01]?\d|2[0-3])[:.]([0-5]\d)\s*$")
+# SetCb digest_toggle values: the daily digests and the Sunday review (docs/features/iteration-4.md §6).
+DIGEST_TOGGLES: Final = ("morning", "evening", "weekly")
 
 
 def make_router() -> Router:
@@ -79,7 +81,7 @@ def _toggle_quiet(p: Prefs, v: str) -> None:
 
 
 def _toggle_digest(p: Prefs, v: str) -> None:
-    if v not in ("morning", "evening"):
+    if v not in DIGEST_TOGGLES:
         raise ValueError(f"unknown digest: {v}")
     field = f"digest_{v}_enabled"
     setattr(p, field, not getattr(p, field))

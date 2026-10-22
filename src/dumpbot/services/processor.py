@@ -49,6 +49,10 @@ the usual keys) for ``GET /api/inbox/{raw_id}``. Jobs "edit_time" and "split" wi
 out of the chat too and return their outcome (``{"ok", "reason", "message", …}``), which the worker keeps in
 ``Job.result``. ``ask_question`` answers ``POST /api/ask`` (the "?" path without a saved message).
 Message text, transcripts and OCR are never logged at INFO or above.
+
+Every edit applied from a message (a reply to a card or reminder, an edit by description, the "🕒 Время" answer) goes
+into the events journal as ``edit`` (``services.events.edit_entry``, ``"move": true`` when it moved the item): the
+stale-items check counts it as an action and its moves (docs/features/iteration-4.md §4).
 """
 
 from __future__ import annotations
@@ -81,6 +85,7 @@ from dumpbot.domain.fmt import fmt_date
 from dumpbot.domain.kinds import ACTIONABLE, SourceKind
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import BudgetState, CreatedItem, PatchResult, Row
+from dumpbot.services import events as journal
 from dumpbot.services import items as items_svc
 from dumpbot.services import query, undo, usage
 from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY, EDIT_KEY, UNHEARD_KEY
@@ -303,6 +308,14 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, [raw], sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
+    await journal.record(ctx.sessionmaker, journal.edit_entry(item_id, move=moves(patch)))
+
+
+def moves(patch: EditPatch) -> bool:
+    """A text edit that moves the item to another time (not "когда-нибудь", not closing or deleting it): the
+    stale-items check counts those (docs/features/iteration-4.md §4)."""
+    when = patch.when
+    return when is not None and when.period != "someday" and patch.action not in ("done", "delete")
 
 
 def _picked_patch(raw: RawMessage, item_id: int) -> EditPatch | None:
@@ -393,6 +406,7 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str
     if message_id:
         await sender.react(ctx, message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
+    await journal.record(ctx.sessionmaker, journal.edit_entry(item_id, move=moves(patch)))
     return _outcome(True, item_id=item_id, warnings=list(result.warnings)) if app else None
 
 
@@ -1135,6 +1149,7 @@ async def _apply_edit(
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, raws, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
+    await journal.record(ctx.sessionmaker, journal.edit_entry(item_id, move=moves(patch)))
 
 
 async def _send_candidates(

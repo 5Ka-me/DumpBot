@@ -31,7 +31,13 @@ Rules:
   [⏰ 3 часа] [📅 Завтра] (🌙 «Вечером» is gone from new reminders), a span / "на днях" / a deadline [➡️ След.
   неделя] (a month: «След. месяц») [📅 Выбрать день] [💤 Когда-нибудь], a series [⏰ 1 час] [⏹ Хватит повторять];
   ✅ on a series' reminder adds [⏹ Больше не повторять]. A series with several times a day reads "🔁 каждый день в
-  09:00 и 18:00" (``describe_rrule_ru``).
+  09:00 и 18:00" (``describe_rrule_ru``);
+- iteration 4, §4: "🕸 «Сделать карту» висит 15 дней. Что делаем?" [✅ Сделано] [💤 Когда-нибудь] [🗑 Удалить]
+  [Оставить] (``stale_question``; after a press ``stale_done`` / ``stale_someday`` / ``deleted_card`` /
+  ``stale_kept``); the morning digest names a span's item on its first and last working day only (the data decide,
+  ``services.digest.in_morning``); §6: the weekly review "🗓 Обзор недели, вс 25 окт" (``weekly_review``) — the spans
+  of this and next week / month, "когда-нибудь", reminders nobody answered, tasks without a date — numbered with
+  [✅ N].
 
 Re-rendering in place (for the callbacks router):
 - card after done / undone / kind / norem / stoprec / back -> ``item_card`` with fresh item, occurrence and
@@ -44,8 +50,8 @@ Re-rendering in place (for the callbacks router):
   (or ``reminder_stopped``);
 - after ``ItemCb del`` -> ``deleted_card``; after ``undel`` -> ``item_card``;
 - the reply to an edit by description after ``UndoCb`` -> ``item_card`` of the item as it is again;
-- a list after ``ListCb`` -> ``today_list`` / ``tasks_list`` / ``morning_digest`` / ``evening_digest`` with the
-  ``lines`` of ``pin_lines`` (``bot.lists``): the same numbers, each line as it is now.
+- a list after ``ListCb`` -> ``today_list`` / ``tasks_list`` / ``morning_digest`` / ``evening_digest`` /
+  ``weekly_review`` with the ``lines`` of ``pin_lines`` (``bot.lists``): the same numbers, each line as it is now.
 
 Settings callbacks (``SetCb(key, v)``) emitted by the settings menus:
 
@@ -57,7 +63,8 @@ key                v                                          action
 ``close``          ``""``                                     close the menu (remove the keyboard)
 ``tz``             IANA name, e.g. ``Europe/Warsaw``          set ``Prefs.tz``
 ``quiet_toggle``   ``""``                                     flip ``Prefs.quiet_enabled``
-``digest_toggle``  ``morning`` | ``evening``                  flip ``Prefs.digest_<v>_enabled``
+``digest_toggle``  ``morning`` | ``evening`` | ``weekly``     flip ``Prefs.digest_<v>_enabled`` (``weekly``: the
+                                                              Sunday review, docs/features/iteration-4.md §6)
 ``stt``            ``auto`` | ``ru`` | ``en``                 set ``Prefs.stt_language`` (``auto`` -> None)
 ``stt_mode``       ``auto`` | ``local`` | ``chutes``          set ``Prefs.stt_mode`` (speech-to-text order)
 ``budget``         dollars: ``1`` ``3`` ``5`` ``10``          set ``Prefs.budget_usd``
@@ -90,6 +97,7 @@ from dumpbot.bot.cbdata import (
     LIST_MORNING,
     LIST_TASKS,
     LIST_TODAY,
+    LIST_WEEKLY,
     AgainCb,
     AskCb,
     ItemCb,
@@ -110,6 +118,7 @@ from dumpbot.bot.keyboards import (
     list_buttons,
     markup,
     reminder_keyboard,
+    stale_keyboard,
     undo_keyboard,
     undone_keyboard,
 )
@@ -121,7 +130,7 @@ from dumpbot.domain.recurrence import describe_rrule_ru
 if TYPE_CHECKING:
     from dumpbot.ai.schemas import Ask, EditPatch
     from dumpbot.db.models import Item, Occurrence, Reminder
-    from dumpbot.dto import Agenda, CardExtras, DigestData, RelatedRef, Row, Step, UsageSummary
+    from dumpbot.dto import Agenda, CardExtras, DigestData, RelatedRef, Row, Step, UsageSummary, WeeklyData
 
 View = tuple[str, InlineKeyboardMarkup | None]
 MenuView = tuple[str, InlineKeyboardMarkup]
@@ -1123,13 +1132,19 @@ SEC_DONE: Final = "d"  # done that day (never numbered)
 SEC_MISSED: Final = "m"  # evening: not done, already due
 SEC_AHEAD: Final = "a"  # evening: still ahead tonight
 SEC_YESTERDAY: Final = "y"  # morning: not done yesterday, whose evening digest could not be sent (§5)
+SEC_SOMEDAY: Final = "s"  # weekly review: "когда-нибудь" (iteration 4, §6)
+SEC_UNANSWERED: Final = "r"  # weekly review: the week's reminders nobody reacted to
+SEC_UNDATED: Final = "u"  # weekly review: open tasks without a date
 # Per list, the sections whose open lines are numbered, in numbering order.
 NUMBERED_SECTIONS: Final[dict[str, tuple[str, ...]]] = {
     LIST_TODAY: (SEC_OPEN, SEC_OVERDUE, SEC_PERIOD),
     LIST_TASKS: (SEC_OPEN,),
     LIST_MORNING: (SEC_OPEN, SEC_YESTERDAY, SEC_OVERDUE, SEC_PERIOD),
     LIST_EVENING: (SEC_MISSED, SEC_AHEAD, SEC_OVERDUE),
+    LIST_WEEKLY: (SEC_PERIOD, SEC_SOMEDAY, SEC_UNANSWERED, SEC_UNDATED),
 }
+# Lists whose line stands for the item: a re-render matches lines by item, not by occurrence.
+ITEM_LISTS: Final = frozenset({LIST_TASKS, LIST_WEEKLY})
 TODAY_EMPTY: Final = "На сегодня ничего не запланировано."
 YESTERDAY_TITLE: Final = "Вчерашний итог"
 YESTERDAY_NOTE: Final = "не успел прислать"
@@ -1190,11 +1205,11 @@ def number_lines(kind: str, sections: Mapping[str, Sequence[Row]]) -> ListLines:
 def pin_lines(kind: str, sections: Mapping[str, Sequence[Row]], pinned: Sequence[tuple[str, int, Row]]) -> ListLines:
     """A re-render after a press: the numbered lines of the message (``pinned``: section, number, the row as it is
     now) keep their sections and numbers, in number order; the rows of the fresh ``sections`` that are not among them
-    (added since, past the first 20) follow without a number. /tasks tells rows apart by item (a series' next
-    instance is the same line), the day lists by occurrence."""
+    (added since, past the first 20) follow without a number. /tasks and the weekly review tell rows apart by item
+    (a series' next instance is the same line), the day lists by occurrence."""
 
     def key(row: Row) -> tuple[int, int | None]:
-        return (row.item_id, None) if kind == LIST_TASKS else (row.item_id, row.occurrence_id)
+        return (row.item_id, None) if kind in ITEM_LISTS else (row.item_id, row.occurrence_id)
 
     taken = {key(row) for _, _, row in pinned}
     lines: ListLines = {s: [] for s in sections}
@@ -1411,6 +1426,107 @@ def evening_digest(data: DigestData, prefs: Prefs, now: datetime, *, lines: List
     return text, _list_markup(nb, text, digest_move_row(day) if move else [])
 
 
+# --- the weekly review (docs/features/iteration-4.md §6) -----------------------------------------------------------
+
+WEEKLY_TITLE: Final = "Обзор недели"
+WEEKLY_SOMEDAY_TITLE: Final = "🌙 <b>Когда-нибудь</b>"
+WEEKLY_UNANSWERED_TITLE: Final = "🔕 <b>Напоминания без ответа</b>"
+WEEKLY_UNDATED_TITLE: Final = "📋 <b>Задачи без даты</b>"
+WEEKLY_CLEAR: Final = "Всё разобрано 🎉"
+
+
+def weekly_sections(data: WeeklyData) -> dict[str, list[Row]]:
+    return {
+        SEC_PERIOD: list(data.period),
+        SEC_SOMEDAY: list(data.someday),
+        SEC_UNANSWERED: list(data.unanswered),
+        SEC_UNDATED: list(data.undated),
+    }
+
+
+def weekly_review(data: WeeklyData, prefs: Prefs, now: datetime, *, lines: ListLines | None = None) -> View:
+    """Sunday's "🗓 Обзор недели, вс 25 окт": the spans of this and next week / month ("🗓 На следующей неделе (до вс
+    1 ноя)"), "🌙 Когда-нибудь" (a few, "… и ещё 4 — в /someday"), "🔕 Напоминания без ответа" (the week's reminders
+    nobody reacted to, with their time), "📋 Задачи без даты" — every open line numbered, [✅ N] under them (the list
+    buttons: no AI). ``lines``: a re-render (``pin_lines``)."""
+    if lines is None:
+        lines = number_lines(LIST_WEEKLY, weekly_sections(data))
+    nb = _Numbered(LIST_WEEKLY, data.day, lines)
+    head = [f"🗓 <b>{WEEKLY_TITLE}</b>, {fmt_date(data.day)}"]
+    budget = MAX_TEXT - _TAIL_RESERVE - tg_len("\n".join(head))
+    body: list[str] = []
+
+    def add(header: str | None, section_lines: Sequence[str]) -> None:
+        room = max(budget - tg_len("\n".join(body)) - 40, 60)
+        body.extend(["", *([header] if header else []), *fit_lines(section_lines, room)])
+
+    if period_lines := _period_lines(lines.get(SEC_PERIOD, []), prefs, now, nb):
+        add(None, period_lines)
+    if someday := lines.get(SEC_SOMEDAY):
+        rows = [nb.line(SEC_SOMEDAY, e, _row_title(e[0])) for e in someday]
+        more = data.someday_total - sum(not row_done(r) for r, _ in someday)
+        add(WEEKLY_SOMEDAY_TITLE, [*rows, *([f"<i>… и ещё {more} — в /someday</i>"] if more > 0 else [])])
+    if unanswered := lines.get(SEC_UNANSWERED):
+        add(WEEKLY_UNANSWERED_TITLE, [nb.line(SEC_UNANSWERED, e, row_line(e[0], prefs, now)) for e in unanswered])
+    if undated := lines.get(SEC_UNDATED):
+        add(WEEKLY_UNDATED_TITLE, [nb.line(SEC_UNDATED, e, _row_title(e[0])) for e in undated])
+    if not body:
+        body = ["", WEEKLY_CLEAR]
+    if hint := nb.hint():
+        body += ["", *hint]
+    text = fit("\n".join(head + body))
+    return text, _list_markup(nb, text)
+
+
+# --- stale items (docs/features/iteration-4.md §4) -----------------------------------------------------------------
+
+STALE_MARK: Final = "🕸"
+
+
+def stale_question(
+    item: Item,
+    occ: Occurrence | None,
+    reminders: Sequence[Reminder],
+    prefs: Prefs,
+    now: datetime,
+    *,
+    moves: int = 0,
+) -> MenuView:
+    """ "🕸 📌 «Сделать карту» висит 15 дней. Что делаем?" with how often it was moved and the card's time line;
+    [✅ Сделано] [💤 Когда-нибудь] / [🗑 Удалить] [Оставить]. An item saved today (moved twice already): "🕸 📌 «…»
+    переносили уже 2 раза. Что делаем?"."""
+    tz = prefs.zone
+    days = (_local(now, tz).date() - _local(item.created_at, tz).date()).days
+    title = f"{_kind_emoji(item.kind)} «{q(item.title)}»"
+    times = f"{moves} {plural_ru(moves, 'раз', 'раза', 'раз')}"
+    if days > 0:
+        lines = [f"{STALE_MARK} {title} висит {days} {plural_ru(days, 'день', 'дня', 'дней')}. Что делаем?"]
+        if moves >= 2:
+            lines.append(f"Переносили уже {times}.")
+    else:
+        lines = [f"{STALE_MARK} {title} переносили уже {times}. Что делаем?"]
+    if (line := _time_line(item, occ, reminders, prefs, now)) is not None:
+        lines.append(line)
+    return fit("\n".join(lines)), stale_keyboard(item.id)
+
+
+def stale_done(item: Item, occ: Occurrence | None, prefs: Prefs, now: datetime) -> View:
+    """[✅ Сделано] of the stale question: like a reminder after ✅ (with [↩️ Не сделано] for its instance)."""
+    if occ is not None and occ.status == "done":
+        return reminder_done(item, occ, prefs, now)
+    return fit(f"✅ <s>{q(item.title)}</s>"), None
+
+
+def stale_someday(item: Item) -> View:
+    """[💤 Когда-нибудь] of the stale question: no date, no reminders; the item waits in /someday."""
+    return fit(f"💤 «{q(item.title)}» — когда-нибудь, запись в /someday"), None
+
+
+def stale_kept(item: Item) -> View:
+    """[Оставить] of the stale question: nothing changes, the count starts afresh."""
+    return fit(f"👌 Оставил «{q(item.title)}» как есть — спрошу снова, если опять залежится"), None
+
+
 # --- usage / help ------------------------------------------------------------------------------------------------
 
 PURPOSE_LABELS: Final[dict[str, str]] = {
@@ -1472,7 +1588,6 @@ def help_text() -> str:
             "• или нажми «✏️ Изменить» в карточке",
             "• или опиши: «закрой задачу про документацию», «купил молоко» — одну подходящую запись меняю сразу"
             " (↩️ Отменить вернёт как было), из нескольких — спрошу какую",
-            "• правка исходного сообщения в Telegram запись не меняет",
             "",
             "<b>Напоминания</b>",
             "• время записи — это время напоминания: «встреча в 15» — напомню в 15:00, «в обед» — в 13:00;"
@@ -1480,7 +1595,7 @@ def help_text() -> str:
             "• «напомни за 30 минут до встречи в 15» — напомню в 14:30, а 15:00 останется в названии;"
             " «за день и за час» — оба раза",
             "• «на этой неделе», «в октябре», «летом» — в последний рабочий день срока в 19:00;"
-            " такие дела каждое утро в плане, пока срок идёт",
+            " в утреннем плане — в первый и последний рабочий день срока",
             "• «до пятницы», «к лету» (срок — 1 июня) — накануне в 19:00 и в сам день в 10:00,"
             " «на днях» — через 2 дня в 19:00",
             "• «когда-нибудь» — без напоминаний, такие записи в /someday",
@@ -1490,12 +1605,13 @@ def help_text() -> str:
             "• повторы: «каждый день в 9 и 18» — один повтор; «Готово» закрывает текущий раз;"
             " «⏹ Хватит повторять» или «больше не напоминай» — стоп",
             "• в тихие часы приходят только напоминания с явно заданным временем",
-            "• компьютер спал: опоздавшее ночью напоминание придёт утром без звука, итог дня — в утреннем"
-            " дайджесте, и я коротко напишу, что меня не было",
-            "• по утрам — план на день, вечером — итоги",
+            "• компьютер спал: опоздавшее ночью придёт утром без звука, итог дня — в утреннем плане",
+            "• утром — план на день, вечером — итоги, в воскресенье 19:00 — обзор недели",
+            "• дело висит (3 дайджеста без действий или 2 переноса) — раз в день спрошу: сделано,"
+            " когда-нибудь, удалить или оставить",
             "",
             "<b>Списки</b>",
-            "• в /today, /tasks и дайджестах дела пронумерованы, под списком кнопки ✅ 1 ✅ 2 … (до 20):"
+            "• в /today, /tasks, дайджестах и обзоре недели дела пронумерованы, под списком кнопки ✅ 1 ✅ 2 … (до 20):"
             " нажал — дело закрыто, кнопка стала ↩️ — отменить; у повторяющихся закрывается"
             " текущий раз, у задачи с шагами — и шаги",
             "",
@@ -1512,7 +1628,7 @@ def help_text() -> str:
             "<b>Приложение</b>",
             "• кнопка «📱 Свалка» слева от поля ввода открывает Mini App: сегодня, лента с поиском и картинками,"
             " задачи, карточки со всеми правками, «закинуть в свалку», вопросы, настройки и расходы",
-            "• кнопка есть, когда приложение включено (README, «Mini App»); записи из приложения в чат не дублируются",
+            "• записи из приложения в чат не дублируются",
             "",
             "<b>Команды</b>",
             "/today — план на сегодня",
@@ -1562,6 +1678,7 @@ ASK_FIELDS: Final[dict[str, AskField]] = {
     "quiet_end": AskField("конец тихих часов", "time", "quiet"),
     "digest_morning_time": AskField("утренний дайджест", "time", "digest"),
     "digest_evening_time": AskField("вечерний дайджест", "time", "digest"),
+    "digest_weekly_time": AskField("обзор недели (воскресенье)", "time", "digest"),
     "budget_usd": AskField("бюджет на ИИ", "money", "budget"),
 }
 
@@ -1626,7 +1743,8 @@ def settings_menu(prefs: Prefs) -> MenuView:
         f"   выходные — сб {fmt_time(prefs.weekend_time)}, дата без времени — {fmt_time(prefs.bare_date_time)}",
         f"🌙 Тихие часы: {fmt_time(prefs.quiet_start)}–{fmt_time(prefs.quiet_end)} ({_on_off(prefs.quiet_enabled)})",
         f"📰 Дайджесты: утро {fmt_time(prefs.digest_morning_time)} ({_on_off(prefs.digest_morning_enabled)}),"
-        f" вечер {fmt_time(prefs.digest_evening_time)} ({_on_off(prefs.digest_evening_enabled)})",
+        f" вечер {fmt_time(prefs.digest_evening_time)} ({_on_off(prefs.digest_evening_enabled)}),"
+        f" обзор недели вс {fmt_time(prefs.digest_weekly_time)} ({_on_off(prefs.digest_weekly_enabled)})",
         f"💰 Бюджет: {fmt_money(prefs.budget_usd)} в месяц",
         f"🎙 Голос: язык {_stt_label(prefs.stt_language)}, распознавание {_stt_mode_label(prefs.stt_mode)}",
         "",
@@ -1692,11 +1810,13 @@ def settings_quiet_menu(prefs: Prefs) -> MenuView:
 
 def settings_digest_menu(prefs: Prefs) -> MenuView:
     m_on, e_on = prefs.digest_morning_enabled, prefs.digest_evening_enabled
+    w_on = prefs.digest_weekly_enabled
     text = "\n".join(
         [
             "📰 <b>Дайджесты</b>",
             f"☀️ Утренний (план на день): {fmt_time(prefs.digest_morning_time)}, {_on_off(m_on)}",
             f"🌙 Вечерний (итоги дня): {fmt_time(prefs.digest_evening_time)}, {_on_off(e_on)}",
+            f"🗓 Обзор недели (воскресенье): {fmt_time(prefs.digest_weekly_time)}, {_on_off(w_on)}",
             "В тихие часы дайджест придёт после их окончания.",
         ]
     )
@@ -1708,6 +1828,10 @@ def settings_digest_menu(prefs: Prefs) -> MenuView:
         [
             _ask_button(f"☀️ Время {fmt_time(prefs.digest_morning_time)}", "digest_morning_time"),
             _ask_button(f"🌙 Время {fmt_time(prefs.digest_evening_time)}", "digest_evening_time"),
+        ],
+        [
+            button(f"🗓 {'Выключить' if w_on else 'Включить'} обзор недели", SetCb(key="digest_toggle", v="weekly")),
+            _ask_button(f"🗓 Время {fmt_time(prefs.digest_weekly_time)}", "digest_weekly_time"),
         ],
         _back_row(),
     )

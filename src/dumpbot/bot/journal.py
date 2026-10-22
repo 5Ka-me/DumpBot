@@ -5,7 +5,9 @@
 - ``ButtonJournal`` (inner middleware of every callback query handler, registered on the dispatcher): a ``button``
   event after a press was handled — the action of its callback data (``o:done``, ``ld:undo``, ``s:stt_mode``), the
   item / occurrence it names, and as the source the purpose of the bot message it is on (reminder, digest, list,
-  card, …). A press whose handler failed is journaled with the error type.
+  card, …). A press whose handler failed is journaled with the error type. A press that moves the item to another
+  day (``MOVE_ACTIONS``: [📅 Завтра], [➡️ След. неделя / месяц], a day of the picker) is marked ``"move": true`` —
+  the stale-items check counts those (docs/features/iteration-4.md §4).
 
 Both write after the handler (the reply / toast is out already) and never fail the update: ``events.record``
 swallows its errors.
@@ -21,7 +23,7 @@ from aiogram import BaseMiddleware
 from aiogram.filters.callback_data import CallbackData
 from aiogram.types import CallbackQuery, Message, TelegramObject
 
-from dumpbot.bot.cbdata import DayCb, ItemCb, KindCb, ListCb, OccCb, PickCb, SubCb, UndoCb
+from dumpbot.bot.cbdata import DayCb, ItemCb, KindCb, ListCb, OccCb, PickCb, StaleCb, SubCb, UndoCb
 from dumpbot.services import events
 
 if TYPE_CHECKING:
@@ -41,8 +43,12 @@ ITEM_FIELD: Final[dict[type[CallbackData], str]] = {
     PickCb: "item",
     UndoCb: "item",
     ListCb: "i",
+    StaleCb: "id",
 }
 OCC_FIELD: Final[dict[type[CallbackData], str]] = {OccCb: "id", ListCb: "o", DayCb: "id"}
+# Presses that move the item to another day (``button_action`` codes): to tomorrow, to the next week / month, to a
+# day of the picker. Snoozing by hours is not a move.
+MOVE_ACTIONS: Final = frozenset({"o:tmr", "o:nw", "o:nm", "dy"})
 
 
 class CommandJournal(BaseMiddleware):
@@ -105,6 +111,8 @@ def button_entry(
     else:  # a button of an older version or unknown data: its first two parts
         action = ":".join(raw.split(":")[:2])
     info: dict[str, Any] = {"action": action[:ACTION_MAX], "cb": raw}
+    if action in MOVE_ACTIONS and error is None:
+        info[events.MOVE] = True
     if error is not None:
         info["error"] = error
     message = callback.message

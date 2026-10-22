@@ -46,7 +46,8 @@ SubCb     ``c:<a>:<step item id>``      A checklist line of a parent's card: ``d
 ListCb    ``ld:<a>:<k>:<d>:<s>:<n>:``   [✅ N] / [↩️ N] under a list (docs/features/iteration-3.md §2): ``a`` =
           ``<o>:<i>``                   ``done`` / ``undo`` (the wanted state, as in SubCb); ``k`` = the list
                                         (``LIST_KINDS``: ``t`` /today, ``k`` /tasks, ``m`` / ``e`` the morning /
-                                        evening digest); ``d`` = its local day ``YYYYMMDD`` ("" for /tasks);
+                                        evening digest, ``w`` the weekly review — docs/features/iteration-4.md
+                                        §6); ``d`` = its local day ``YYYYMMDD`` ("" for /tasks);
                                         ``s`` = the section of the line (``views.SEC_*``), ``n`` = its
                                         number; ``o`` = the occurrence of the line (0: none, the item itself),
                                         ``i`` = its item. The buttons of a list message are its snapshot: a press
@@ -60,6 +61,10 @@ AgainCb   ``vr:<raw id>``               [🔁 Ещё раз] under "🎤 Не р
 DayCb     ``dy:<occurrence id>:<d>``    A day of the [📅 Выбрать день] picker (docs/features/iteration-4.md §3):
                                         move the item of the occurrence to local day ``d`` (``YYYYMMDD``) at its
                                         own time of day, or ``task_default_time`` (``items.move_to_day``)
+StaleCb   ``st:<a>:<item id>``          The answer to "«…» висит 15 дней. Что делаем?" (docs/features/iteration-4.md
+                                        §4, ``STALE_ACTIONS``): ``done`` (✅ Сделано), ``smd`` (💤 Когда-нибудь),
+                                        ``del`` (🗑 Удалить), ``keep`` (Оставить: nothing changes, the count of
+                                        digests and moves starts afresh)
 ========  ============================  =============================================================================
 
 Removed 2026-10-07 (an item's time is its notification time): ``ItemCb`` ``lead`` (the "⏱ Напомнить за…" menu) and
@@ -113,7 +118,13 @@ LIST_TODAY: Final = "t"
 LIST_TASKS: Final = "k"
 LIST_MORNING: Final = "m"
 LIST_EVENING: Final = "e"
-LIST_KINDS: Final[frozenset[str]] = frozenset({LIST_TODAY, LIST_TASKS, LIST_MORNING, LIST_EVENING})
+LIST_WEEKLY: Final = "w"
+LIST_KINDS: Final[frozenset[str]] = frozenset({LIST_TODAY, LIST_TASKS, LIST_MORNING, LIST_EVENING, LIST_WEEKLY})
+STALE_DONE: Final = "done"
+STALE_SOMEDAY: Final = "smd"
+STALE_DELETE: Final = "del"
+STALE_KEEP: Final = "keep"
+STALE_ACTIONS: Final[frozenset[str]] = frozenset({STALE_DONE, STALE_SOMEDAY, STALE_DELETE, STALE_KEEP})
 
 
 class ItemCb(CallbackData, prefix="i"):
@@ -180,6 +191,11 @@ class DayCb(CallbackData, prefix="dy"):
     d: str  # local day, DIGEST_DAY_FMT
 
 
+class StaleCb(CallbackData, prefix="st"):
+    a: str  # STALE_ACTIONS
+    id: int  # item id
+
+
 ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     ItemCb,
     OccCb,
@@ -193,4 +209,5 @@ ALL_CALLBACKS: Final[tuple[type[CallbackData], ...]] = (
     UndoCb,
     AgainCb,
     DayCb,
+    StaleCb,
 )

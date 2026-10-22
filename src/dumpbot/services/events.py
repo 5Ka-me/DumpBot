@@ -15,15 +15,25 @@ type               written by                              source / ids / data
                                                            /api/items/{id}/done", "status": 200}``
 ``reminder_sent``  ``workers.scheduler``                   source ``reminder``; item, occurrence;
                                                            data ``{"reminder": id, "late_min": N, "held": bool}``
-``digest_item``    ``workers.scheduler``                   source ``digest``; a line of a sent digest: item,
-                                                           occurrence; data ``{"digest": "morning", "sec": "o"}``
-                                                           (``bot.views.SEC_*``)
-``stale_ask``      §4 (the "висит 15 дней" question)
+``digest_item``    ``workers.scheduler``                   source ``digest``; a line of a sent digest or weekly
+                                                           review: item, occurrence; data ``{"digest": "morning",
+                                                           "sec": "o"}`` (``"weekly"``; ``bot.views.SEC_*``)
+``edit``           ``services.processor`` (text),          an item changed without a button of its own: by a text
+                   ``bot.routers.callbacks`` /             edit (a reply to a card, an edit by description, the
+                   ``web.api_lists`` (bulk move)           "🕒 Время" answer; source ``text``) or moved by «📅
+                                                           Перенести невыполненное на завтра» (source ``digest`` /
+                                                           ``miniapp``, one per occurrence); data ``{"move": bool}``
+``stale_ask``      ``workers.scheduler``                   source ``stale``; the "«…» висит 15 дней. Что делаем?"
+                                                           question (§4): item; data ``{"digests": N, "moves": M}``
 =================  ======================================  =========================================================
 
 ``data`` holds codes and ids only, never message text. Writing is best effort and comes after the action it
 describes (the reply, the toast, the sent reminder): ``record`` uses its own session, and any failure is logged by
 type and swallowed — the journal never breaks or delays what it journals.
+
+``"move": true`` in ``data`` marks a move of the item to another day (§4 counts them, ``services.stale``): the
+buttons [📅 Завтра], [➡️ След. неделя / месяц] and a day of the picker (``bot.journal.MOVE_ACTIONS``), the Mini App's
+new time / snooze to tomorrow, a text edit that moved the item, the bulk move.
 """
 
 from __future__ import annotations
@@ -43,13 +53,19 @@ __all__ = [
     "BUTTON",
     "COMMAND",
     "DIGEST_ITEM",
+    "EDIT",
     "MINIAPP",
+    "MOVE",
     "REMINDER_SENT",
     "SRC_DIGEST",
     "SRC_MINIAPP",
     "SRC_REMINDER",
+    "SRC_STALE",
+    "SRC_TEXT",
     "STALE_ASK",
     "Entry",
+    "edit_entry",
+    "moved_entries",
     "record",
 ]
 
@@ -60,11 +76,16 @@ BUTTON: Final = "button"
 MINIAPP: Final = "miniapp"
 REMINDER_SENT: Final = "reminder_sent"
 DIGEST_ITEM: Final = "digest_item"
+EDIT: Final = "edit"
 STALE_ASK: Final = "stale_ask"
 
 SRC_REMINDER: Final = "reminder"
 SRC_DIGEST: Final = "digest"
 SRC_MINIAPP: Final = "miniapp"
+SRC_TEXT: Final = "text"
+SRC_STALE: Final = "stale"
+
+MOVE: Final = "move"  # data key: the event moved the item to another day
 
 _SHORT: Final = 16  # events.type / events.source are String(16)
 
@@ -81,6 +102,17 @@ class Entry:
     occurrence_id: int | None = None
     data: dict[str, Any] | None = None
     message: tuple[int, int] | None = None
+
+
+def edit_entry(item_id: int, *, move: bool) -> Entry:
+    """``edit`` of an item changed by a text message (a reply to its card, an edit by description, the "🕒 Время"
+    answer); ``move``: its time changed."""
+    return Entry(EDIT, source=SRC_TEXT, item_id=item_id, data={MOVE: move})
+
+
+def moved_entries(occurrences: Sequence[Any], source: str) -> list[Entry]:
+    """``edit`` per occurrence moved by «📅 Перенести невыполненное на завтра» (the digest's button, the Mini App)."""
+    return [Entry(EDIT, source=source, item_id=o.item_id, occurrence_id=o.id, data={MOVE: True}) for o in occurrences]
 
 
 async def record(sessionmaker: async_sessionmaker[AsyncSession], *entries: Entry) -> None:

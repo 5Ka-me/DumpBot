@@ -161,3 +161,20 @@ class DigestData:
     # Morning only: the day before, when its evening digest could not be sent (the bot was down) — shown as
     # "Вчерашний итог (не успел прислать)" (docs/features/iteration-3.md §5).
     yesterday: Agenda | None = None
+
+
+@dataclass
+class WeeklyData:
+    """The weekly review of local ``day`` (a Sunday; docs/features/iteration-4.md §6). Each item is in one section,
+    the first that has it."""
+
+    day: date
+    period: list[Row] = field(default_factory=list)  # spans of this and next week / month
+    someday: list[Row] = field(default_factory=list)  # a few "когда-нибудь" items
+    someday_total: int = 0  # all of them ("и ещё N — в /someday")
+    unanswered: list[Row] = field(default_factory=list)  # reminders of the week nobody reacted to, still not done
+    undated: list[Row] = field(default_factory=list)  # open tasks without any date
+
+    @property
+    def empty(self) -> bool:
+        return not (self.period or self.someday or self.unanswered or self.undated)

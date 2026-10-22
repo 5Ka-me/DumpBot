@@ -19,6 +19,10 @@ The Mini App (§D): ``feed`` pages through all items newest first with filters (
 the rows an answer named, ``item_images`` / ``image_counts`` find the pictures of the message an item came from.
 
 Iteration 3 (§2): ``list_rows`` reads the numbered lines of a list message (its [✅ N] buttons) as they are now.
+
+Iteration 4 (§6), the weekly review: ``review_period_rows`` (the spans of this and next week / month),
+``someday_for_review`` (a few "когда-нибудь" items, the ones the reviews showed least recently first),
+``undated_tasks`` (open tasks without any date).
 """
 
 from __future__ import annotations
@@ -37,7 +41,7 @@ from sqlalchemy.orm import defer
 from sqlalchemy.sql.selectable import Subquery
 
 from dumpbot.ai.schemas import QuerySpec
-from dumpbot.db.models import AiUsage, Item, ItemLink, Occurrence, RawMessage
+from dumpbot.db.models import AiUsage, Event, Item, ItemLink, Occurrence, RawMessage
 from dumpbot.domain import recurrence, timeresolve
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
@@ -63,11 +67,14 @@ __all__ = [
     "recurring",
     "related_candidates",
     "related_refs",
+    "review_period_rows",
     "rows_by_ids",
     "rows_for_llm",
     "run_query",
     "search",
+    "someday_for_review",
     "someday_items",
+    "undated_tasks",
     "usage_summary",
 ]
 
@@ -213,6 +220,74 @@ async def someday_items(session: AsyncSession, limit: int = 50) -> list[Row]:
         _item_select(occ)
         .where(Item.someday.is_(True), Item.status == "open", _listed())
         .order_by(Item.created_at.desc(), Item.id.desc())
+        .limit(limit)
+    )
+    return await _item_rows(session, stmt)
+
+
+async def review_period_rows(
+    session: AsyncSession, weeks: tuple[date, date], months: tuple[date, date], limit: int = 30
+) -> list[Row]:
+    """Open items of a calendar span that overlaps ``weeks`` (a week span) or ``months`` (a month or a season): the
+    weekly review's "this and next week / month" (docs/features/iteration-4.md §6), the shortest span first."""
+    occ = _occ_subquery(open_only=True)
+
+    def overlaps(span: tuple[date, date]) -> ColumnElement[bool]:
+        return and_(Item.period_start <= span[1], Item.period_end >= span[0])
+
+    stmt = (
+        _item_select(occ)
+        .where(
+            Item.status == "open",
+            Item.someday.is_(False),
+            or_(
+                and_(Item.period_kind == "week", overlaps(weeks)),
+                and_(Item.period_kind.in_(("month", "season")), overlaps(months)),
+            ),
+        )
+        .order_by(Item.period_end, Item.period_start.desc(), Item.created_at, Item.id)
+        .limit(limit)
+    )
+    return await _item_rows(session, stmt)
+
+
+async def someday_for_review(
+    session: AsyncSession, limit: int, *, before: datetime | None = None, digest: str = "weekly"
+) -> tuple[list[Row], int]:
+    """Up to ``limit`` open "когда-нибудь" items for the weekly review — never shown by a review (``digest_item``
+    events of ``digest``) first, then the ones shown longest ago, the oldest saved first — and how many there are.
+    ``before``: only reviews before it count (the review's own day: a re-render after [✅ N] lists the same items)."""
+    shown = [Event.item_id == Item.id, Event.type == "digest_item", Event.data["digest"].astext == digest]
+    if before is not None:
+        shown.append(Event.created_at < before)
+    last_shown = select(func.max(Event.created_at)).where(*shown).scalar_subquery()
+    occ = _occ_subquery(open_only=True)
+    where = (Item.someday.is_(True), Item.status == "open", _listed())
+    stmt = (
+        _item_select(occ).where(*where).order_by(last_shown.asc().nulls_first(), Item.created_at, Item.id).limit(limit)
+    )
+    total = await session.scalar(select(func.count()).select_from(Item).where(*where))
+    return await _item_rows(session, stmt), int(total or 0)
+
+
+async def undated_tasks(session: AsyncSession, limit: int = 30) -> list[Row]:
+    """Open tasks / events / purchases the owner never gave a date (the weekly review's last section): no open
+    occurrence, or only the time the bot chose for a task without one (``default``: "купить молоко" got today 19:00);
+    not a span, not "когда-нибудь", not a series. Steps live in their parent's card; the oldest saved first."""
+    has_date = exists().where(
+        Occurrence.item_id == Item.id, Occurrence.status == "open", Occurrence.precision != "default"
+    )
+    stmt = (
+        _item_select(_occ_subquery(open_only=True))
+        .where(
+            Item.kind.in_(_ACTIONABLE_KINDS),
+            Item.status == "open",
+            Item.someday.is_(False),
+            Item.parent_id.is_(None),
+            Item.rec_active.is_(False),
+            ~has_date,
+        )
+        .order_by(Item.created_at, Item.id)
         .limit(limit)
     )
     return await _item_rows(session, stmt)

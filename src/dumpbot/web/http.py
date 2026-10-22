@@ -15,13 +15,17 @@ from typing import Any, Final
 from aiohttp import web
 
 from dumpbot.context import AppContext
-from dumpbot.services import items
+from dumpbot.services import events, items
 from dumpbot.workers.jobs import describe_error, safe_traceback
 
 log = logging.getLogger(__name__)
 
 CTX: Final = web.AppKey("ctx", AppContext)
 API_PREFIX: Final = "/api/"
+# What a handler adds to the ``miniapp`` journal event of its call (``journal_note``) and further events of its own
+# (``journal_also``); written by ``web.server.journal_middleware`` after the answer went out.
+JOURNAL_DATA: Final = web.RequestKey("journal_data", dict)
+JOURNAL_EXTRA: Final = web.RequestKey("journal_extra", list)
 
 NOT_FOUND: Final = "Запись не найдена"
 INTERNAL: Final = "😢 Что-то пошло не так — попробуй ещё раз."
@@ -71,6 +75,16 @@ def _dumps(data: Any) -> str:
 
 def ctx_of(request: web.Request) -> AppContext:
     return request.app[CTX]
+
+
+def journal_note(request: web.Request, **data: Any) -> None:
+    """Codes for the ``miniapp`` journal event of this call, e.g. ``move=True`` (docs/features/iteration-4.md §4)."""
+    request.setdefault(JOURNAL_DATA, {}).update(data)
+
+
+def journal_also(request: web.Request, *entries: events.Entry) -> None:
+    """More journal events of this call (one per item it changed in bulk), written with its ``miniapp`` event."""
+    request.setdefault(JOURNAL_EXTRA, []).extend(entries)
 
 
 async def read_json(request: web.Request) -> dict[str, Any]:

@@ -88,8 +88,10 @@ async def test_section_lists_the_shortest_span_first(session, prefs, local, now,
 
 
 async def test_morning_digest_with_only_period_items_is_sent(session, prefs, local, week_item):
-    data = await digest.build_digest(session, "morning", prefs, local(2026, 10, 10, 9, 0))
+    """Iteration 4, §4: a span's item is in the morning digest on its first and last working day only."""
+    data = await digest.build_digest(session, "morning", prefs, local(2026, 10, 9, 9, 0))  # Friday
     assert data is not None and titles(data.agenda.period_items) == ["Посмотреть расбери пай"]
+    assert await digest.build_digest(session, "morning", prefs, local(2026, 10, 10, 9, 0)) is None  # Saturday
     assert await digest.build_digest(session, "evening", prefs, local(2026, 10, 10, 21, 0)) is None
 
 

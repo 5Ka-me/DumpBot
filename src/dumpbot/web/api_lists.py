@@ -25,10 +25,20 @@ from dumpbot.bot.routers.settings import parse_money, parse_time, parse_tz, save
 from dumpbot.db.models import Job
 from dumpbot.domain.kinds import KIND_EMOJI, KIND_LABELS, KINDS
 from dumpbot.domain.prefs import Prefs
-from dumpbot.services import digest, processor, query
+from dumpbot.services import digest, events, processor, query
 from dumpbot.web import serialize
 from dumpbot.web.auth import USER
-from dumpbot.web.http import NUL_TEXT, ApiError, bad_request, ctx_of, has_nul, json_response, path_id, read_json
+from dumpbot.web.http import (
+    NUL_TEXT,
+    ApiError,
+    bad_request,
+    ctx_of,
+    has_nul,
+    journal_also,
+    json_response,
+    path_id,
+    read_json,
+)
 from dumpbot.workers.jobs import BUDGET_REASON, RetryLater
 
 if TYPE_CHECKING:
@@ -226,6 +236,7 @@ async def move_today(request: web.Request) -> web.Response:
         await session.commit()
     if moved:
         ctx.scheduler_wakeup.set()
+    journal_also(request, *events.moved_entries(moved, events.SRC_MINIAPP))
     message = f"📅 Перенёс на завтра: {len(moved)}" if moved else "Нечего переносить"
     return json_response({"moved": len(moved), "message": message})
 

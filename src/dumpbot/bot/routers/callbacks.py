@@ -21,7 +21,10 @@ transcribes the same voice note again (``processor.retry_unheard``). §2-3, remi
 месяце"; [💤 Когда-нибудь] (``smd``); [📅 Выбрать день] (``pick``) turns the message into a 7-day picker (``DayCb``
 moves the item to that day, [Другая дата…] is the "🕒 Время" prompt, [← Назад] = ``rem``); [⏹ Хватит повторять] of a
 series and [⏹ Больше не повторять] after its ✅ (``stop``) stop it — every instance still ahead is cancelled with its
-reminders and this one is closed.
+reminders and this one is closed. §4: the answers to "«…» висит 15 дней. Что делаем?" (``StaleCb``): [✅ Сделано]
+closes the item (its current instance), [💤 Когда-нибудь] takes its date away, [🗑 Удалить] deletes it (with [↩️
+Вернуть]), [Оставить] changes nothing — the press itself is the action that starts the count afresh. The weekly review
+(§6) is one more list of [✅ N] (``ListCb`` kind ``w``).
 
 ``ItemCb`` time/title/tags (text-input dialogs) live in the ``edit`` router and ``SetCb`` in ``settings``.
 """
@@ -56,6 +59,10 @@ from dumpbot.bot.cbdata import (
     SNOOZE_ACTIONS,
     SNOOZE_EVENING,
     SNOOZE_MINUTES,
+    STALE_ACTIONS,
+    STALE_DELETE,
+    STALE_DONE,
+    STALE_KEEP,
     STEP_ACTIONS,
     AgainCb,
     AskCb,
@@ -66,6 +73,7 @@ from dumpbot.bot.cbdata import (
     ListCb,
     OccCb,
     PickCb,
+    StaleCb,
     SubCb,
     UndoCb,
 )
@@ -75,7 +83,7 @@ from dumpbot.db.models import Occurrence, RawMessage
 from dumpbot.domain import timeresolve
 from dumpbot.domain.fmt import fmt_date, fmt_dt, plural_ru
 from dumpbot.domain.kinds import KIND_LABELS, KINDS
-from dumpbot.services import digest, items, processor, query, undo
+from dumpbot.services import digest, events, items, processor, query, undo
 from dumpbot.workers import jobs
 
 if TYPE_CHECKING:
@@ -134,6 +142,7 @@ def make_router() -> Router:
     router.callback_query.register(on_undo, UndoCb.filter())
     router.callback_query.register(on_again, AgainCb.filter())
     router.callback_query.register(on_day, DayCb.filter())
+    router.callback_query.register(on_stale_answer, StaleCb.filter())
     router.callback_query.register(on_digest, DigestCb.filter(F.a.in_(DIGEST_ACTIONS)))
     router.callback_query.register(on_old_digest, F.data.in_(OLD_DIGEST_DATA))
     # Buttons of an older version (the removed "⏱ Напомнить за…" menu: ItemCb "lead", "l:…"), garbage data.
@@ -149,7 +158,7 @@ async def run(callback: CallbackQuery, ctx: AppContext, op: Op) -> None:
             prefs = await ctx.prefs(session)
             outcome = await op(session, prefs, now)
             await session.commit()
-            events = items.take_parent_events(session)
+            parent_events = items.take_parent_events(session)
     except items.NotFoundError:
         await common.answer(callback, common.NOT_FOUND)
         return
@@ -159,7 +168,7 @@ async def run(callback: CallbackQuery, ctx: AppContext, op: Op) -> None:
         await common.show(ctx, message_id, outcome.view)
     for (text, markup), item_id, occ_id in outcome.cards:
         await sender.send(ctx, text, markup, reply_to=message_id, purpose="card", item_id=item_id, occurrence_id=occ_id)
-    await cards.after_steps(ctx, events, prefs, now, shown=message_id if outcome.view is not None else None)
+    await cards.after_steps(ctx, parent_events, prefs, now, shown=message_id if outcome.view is not None else None)
     if outcome.wake_scheduler:
         ctx.scheduler_wakeup.set()
     if outcome.wake_jobs:
@@ -328,6 +337,40 @@ async def on_day(callback: CallbackQuery, callback_data: DayCb, ctx: AppContext)
         view = views.reminder_moved(result.item, result.occurrence, result.reminders, prefs, now)
         toast = f"📅 Перенёс на {fmt_date(day, today=now.astimezone(prefs.zone).date())}"
         return Outcome(view, toast, wake_scheduler=True)
+
+    await run(callback, ctx, op)
+
+
+# --- the stale question (docs/features/iteration-4.md §4) ---------------------------------------------------------
+
+
+async def on_stale_answer(callback: CallbackQuery, callback_data: StaleCb, ctx: AppContext) -> None:
+    """[✅ Сделано] / [💤 Когда-нибудь] / [🗑 Удалить] / [Оставить] under "«…» висит 15 дней. Что делаем?". An item
+    closed or deleted since: the message shows that, with a toast."""
+    action = callback_data.a
+    if action not in STALE_ACTIONS:
+        await common.answer(callback, common.STALE)
+        return
+
+    async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
+        item = await common.get_item(session, callback_data.id)
+        if item.status == "deleted":
+            return Outcome(views.deleted_card(item), common.DELETED)
+        if item.status == "done":
+            occ = await items.current_occurrence(session, item.id)
+            return Outcome(views.stale_done(item, occ, prefs, now), ALREADY_DONE)
+        if action == STALE_KEEP:
+            return Outcome(views.stale_kept(item), "👌 Оставил")
+        if action == STALE_DELETE:
+            await items.delete_item(session, item.id, now)
+            return Outcome(views.deleted_card(item), "🗑 Удалено", wake_scheduler=True)
+        if action == STALE_DONE:
+            result = await items.apply_patch(session, item.id, EditPatch(action="done"), prefs, now)
+            occ = await items.current_occurrence(session, item.id)
+            return Outcome(views.stale_done(result.item, occ, prefs, now), "✅ Готово", wake_scheduler=True)
+        someday = EditPatch(when=When(text="когда-нибудь", period="someday"))
+        await items.apply_patch(session, item.id, someday, prefs, now)
+        return Outcome(views.stale_someday(item), "💤 Когда-нибудь", wake_scheduler=True)
 
     await run(callback, ctx, op)
 
@@ -716,16 +759,19 @@ async def on_digest(callback: CallbackQuery, callback_data: DigestCb, ctx: AppCo
     """
     sent_at = callback.message.date if isinstance(callback.message, Message) else None
     refs = lists.snapshot(callback.message)
+    moved: list[Occurrence] = []
 
     async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
         day = _digest_day(callback_data.d) or (sent_at or now).astimezone(prefs.zone).date()
-        moved = await digest.move_not_done(session, day, prefs, now)
+        moved[:] = await digest.move_not_done(session, day, prefs, now)
         await session.flush()
         view = await _evening_after_move(session, prefs, day, now, moved, refs)
         toast = f"📅 Перенёс на завтра: {len(moved)}" if moved else "Нечего переносить"
         return Outcome(view, toast, wake_scheduler=bool(moved))
 
     await run(callback, ctx, op)
+    # The button names no item: each moved one gets a move of its own (the stale-items check counts them).
+    await events.record(ctx.sessionmaker, *events.moved_entries(moved, events.SRC_DIGEST))
 
 
 async def on_old_digest(callback: CallbackQuery, ctx: AppContext) -> None:

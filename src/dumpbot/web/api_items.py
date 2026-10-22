@@ -26,7 +26,16 @@ from dumpbot.domain.kinds import KINDS
 from dumpbot.services import items, query
 from dumpbot.services.processor import CANT_SPLIT_TEXT, HAS_STEPS_TEXT, split_budget_block
 from dumpbot.web import serialize
-from dumpbot.web.http import ApiError, bad_request, conflict, ctx_of, json_response, path_id, read_json
+from dumpbot.web.http import (
+    ApiError,
+    bad_request,
+    conflict,
+    ctx_of,
+    journal_note,
+    json_response,
+    path_id,
+    read_json,
+)
 from dumpbot.workers import jobs
 
 if TYPE_CHECKING:
@@ -146,6 +155,8 @@ async def patch_item(request: web.Request) -> web.Response:
     """``{title?, details?, kind?, tags?, period?, someday?}`` — validated first, applied together. The item's time is
     its notification time: there is no "напомнить за" any more (``lead`` is refused like any unknown field)."""
     edits = _item_edits(await read_json(request))
+    if edits.get("period") not in (None, "someday"):  # a new span: the item moved (docs/features/iteration-4.md §4)
+        journal_note(request, move=True)
 
     async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
         return Change(message="✅ Сохранено", warnings=await _apply_edits(session, item, edits, prefs, now))
@@ -243,6 +254,7 @@ async def set_when(request: web.Request) -> web.Response:
         raise bad_request("Нужно либо text, либо due_local")
     if "due_local" in body:
         value = body["due_local"]
+        journal_note(request, move=True)  # the stale-items check counts moves (docs/features/iteration-4.md §4)
 
         async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
             result = await items.apply_patch(session, item.id, EditPatch(when=_due_when(item, value)), prefs, now)
@@ -372,6 +384,8 @@ async def snooze(request: web.Request) -> web.Response:
     valid_minutes = isinstance(minutes, int) and not isinstance(minutes, bool) and 1 <= minutes <= SNOOZE_MAX
     if tomorrow == valid_minutes or (minutes is not None and not valid_minutes):
         raise bad_request(f"Нужно либо minutes (1…{SNOOZE_MAX}), либо tomorrow: true", "minutes")
+    if tomorrow:  # like the reminder's [📅 Завтра]: a move to another day (docs/features/iteration-4.md §4)
+        journal_note(request, move=True)
 
     async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
         occ = await items.current_occurrence(session, item.id)

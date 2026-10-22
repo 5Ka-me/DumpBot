@@ -47,7 +47,7 @@ def _roundtrip(cb: CallbackData) -> str:
 def test_prefixes_are_unique_and_short():
     prefixes = [cls.__prefix__ for cls in ALL_CALLBACKS]
     # "l" (LeadCb) is retired: never reuse it
-    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u", "vr", "dy"]
+    assert prefixes == ["i", "o", "k", "a", "p", "d", "s", "c", "ld", "u", "vr", "dy", "st"]
     assert len(set(prefixes)) == len(prefixes)
 
 
@@ -107,7 +107,7 @@ async def test_day_of_the_picker_fits_and_matches_only_its_filter():
 @pytest.mark.parametrize("action", sorted(LIST_ACTIONS))
 @pytest.mark.parametrize("kind", sorted(LIST_KINDS))
 def test_list_lines_fit_with_huge_ids(action: str, kind: str):
-    assert LIST_ACTIONS == {"done", "undo"} and LIST_KINDS == {"t", "k", "m", "e"}
+    assert LIST_ACTIONS == {"done", "undo"} and LIST_KINDS == {"t", "k", "m", "e", "w"}  # w: the weekly review
     packed = _roundtrip(ListCb(a=action, k=kind, d="20261009", s="v", n=20, o=BIG * 1000, i=BIG * 1000))
     assert packed == f"ld:{action}:{kind}:20261009:v:20:{BIG * 1000}:{BIG * 1000}"
     assert _roundtrip(ListCb(a=action, k=kind, d="", s="o", n=1, o=0, i=5)) == f"ld:{action}:{kind}::o:1:0:5"

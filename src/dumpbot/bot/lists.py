@@ -1,4 +1,5 @@
-"""Numbered lists with [✅ N] / [↩️ N] buttons: /today, /tasks and the digests (docs/features/iteration-3.md §2).
+"""Numbered lists with [✅ N] / [↩️ N] buttons: /today, /tasks, the digests (docs/features/iteration-3.md §2) and the
+weekly review (docs/features/iteration-4.md §6).
 
 A first render numbers the open lines (``views.number_lines``) and puts a ``ListCb`` button under each; those
 buttons are the list's snapshot. After a press (the callbacks router closes or reopens the line, without the AI) the
@@ -17,7 +18,7 @@ from typing import TYPE_CHECKING, Final
 from aiogram.types import Message
 
 from dumpbot.bot import views
-from dumpbot.bot.cbdata import LIST_EVENING, LIST_MORNING, LIST_TASKS, LIST_TODAY, ListCb
+from dumpbot.bot.cbdata import LIST_EVENING, LIST_MORNING, LIST_TASKS, LIST_TODAY, LIST_WEEKLY, ListCb
 from dumpbot.services import digest, query
 
 if TYPE_CHECKING:
@@ -81,6 +82,10 @@ async def render(
         data = await digest.digest_data(session, "evening", prefs, at)
         lines = await _pinned(session, kind, views.evening_sections(data.agenda, now), refs, drop)
         return views.evening_digest(data, prefs, now, lines=lines)
+    if kind == LIST_WEEKLY:
+        weekly = await digest.weekly_data(session, prefs, at)
+        lines = await _pinned(session, kind, views.weekly_sections(weekly), refs, drop)
+        return views.weekly_review(weekly, prefs, now, lines=lines)
     raise ValueError(f"unknown list: {kind}")
 
 

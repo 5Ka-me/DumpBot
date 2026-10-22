@@ -1,6 +1,7 @@
 """End-to-end: fuzzy time (docs/features/iteration-2.md §A) through the whole app — the fake chutes returns a period
-extraction -> card -> the morning digest's period section every day of the week -> the Friday 19:00 reminder ->
-overdue after the week; a deadline with its two reminders; "когда-нибудь" in /someday, moved to next week by a reply.
+extraction -> card -> the morning digest's period section on the span's first and last working day only (iteration 4,
+§4) -> the Friday 19:00 reminder -> overdue after the week; a deadline with its two reminders; "когда-нибудь" in
+/someday, moved to next week by a reply.
 
 Harness: conftest.py (``e2e``). The owner's live example: "На этой неделе посмотреть расбери пай", Tue 2026-10-06
 13:36 Europe/Warsaw.
@@ -81,11 +82,10 @@ async def test_this_week_card_digest_section_and_friday_reminder(e2e: Any) -> No
     await e2e.tick(local(2026, 10, 6, 21, 0))
     assert len(e2e.tg.sent) == sent_before
 
-    # Wednesday and Thursday mornings: the period section, nothing planned for the day itself
+    # Wednesday and Thursday mornings: mid-span, nothing else -> no morning digest (iteration 4, §4: the span's item is
+    # named on its first day — Tuesday, the day it was saved, after that morning's digest — and its last working day)
     for day in (7, 8):
-        text = await morning(e2e, day)
-        assert text is not None and SECTION in text
-        assert "На сегодня ничего не запланировано." in text and "Просрочено" not in text
+        assert await morning(e2e, day) is None
 
     # Friday morning: still the section, not a numbered "19:00" item of the day
     text = await morning(e2e, 9)
@@ -113,10 +113,9 @@ async def test_this_week_card_digest_section_and_friday_reminder(e2e: Any) -> No
     await e2e.tick(local(2026, 10, 9, 21, 0))
     assert len(e2e.tg.sent) == sent_before
 
-    # Saturday and Sunday: still in the section until the week ends
+    # Saturday and Sunday: the week still runs, but its last working day is past -> no morning digest
     for day in (10, 11):
-        text = await morning(e2e, day)
-        assert text is not None and SECTION in text and "Просрочено" not in text
+        assert await morning(e2e, day) is None
 
     # Monday: the week is over -> overdue, no section
     text = await morning(e2e, 12)

@@ -15,11 +15,16 @@ from dumpbot.bot.cbdata import (
     OCC_PICK,
     OCC_SOMEDAY,
     OCC_STOP,
+    STALE_DELETE,
+    STALE_DONE,
+    STALE_KEEP,
+    STALE_SOMEDAY,
     DayCb,
     DigestCb,
     ItemCb,
     ListCb,
     OccCb,
+    StaleCb,
     SubCb,
     UndoCb,
 )
@@ -149,6 +154,21 @@ def day_picker_keyboard(occurrence_id: int, item_id: int, days: Sequence[date]) 
         *chunked(buttons, DAY_BUTTONS_PER_ROW),
         [button(OTHER_DAY_LABEL, ItemCb(a="time", id=item_id))],
         [button(BACK, OccCb(a=OCC_BACK, id=occurrence_id))],
+    )
+
+
+def stale_keyboard(item_id: int) -> InlineKeyboardMarkup:
+    """The stale question (docs/features/iteration-4.md §4): [✅ Сделано] [💤 Когда-нибудь] / [🗑 Удалить] [Оставить]
+    (two rows: four labels in one get cut on a phone)."""
+    return markup(
+        [
+            button("✅ Сделано", StaleCb(a=STALE_DONE, id=item_id), style="success"),
+            button("💤 Когда-нибудь", StaleCb(a=STALE_SOMEDAY, id=item_id)),
+        ],
+        [
+            button("🗑 Удалить", StaleCb(a=STALE_DELETE, id=item_id), style="danger"),
+            button("Оставить", StaleCb(a=STALE_KEEP, id=item_id)),
+        ],
     )
 
 

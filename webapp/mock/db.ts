@@ -105,6 +105,8 @@ export const DEFAULT_PREFS: Prefs = {
   digest_morning_time: "09:00",
   digest_evening_enabled: true,
   digest_evening_time: "21:00",
+  digest_weekly_enabled: true,
+  digest_weekly_time: "19:00",
   budget_usd: 5,
   stt_language: null,
   stt_mode: "auto",

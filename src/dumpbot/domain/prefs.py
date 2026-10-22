@@ -60,6 +60,9 @@ class Prefs(BaseModel):
     digest_morning_time: time = time(9, 0)
     digest_evening_enabled: bool = True
     digest_evening_time: time = time(21, 0)
+    # The weekly review (docs/features/iteration-4.md §6): on Sundays at this time.
+    digest_weekly_enabled: bool = True
+    digest_weekly_time: time = time(19, 0)
 
     budget_usd: float = Field(5.0, ge=0)
     stt_language: Literal["ru", "en"] | None = "ru"  # None = auto-detect (unreliable on short clips: Russian

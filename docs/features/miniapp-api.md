@@ -340,8 +340,8 @@ query: QuerySpec}`; `answer: null` — показать `rows` под загол
 | `soon_days` | int 1…14 | 2 («на днях») |
 | `quiet_enabled` | boolean | true |
 | `quiet_start`, `quiet_end`, `night_cutoff` | `"HH:MM"` | 23:00, 08:00, 04:00 |
-| `digest_morning_enabled`, `digest_evening_enabled` | boolean | true |
-| `digest_morning_time`, `digest_evening_time` | `"HH:MM"` | 09:00, 21:00 |
+| `digest_morning_enabled`, `digest_evening_enabled`, `digest_weekly_enabled` | boolean | true |
+| `digest_morning_time`, `digest_evening_time`, `digest_weekly_time` | `"HH:MM"` | 09:00, 21:00, 19:00 (обзор недели — по воскресеньям) |
 | `budget_usd` | number ≥ 0 | 5 (округляется до центов; 0 — ИИ выключен) |
 | `stt_language` | `"ru"` \| `"en"` \| null | null (авто) |
 | `stt_mode` | `"auto"` \| `"local"` \| `"chutes"` | `auto` |

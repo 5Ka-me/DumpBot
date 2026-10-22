@@ -482,6 +482,9 @@ export interface Prefs {
   digest_morning_time: HHMM;
   digest_evening_enabled: boolean;
   digest_evening_time: HHMM;
+  /** The weekly review on Sundays (iteration 4, §6). */
+  digest_weekly_enabled: boolean;
+  digest_weekly_time: HHMM;
   /** ≥ 0, cents; 0 = AI off. */
   budget_usd: number;
   stt_language: "ru" | "en" | null;

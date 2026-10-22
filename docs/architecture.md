@@ -9,8 +9,8 @@
 описаны в этой модели.
 Контракт API Mini App — [features/miniapp-api.md](features/miniapp-api.md).
 Итерация 4 ([features/iteration-4.md](features/iteration-4.md)): сделанное (§1 фильтр мусорных расшифровок, §2 повторы:
-фразы остановки и несколько времён в день, §3 кнопки напоминания по типу записи, §5 журнал действий) отмечено в
-контрактах ниже.
+фразы остановки и несколько времён в день, §3 кнопки напоминания по типу записи, §4 залежавшиеся дела, §5 журнал
+действий, §6 еженедельный обзор) отмечено в контрактах ниже.
 
 ## 1. Общая схема
 
@@ -30,7 +30,8 @@ Telegram ──long polling──► aiogram Dispatcher
                               │
            Scheduler (asyncio task, тик ≤30 c или wake):
                  напоминания (claim → send → sent, восстановление зависших), повторы (следующее occurrence),
-                 дайджесты (once_keys), простой (последний тик в app_state → одно уведомление), heartbeat-файл
+                 дайджесты и обзор недели (once_keys), вопрос о залежавшемся деле (журнал events, раз в день),
+                 простой (последний тик в app_state → одно уведомление), heartbeat-файл
                               │
                          PostgreSQL 18
 ```
@@ -115,6 +116,7 @@ src/dumpbot/
     settings_repo.py                                                                                  [foundation ✔]
     usage.py               запись ai_usage, траты за месяц, состояние бюджета                        [ai]
     events.py              журнал действий: таблица events, запись best effort (итерация 4, §5)       [workers]
+    stale.py               чтение журнала: залежавшиеся дела (§4), напоминания без реакции (§6)       [workers]
     items.py               жизненный цикл записей/повторений/напоминаний                             [items]
     query.py               чтение: повестка, списки, поиск, QuerySpec, расходы                        [items]
     related.py             «предметные» лексемы для «🔗 похоже на» (без инфинитивов и общих слов)     [items]
@@ -122,7 +124,7 @@ src/dumpbot/
     app_state.py           значения, переживающие рестарт (app_state: последний тик планировщика)    [workers]
     ingest.py              Message → RawMessage, постановка в очередь                                [workers]
     processor.py           обработчики задач очереди                                                  [workers]
-    digest.py              данные для дайджестов                                                      [workers]
+    digest.py              данные для дайджестов и обзора недели                                      [workers]
   workers/
     jobs.py                enqueue/claim/JobWorker/RetryLater                                         [workers]
     scheduler.py           Scheduler                                                                  [workers]
@@ -153,7 +155,7 @@ tests/<area>/test_*.py                                                          
 
 **Общие dataclass-ы контрактов уже определены в `src/dumpbot/dto.py`** (foundation ✔): `ReminderPlan`, `Resolution`,
 `CreatedItem`, `PatchResult`, `Row`, `Agenda`, `UsageSummary`, `BudgetState`, `DigestData` (итерация 2, C: `Step`,
-`RelatedRef`, `CardExtras`). Модули импортируют их оттуда
+`RelatedRef`, `CardExtras`; итерация 4: `WeeklyData`). Модули импортируют их оттуда
 (и могут реэкспортировать: `from dumpbot.dto import Resolution` в `timeresolve.py` и т.п.), а не объявляют заново.
 Ниже их поля приведены для справки.
 
@@ -570,8 +572,11 @@ def next_month_start(now: datetime, prefs: Prefs) -> datetime         # aware UT
 class Entry: type: str; source: str | None = None; item_id: int | None = None; occurrence_id: int | None = None
              data: dict | None = None; message: tuple[int, int] | None = None   # (chat_id, message_id) бота
 async def record(sessionmaker, *entries: Entry) -> None   # своя сессия + commit; ошибки только в лог (WARNING, тип)
-COMMAND, BUTTON, MINIAPP, REMINDER_SENT, DIGEST_ITEM, STALE_ASK   # events.type
-SRC_REMINDER, SRC_DIGEST, SRC_MINIAPP                             # events.source
+COMMAND, BUTTON, MINIAPP, REMINDER_SENT, DIGEST_ITEM, EDIT, STALE_ASK   # events.type
+SRC_REMINDER, SRC_DIGEST, SRC_MINIAPP, SRC_TEXT, SRC_STALE              # events.source
+MOVE = "move"                     # data["move"] = true: перенос записи на другой день (считает §4)
+def edit_entry(item_id: int, *, move: bool) -> Entry                     # правка сообщением (source text)
+def moved_entries(occurrences, source: str) -> list[Entry]               # массовый перенос: edit на occurrence
 ```
 Таблица `events` (миграция 0007, без внешних ключей): `created_at` (`clock.utcnow()`), `type`, `source`, `item_id`,
 `occurrence_id`, `data` JSONB (коды и id, никогда текст сообщений; None → SQL NULL); индексы (type, created_at),
@@ -584,7 +589,33 @@ SRC_REMINDER, SRC_DIGEST, SRC_MINIAPP                             # events.sourc
 | `button` | `bot.journal.ButtonJournal` (inner middleware `dp.callback_query`: все роутеры) | source = purpose сообщения с кнопкой (reminder / digest / list / card / …); ids из CallbackData (`ItemCb`/`KindCb`/`SubCb`.id, `PickCb`/`UndoCb`.item, `ListCb`.i/o, `OccCb`.id); data `{"action": "o:done", "cb": <callback_data>}` (+ `"error"`, если обработчик упал) |
 | `miniapp` | `web.server.journal_middleware` (внешний) | source `miniapp`; item = `{id}` у `/api/items/…`, `/api/steps/…`; data `{"route": "POST /api/items/{id}/done", "status": 200}`; только прошедшие initData (не 401/403), без опросов `GET /api/jobs/{id}`, `GET /api/inbox/{id}` и картинок; ответ уходит (`prepare` + `write_eof`) до записи |
 | `reminder_sent` | `Scheduler._deliver` после `sent` | source `reminder`; item, occurrence; data `{"reminder": id, "late_min": N, "kb": "timed"\|"span"\|"series", "held"?: true}` (`kb` — набор кнопок, `views.reminder_kind`) |
-| `digest_item` | `Scheduler._send_digest` после отправки | source `digest`; строка раздела (`views.morning_sections` без сделанных / `views.evening_sections`): item, occurrence; data `{"digest": "morning", "sec": "o"}` |
+| `digest_item` | `Scheduler._send_digest` / `_send_weekly` после отправки | source `digest`; строка раздела (`views.morning_sections` без сделанных / `views.evening_sections` / `views.weekly_sections`): item, occurrence; data `{"digest": "morning", "sec": "o"}` (`"weekly"`) |
+| `edit` | `processor.handle_edit` / `handle_edit_time` / `_apply_edit` после ответа; `DigestCb` и `POST /api/today/move` (массовый перенос) | правка сообщением (ответ на карточку / напоминание, описанием, «🕒 Время»): source `text`, item, data `{"move": bool}` (`processor.moves(patch)`: новое время, не «когда-нибудь», не done/delete); перенос невыполненного: source `digest` / `miniapp`, item и occurrence каждой перенесённой, data `{"move": true}` |
+| `stale_ask` | `Scheduler._ask_stale` после отправки | source `stale`; item; data `{"digests": N, "moves": M}` |
+
+Итерация 4, §4 — `"move": true` ставят: `ButtonJournal` у `MOVE_ACTIONS` (`o:tmr`, `o:nw`, `o:nm`, `dy`; без ошибки
+обработчика), Mini App через `web.http.journal_note` (`POST /api/items/{id}/when` с `due_local`, `…/snooze` с
+`tomorrow`, `PATCH /api/items/{id}` с новым `period`, не `someday`), `edit_entry`/`moved_entries`. Свои события
+вызова Mini App — `web.http.journal_also` (пишутся вместе с `miniapp`, только при статусе < 400).
+
+### 4.9b services/stale.py  [workers] (итерация 4, §4, §6)
+
+```python
+DIGESTS_IN_A_ROW = 3; MOVES = 2
+@dataclass(frozen=True)
+class Stale: item_id: int; created_at: datetime; digests: int; moves: int
+def is_action(ev=Event) -> ColumnElement[bool]   # button | miniapp (кроме GET) | edit — действие по записи
+def is_move(ev=Event) -> ColumnElement[bool]     # действие с data.move = true
+async def candidates(session, *, limit=10) -> list[Stale]   # залежавшиеся, раньше сохранённые — первыми
+async def pick(session) -> Stale | None
+async def asked_on(session, day: date, prefs) -> set[int]    # о каких записях спрашивали в этот локальный день
+async def unanswered_reminders(session, start, end) -> list[tuple[int, int]]   # (occurrence, item), §6
+```
+Запись залежалась: открыта, не «когда-нибудь», не активный повтор; дайджестов (`digest_item`, разные `created_at`;
+обзор недели тоже) после последнего действия (или сохранения) ≥ 3, или переносов (`is_move`) после последнего
+вопроса (или сохранения) ≥ 2; вопрос без ответа (нет действия после `stale_ask`) не повторяется, «Оставить» — само
+действие (сбрасывает счёт). Напоминание без реакции (§6): `reminder_sent` в [start, end), после него ни одного
+действия по записи, occurrence open/missed, запись открыта и не «когда-нибудь»; последнее такое на запись.
 
 ### 4.10 services/items.py  [items]
 
@@ -1020,9 +1051,20 @@ class DigestData:
     agenda: Agenda
     recurring_today: int
     yesterday: Agenda | None = None    # итерация 3, §5: утренний — вчерашний день, если его вечерний итог проспан
-async def build_digest(session, kind: str, prefs: Prefs, now: datetime) -> DigestData | None   # None, если пусто
-async def digest_data(session, kind: str, prefs: Prefs, now: datetime) -> DigestData   # итерация 3: и пустой
-                                                                                       # (перерисовка после [✅ N])
+async def build_digest(session, kind: str, prefs: Prefs, now: datetime, *, ask: int | None = None) -> DigestData | None
+    # None, если пусто; ask — запись сегодняшнего вопроса о залежавшемся (итерация 4, §4): в утреннем и посреди срока
+async def digest_data(session, kind: str, prefs: Prefs, now: datetime, *, ask=None) -> DigestData   # итерация 3:
+                                                                       # и пустой (перерисовка после [✅ N])
+def in_morning(row: Row, day: date, prefs: Prefs, asked=()) -> bool
+    # итерация 4, §4: запись срока — в утреннем только в первый день срока (или день сохранения, если позже), в
+    # последний рабочий день срока (нет рабочих — последний день) и в день вопроса о ней (stale.asked_on + ask)
+async def build_weekly(session, prefs: Prefs, now: datetime) -> WeeklyData | None     # §6; None, если пусто
+async def weekly_data(session, prefs: Prefs, now: datetime) -> WeeklyData
+    # неделя (пн–вс) дня now: query.review_period_rows (week — эта и следующая неделя; month/season — этот и
+    # следующий месяц), query.someday_for_review (до 5: давно не показанные обзорами до этого дня первыми — после
+    # [✅ N] перерисовываются те же; + всего),
+    # stale.unanswered_reminders недели (→ query.list_rows, по времени, до 10), query.undated_tasks (до 15);
+    # запись — только в первом разделе
 def folded_key(day: date) -> str          # once_key "digest:evening-folded:YYYY-MM-DD": итог day — в утреннем day+1
 async def missed_evening(session, day: date, prefs: Prefs) -> Agenda | None   # day_summary(day-1), если итог свёрнут
 async def day_summary(session, day: date, prefs: Prefs) -> Agenda   # повестка day; done — и отмеченные позже
@@ -1056,7 +1098,9 @@ now в тихих часах и (`auto` или опоздало больше `HO
 5xx Telegram, flood control дольше 60 с, обрыв соединения с БД) → `pending` без attempts++, остаток пачки возвращается
 в `pending` до следующего обычного тика (без немедленного повтора): сбой переживается до `missed_grace_minutes`, потом
 `missed`; прочая ошибка отправки → attempts++, `pending` (после 5 попыток → `failed`); (3) `items.ensure_recurring`;
-(4) дайджесты: для morning/evening, если включён:
+(4) дайджесты: для morning/evening, если включён (итерация 4: утренний перед сборкой выбирает сегодняшний вопрос о
+залежавшемся — `stale.pick`, если вопрос уже можно задать и сегодня его не было — и показывает его запись даже
+посреди срока; после отправки вопрос уходит в том же тике):
 целевое время = `shift_out_of_quiet(local digest time)`, окно [цель, цель+3ч), в тихие часы не отправляется (опоздавший
 в них утренний пропадает, когда окно закроется; вечерний — см. ниже), ключ `digest:{kind}:{YYYY-MM-DD}` в once_keys
 (вставка ON CONFLICT DO NOTHING → только вставивший отправляет); `build_digest` → None → не отправлять;
@@ -1070,8 +1114,16 @@ now в тихих часах и (`auto` или опоздало больше `HO
 `views.downtime_notice` (`purpose="notice"`), только если что-то задело — опоздавшие (отправлены поздно / ждут
 конца тихих часов), устаревшие (`missed`), свёрнутый итог; не ушло — повтор на следующем тике (в пределах grace);
 (6) heartbeat: записать время в `settings.heartbeat_file`.
-Итерация 4, §5: отправленное напоминание (`reminder_sent`) и строки отправленного дайджеста (`digest_item`) пишутся в
-журнал (`services.events`) после отправки; ошибка записи — только в лог.
+(4a) итерация 4, §6 — обзор недели: по воскресеньям в `digest_weekly_time`, если `digest_weekly_enabled`; цель,
+окно, тихие часы и опоздание после простоя — как у дайджестов, ключ `digest:weekly:{YYYY-MM-DD}`, `build_weekly` →
+None → не отправлять; `views.weekly_review`, `purpose="digest"`;
+(4b) итерация 4, §4 — вопрос о залежавшемся (`_ask_stale`): не в тихие часы, не раньше цели утреннего дайджеста
+этого дня (`shift_out_of_quiet(digest_morning_time)`), ключ `stale:{YYYY-MM-DD}` (не больше одного в день;
+снимается, если отправка не удалась); запись — выбранная утренним дайджестом, иначе `stale.pick`; нет кандидата —
+следующая проверка через `STALE_CHECK_EVERY` (10 мин); `views.stale_question`, `purpose="stale"` с item и
+occurrence (ответ на вопрос текстом — правка записи).
+Итерация 4, §5: отправленное напоминание (`reminder_sent`), строки отправленного дайджеста и обзора (`digest_item`)
+и вопрос (`stale_ask`) пишутся в журнал (`services.events`) после отправки; ошибка записи — только в лог.
 `run` регистрирует `"scheduler"` в `ctx.watchdog` (лимит `max(15 мин, 3 × scheduler_interval_s)`) и отмечается перед
 каждым тиком, шагом и напоминанием.
 
@@ -1167,6 +1219,13 @@ def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_be
 # Итерация 4, §1: unheard(raw_id) — «🎤 Не разобрал голосовое — повтори или напиши текстом» [🔁 Ещё раз] (AgainCb);
 # unheard_again() — «🎤 Распознаю ещё раз…» без кнопок; settings_stt_menu(prefs, *, local_stt, local_down) —
 # «(недоступен)» у «Локальный» на паузе.
+# §4: stale_question(item, occ, reminders, prefs, now, *, moves) — «🕸 📌 «Сделать карту» висит 15 дней. Что
+# делаем?» (+ «Переносили уже 2 раза.», строка времени карточки; запись сегодняшняя — «переносили уже 2 раза»)
+# [✅ Сделано] [💤 Когда-нибудь] / [🗑 Удалить] [Оставить] (StaleCb); после нажатия stale_done (как reminder_done) /
+# stale_someday / deleted_card / stale_kept. §6: weekly_sections(data), weekly_review(data, prefs, now, *, lines) —
+# «🗓 Обзор недели, вс 25 окт»: разделы сроков (как в утреннем), «🌙 Когда-нибудь» (+ «… и ещё N — в /someday»),
+# «🔕 Напоминания без ответа» (со временем), «📋 Задачи без даты»; все открытые строки пронумерованы
+# (NUMBERED_SECTIONS[w] = p, s, r, u; перерисовка — по записи, как /tasks). Меню «📰 Дайджесты» — и обзор недели.
 def ask_message(ask: Ask, raw_id: int) -> tuple[str, InlineKeyboardMarkup]
 def edit_candidates(rows: Sequence[Row], raw_id: int, prefs: Prefs, now: datetime)
 def usage_text(summary: UsageSummary) -> str
@@ -1218,6 +1277,11 @@ occurrences)`): закрытые строки сохраняют номер и [
 UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: вернулось → сообщение становится карточкой записи,
 тост «↩️ Отменено»; второе нажатие — «Уже отменено»; устарело — «🤷 Запись уже изменилась — отменить нельзя», кнопка
 убирается, ничего не меняется; снимка нет — «Кнопка устарела».
+Итерация 4, §4: StaleCb `st:<a>:<item>` — ответы на вопрос о залежавшемся: `done` (`apply_patch(done)`, сообщение →
+`stale_done` с [↩️ Не сделано]), `smd` («когда-нибудь»), `del` (`delete_item`, `deleted_card` с [↩️ Вернуть]), `keep`
+(ничего не меняет; само нажатие в журнале — действие, счёт заново); запись уже закрыта / удалена — тост и её
+состояние. §6: ListCb `k=w` — [✅ N] обзора недели (`lists.render` → `digest.weekly_data` дня кнопки).
+DigestCb после переноса пишет в журнал `edit` на каждую перенесённую запись (`events.moved_entries`).
 Итерация 4: AgainCb `vr:<raw>` [🔁 Ещё раз] — `processor.retry_unheard`, сообщение → «🎤 Распознаю ещё раз…» без
 кнопок, 👀 на голосовое, тост «🔁 Распознаю ещё раз» (второе нажатие — «Уже распознаю ещё раз…»). Каждая команда и
 каждое нажатие кнопки после обработки пишутся в журнал (`bot.journal`, §5).
@@ -1242,7 +1306,8 @@ UndoCb `u:<raw>:<item>` [↩️ Отменить] (§3) — `undo.undo_edit`: в
 
 `settings`: меню (views.settings_menu): часовой пояс (кнопки Europe/Warsaw, Europe/Berlin, Europe/Minsk, Europe/Kyiv +
 ввод IANA), задача без времени, слоты (утро/обед/день/вечер/после работы/ночь, выходные, дата без времени),
-тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время), бюджет ($),
+тихие часы (вкл/выкл, начало, конец), дайджесты (вкл/выкл, время; итерация 4, §6: и обзор недели — SetCb
+`digest_toggle` `weekly`, ask `digest_weekly_time`), бюджет ($),
 «🎙 Голос»: язык (авто/ru/en) и режим распознавания (`stt_mode`: авто/локальный/только chutes; «локальный» с пометкой
 «(не настроен)», пока пуст `LOCAL_STT_URL`; «(недоступен)», пока локальный Whisper на паузе — `ctx.stt.local_paused`).
 Ввод времени `HH:MM` валидируется локально. После сохранения — `ctx.scheduler_wakeup.set()`.
@@ -1302,4 +1367,9 @@ class Watchdog:                                            # dumpbot/watchdog.py
   Postgres, данные на ревизии 0004, затем 0005, `alembic check`, downgrade (no-op) и повторный upgrade.
   `tests/test_migration_0006.py` — так же для 0006 (`<тестовая>_mig0006`): app_state, held_from, downgrade и снова.
   `tests/test_migration_0007.py` — 0007 (`<тестовая>_mig0007`): таблица events, индексы, downgrade и снова.
+- Итерация 4, §4/§6: `tests/services/test_stale.py` (кандидаты, вопросы без ответа, напоминания без реакции),
+  `tests/workers/test_digest_weekly.py` (утренний: сроки в первый / последний рабочий день; данные обзора),
+  `tests/workers/test_scheduler_stale.py` (вопрос и обзор в планировщике), `tests/workers/test_processor_journal_edits.py`
+  (правки сообщением в журнале), `tests/web/test_journal_moves.py` (переносы Mini App, настройки обзора),
+  `tests/bot/test_views_stale.py`, `tests/botapp/test_router_stale.py`, `tests/e2e/test_e2e_stale_weekly.py`.
 - Запуск: `TEST_DATABASE_URL=postgresql+asyncpg://dump:dump@127.0.0.1:55432/dump_test uv run pytest`.

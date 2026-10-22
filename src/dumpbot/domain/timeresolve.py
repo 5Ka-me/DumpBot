@@ -44,6 +44,7 @@ __all__ = [
     "ReminderPlan",
     "Resolution",
     "effective_leads",
+    "last_workday",
     "lead_shift",
     "localize",
     "next_series_due",
@@ -546,7 +547,7 @@ def _resolve_period(when: When, now_utc: datetime, prefs: Prefs) -> WhenResult:
         if start > today and _BY_SPAN_RE.search(when.text or ""):
             day = start  # "к лету", "до октября": by the time the span begins (the prompt asks for that day itself)
         else:  # "до конца недели": the last working day of the span
-            last = _last_workday(start, end)
+            last = last_workday(start, end)
             day = last if last is not None and last >= today else end
         return resolve_when(when.model_copy(update={"period": None, "day": day.isoformat()}), now_utc, prefs)
     return _period_due(start, end, now_utc, prefs), "period", [], False
@@ -556,12 +557,12 @@ def _period_due(start: date, end: date, now_utc: datetime, prefs: Prefs) -> date
     """Reminder (2) of a span: its last working day at ``task_default_time``; once that has passed, its last day
     at that time; if that has passed too, that moment anyway (the item has no reminder (2) then)."""
     tz = prefs.zone
-    days = [d for d in (_last_workday(start, end), end) if d is not None]
+    days = [d for d in (last_workday(start, end), end) if d is not None]
     moments = [localize(d, prefs.task_default_time, tz).astimezone(UTC) for d in days]
     return next((m for m in moments if m > now_utc), moments[-1])
 
 
-def _last_workday(start: date, end: date) -> date | None:
+def last_workday(start: date, end: date) -> date | None:
     """The last Monday..Friday in [start, end], or None."""
     d = end
     while d >= start:

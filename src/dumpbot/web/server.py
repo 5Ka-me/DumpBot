@@ -10,14 +10,16 @@ host's health check and the keep-alive ping (``dumpbot.keepalive``). ``WebServer
 
 Every authorized ``/api`` call goes into the events journal (docs/features/iteration-4.md §5, ``services.events``)
 after its answer was sent: ``miniapp`` with the route pattern and the status, the item of ``/api/items/{id}`` and
-``/api/steps/{id}``. Polls (``GET /api/jobs/{id}``, ``GET /api/inbox/{id}``) and pictures are not journaled.
+``/api/steps/{id}``, and what the handler noted (``http.journal_note``: ``"move": true`` for a new time or a snooze to
+tomorrow — §4 counts moves) plus its own events (``http.journal_also``: the items moved by «📅 Перенести
+невыполненное на завтра»). Polls (``GET /api/jobs/{id}``, ``GET /api/inbox/{id}``) and pictures are not journaled.
 """
 
 from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from aiohttp import web
 from aiohttp.abc import AbstractAccessLogger
@@ -28,7 +30,7 @@ from dumpbot.context import AppContext
 from dumpbot.services import events
 from dumpbot.web import api_inbox, api_items, api_lists, files
 from dumpbot.web.auth import auth_middleware
-from dumpbot.web.http import API_PREFIX, CTX, Handler, ctx_of, errors_middleware
+from dumpbot.web.http import API_PREFIX, CTX, JOURNAL_DATA, JOURNAL_EXTRA, Handler, ctx_of, errors_middleware
 
 log = logging.getLogger(__name__)
 
@@ -80,7 +82,8 @@ async def journal_middleware(request: web.Request, handler: Handler) -> web.Stre
         await response.write_eof()
     except ConnectionError:  # the app went away: the call happened all the same
         pass
-    await events.record(ctx_of(request).sessionmaker, entry)
+    more: list[events.Entry] = request.get(JOURNAL_EXTRA, []) if response.status < 400 else []
+    await events.record(ctx_of(request).sessionmaker, entry, *more)
     return response
 
 
@@ -99,9 +102,10 @@ def api_entry(request: web.Request, status: int) -> events.Entry | None:
     raw_id = request.match_info.get("id", "")
     if pattern.startswith(ITEM_ROUTES) and raw_id.isdecimal() and len(raw_id) <= 18:
         item_id = int(raw_id)
-    return events.Entry(
-        events.MINIAPP, source=events.SRC_MINIAPP, item_id=item_id, data={"route": route, "status": status}
-    )
+    data: dict[str, Any] = {"route": route, "status": status}
+    if status < 400:
+        data.update(request.get(JOURNAL_DATA, {}))
+    return events.Entry(events.MINIAPP, source=events.SRC_MINIAPP, item_id=item_id, data=data)
 
 
 async def _headers(request: web.Request, response: web.StreamResponse) -> None:
