@@ -6,7 +6,9 @@ the owner, not a forward or a "?" question, a reply to the prompt or to nothing,
   answer is saved like a voice reply to the card (job ``edit`` transcribes it);
 - title -> ``items.set_title``; tags -> ``items.set_tags`` (split by spaces/commas, "-" clears them); both are
   confirmed with a short reply, since the prompt may be far up the chat.
-Afterwards the prompt turns back into the card. ``/cancel`` (commands router) or [✖️ Отмена] leave the dialog;
+Afterwards the prompt turns back into the card — or into the reminder it was opened from ([Другая дата…] of a
+reminder's day picker: the answer moves that instance, and the job shows the move in the reminder). ``/cancel``
+(commands router) or [✖️ Отмена] leave the dialog;
 any other message (a forward, a reply to another card, a "?" question, a photo, a note sent minutes later)
 closes it and goes on to capture: nothing the owner dumps is taken for a title.
 """
@@ -30,7 +32,7 @@ from dumpbot.bot import sender, views
 from dumpbot.bot.cbdata import ItemCb
 from dumpbot.bot.keyboards import button, markup
 from dumpbot.bot.routers import capture, common
-from dumpbot.bot.states import EditStates, prompt_data
+from dumpbot.bot.states import ORIGIN_REMINDER, EditStates, prompt_data
 from dumpbot.services import items
 from dumpbot.workers import jobs
 
@@ -86,6 +88,7 @@ async def on_prompt(callback: CallbackQuery, callback_data: ItemCb, ctx: AppCont
     async with ctx.sessionmaker() as session:
         prefs = await ctx.prefs(session)
         item = await items.get_item(session, callback_data.id)
+        shown = await sender.lookup(session, ctx.chat_id, message_id) if message_id is not None else None
         await session.commit()
     if item is None:
         await common.answer(callback, common.NOT_FOUND)
@@ -97,7 +100,10 @@ async def on_prompt(callback: CallbackQuery, callback_data: ItemCb, ctx: AppCont
     # Another dialog's prompt (other card, settings) turns back into what it was.
     await common.restore_prompt(ctx, state, prefs, clock.utcnow(), keep=message_id)
     await state.set_state(prompt.state)
-    await state.set_data(prompt_data(message_id, item_id=item.id))
+    origin: dict[str, Any] = {}
+    if shown is not None and shown.purpose == "reminder" and shown.occurrence_id is not None:
+        origin = {"origin": ORIGIN_REMINDER, "occ_id": shown.occurrence_id}  # [Другая дата…] of its day picker
+    await state.set_data(prompt_data(message_id, item_id=item.id, **origin))
     await common.answer(callback)
     await common.show(ctx, message_id, prompt_view(prompt, item))
 
@@ -127,22 +133,41 @@ async def on_time(message: Message, ctx: AppContext, state: FSMContext) -> None:
             await state.clear()
             await message.answer(common.NOT_FOUND)
             return
-        payload = {"item_id": item.id, "text": text, "message_id": message.message_id, "now": message.date.isoformat()}
+        payload: dict[str, Any] = {
+            "item_id": item.id,
+            "text": text,
+            "message_id": message.message_id,
+            "now": message.date.isoformat(),
+        }
+        if reminder := _reminder_of(data):  # that instance moves, its reminder shows the move
+            payload["reminder"] = reminder
         key = f"edit_time:{message.chat.id}:{message.message_id}"
         await jobs.enqueue(session, "edit_time", payload, dedupe_key=key)
-        view = await common.card_view(session, item, prefs, now)
+        view = await common.prompt_origin_view(session, data, prefs, now)
         await session.commit()
     await state.clear()
-    await common.show(ctx, data.get("prompt_id"), view)
+    if view is not None:
+        await common.show(ctx, data.get("prompt_id"), view)
     await sender.react(ctx, message.message_id, sender.REACT_SEEN)
     ctx.jobs_wakeup.set()
 
 
+def _reminder_of(data: dict[str, Any]) -> dict[str, int] | None:
+    """``{message_id, occurrence_id}`` of the reminder a prompt was opened from (None: a card's prompt)."""
+    prompt_id, occ_id = data.get("prompt_id"), data.get("occ_id")
+    if data.get("origin") != ORIGIN_REMINDER or not isinstance(prompt_id, int) or not isinstance(occ_id, int):
+        return None
+    return {"message_id": prompt_id, "occurrence_id": occ_id}
+
+
 async def on_time_voice(message: Message, ctx: AppContext, state: FSMContext) -> None:
-    """A spoken time: saved like a voice reply to the card (job "edit" transcribes it and applies the change)."""
+    """A spoken time: saved like a voice reply to the card (job "edit" transcribes it and applies the change) — or
+    to the reminder the prompt was opened from (that instance)."""
     data = await _active(message, ctx, state)
     await common.leave_dialog(ctx, state)
-    await capture.save(ctx, message, reply_item_id=data["item_id"])
+    reminder = _reminder_of(data)
+    occurrence_id = reminder["occurrence_id"] if reminder else None
+    await capture.save(ctx, message, reply_item_id=data["item_id"], reply_occurrence_id=occurrence_id)
 
 
 async def on_title(message: Message, ctx: AppContext, state: FSMContext) -> None:

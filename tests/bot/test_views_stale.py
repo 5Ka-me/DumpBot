@@ -47,6 +47,14 @@ def test_the_stale_question_says_how_often_it_was_moved(
     assert text == "🕸 📌 «Купить наушники» переносили уже 2 раза. Что делаем?"
 
 
+def test_the_stale_question_of_an_item_saved_today_without_moves(check_view, make_item, now) -> None:
+    """Saved this morning for 12:00, the reminder ignored, three digests that day (a Sunday: the morning one, the
+    weekly review, the evening one): not "переносили уже 0 раз"."""
+    today = make_item(created_at=now - timedelta(hours=3))
+    text, _ = check_view(views.stale_question(today, None, [], PREFS, now, moves=0))
+    assert text == "🕸 📌 «Купить наушники» так и не сделано. Что делаем?"
+
+
 def test_the_stale_answers(check_view, buttons, make_item, make_occ, now, at) -> None:
     item = make_item(id=12, status="done")
     occ = make_occ(at(2026, 10, 5, 19, 0), id=30, status="done")

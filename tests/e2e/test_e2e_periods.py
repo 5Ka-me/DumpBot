@@ -44,10 +44,11 @@ def command(e2e: Any, text: str) -> int:
 
 
 async def morning(e2e: Any, day: int) -> str | None:
-    """Tick at 09:00 on that October day; the digest text, or None when nothing was sent."""
+    """Tick at 09:00 on that October day; the digest text, or None when nothing was sent. (Each such jump is a
+    downtime to the scheduler: a weekly review it jumped over comes late too, and is left out here.)"""
     sent_before = len(e2e.tg.sent)
     await e2e.tick(local(2026, 10, day, 9, 0))
-    new = e2e.tg.sent[sent_before:]
+    new = [c for c in e2e.tg.sent[sent_before:] if "Обзор недели" not in c.text]
     assert len(new) <= 1
     return new[0].text if new else None
 

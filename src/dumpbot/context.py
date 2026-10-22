@@ -45,6 +45,8 @@ class AppContext:
     _prefs_memo: tuple[Prefs, float] | None = field(default=None, init=False, repr=False, compare=False)
     _prefs_generation: int = field(default=0, init=False, repr=False, compare=False)
     _fresh_raws: dict[int, RawMessage] = field(default_factory=dict, init=False, repr=False, compare=False)
+    # Reactions still on their way, by message id (``bot.sender.react_soon``): a later one on the message waits.
+    reacting: dict[int, asyncio.Task[None]] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     @cached_property
     def autocommit(self) -> async_sessionmaker[AsyncSession]:

@@ -8,8 +8,11 @@ line, a page of text for two seconds of audio, the subtitle credits of the video
 
 Any one sign is enough:
 - one letter ``REPEAT_MIN`` (15) times in a row ("аааааааааааааааа");
-- more than ``MAX_CHARS_PER_S`` (40) characters per second of the recording (Telegram's ``duration``);
-- in Russian (the language asked for is ``ru``): Cyrillic letters are under ``MIN_CYRILLIC`` (30 %) of all letters;
+- more than ``MAX_CHARS_PER_S`` (40) characters per second of the recording (Telegram's ``duration``: whole seconds,
+  cut down by the sending app, so a note of 1.9 s says 1 — the text is measured against ``duration + 1``);
+- in Russian (the language asked for is ``ru``): Cyrillic letters are under ``MIN_CYRILLIC`` (30 %) of all letters —
+  judged only from ``MIN_SCRIPT_LETTERS`` (20) letters on: "Zoom с Lead в 15:00", "Deploy на prod" or "OK." are a
+  developer's real notes, and a second try could only repeat them;
 - the whole transcript is a known hallucination (``HALLUCINATIONS``, ``HALLUCINATION_PREFIXES``).
 
 An empty transcript is silence, not garbage: such a voice note is saved without AI as before.
@@ -28,6 +31,8 @@ HALLUCINATION: Final = "known hallucination"
 REPEAT_MIN: Final = 15
 MAX_CHARS_PER_S: Final = 40.0
 MIN_CYRILLIC: Final = 0.3
+# Fewer letters say too little about the language (the short English hallucinations are in ``HALLUCINATIONS``).
+MIN_SCRIPT_LETTERS: Final = 20
 
 # Whole transcripts Whisper makes up on silence and noise (normalized: lower case, ё -> е, letters, digits and single
 # spaces only). Kept short on purpose: only what never is a note of its own.
@@ -76,21 +81,22 @@ _NOT_WORD_RE: Final = re.compile(r"[\W_]+")
 def garbage_reason(text: str, *, duration: float | None = None, language: str | None = None) -> str | None:
     """Why ``text`` is not a transcript of speech (one of the constants above), or None when it looks like one.
 
-    ``duration``: seconds of the recording (None or 0: not known, that sign is skipped); ``language``: the language
-    asked for (the Cyrillic share is checked only for ``ru``).
+    ``duration``: seconds of the recording as Telegram gives them, whole and cut down (None or 0: not known, that
+    sign is skipped); ``language``: the language asked for (the Cyrillic share is checked only for ``ru``, and only
+    for a transcript of at least ``MIN_SCRIPT_LETTERS`` letters).
     """
     text = text.strip()
     if not text:
         return None
     if _REPEAT_RE.search(text.lower()):
         return REPEATED_LETTER
-    if duration and duration > 0 and len(text) / duration > MAX_CHARS_PER_S:
+    if duration and duration > 0 and len(text) / (duration + 1) > MAX_CHARS_PER_S:  # up to duration + 1 s long
         return TOO_FAST
     if is_hallucination(text):
         return HALLUCINATION
     if language == "ru":
         letters = _LETTER_RE.findall(text)
-        if letters and len(_CYRILLIC_RE.findall(text)) / len(letters) < MIN_CYRILLIC:
+        if len(letters) >= MIN_SCRIPT_LETTERS and len(_CYRILLIC_RE.findall(text)) / len(letters) < MIN_CYRILLIC:
             return NOT_CYRILLIC
     return None
 

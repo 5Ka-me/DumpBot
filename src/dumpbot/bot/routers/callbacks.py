@@ -35,7 +35,7 @@ import logging
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -493,13 +493,17 @@ async def on_item(callback: CallbackQuery, callback_data: ItemCb, ctx: AppContex
         await common.answer(callback, common.STALE)
         return
     message_id = common.message_id_of(callback)
+    prompt: dict[str, Any] | None = None
     if action == "back" and await common.is_prompt(state, message_id, EditStates):
+        prompt = await state.get_data()
         await state.clear()  # [✖️ Отмена] of this text prompt (a dialog on another card stays open)
 
     async def op(session: AsyncSession, prefs: Prefs, now: datetime) -> Outcome:
         item = await common.get_item(session, callback_data.id)
         if item.status == "deleted" and action != "undel":
             return Outcome(views.deleted_card(item), common.DELETED)
+        if prompt is not None and prompt.get("item_id") == item.id:  # back to what the prompt was opened from
+            return Outcome(await common.prompt_origin_view(session, prompt, prefs, now))
         return await handler(ItemCall(session, ctx, item, prefs, now, message_id, callback.id))
 
     await run(callback, ctx, op)
@@ -771,7 +775,7 @@ async def on_digest(callback: CallbackQuery, callback_data: DigestCb, ctx: AppCo
 
     await run(callback, ctx, op)
     # The button names no item: each moved one gets a move of its own (the stale-items check counts them).
-    await events.record(ctx.sessionmaker, *events.moved_entries(moved, events.SRC_DIGEST))
+    await events.record(ctx.autocommit, *events.moved_entries(moved, events.SRC_DIGEST))
 
 
 async def on_old_digest(callback: CallbackQuery, ctx: AppContext) -> None:

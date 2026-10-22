@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final
 
 from aiogram.enums import ParseMode
@@ -93,6 +94,7 @@ async def send(
     item_id: int | None = None,
     occurrence_id: int | None = None,
     raw_message_id: int | None = None,
+    later: list[Record] | None = None,
 ) -> int:
     """Send an HTML message to the owner and record it in ``bot_messages``. Returns the Telegram message_id.
 
@@ -100,6 +102,8 @@ async def send(
     ``markup`` is inline buttons, or ``ForceReply`` for a prompt whose answer is a reply to it.
     ``quiet_checked``: the caller looked at the quiet hours itself (``silent`` is its decision), so
     ``bot.quiet_requests`` does not load the prefs again for this message.
+    ``later``: the ``bot_messages`` row is not written now but added there, for ``record`` to write with the rows of
+    the messages sent after it (several cards of one message: no database wait between them).
     """
     reply = ReplyParameters(message_id=reply_to, allow_sending_without_reply=True) if reply_to else None
     # None lets bot.quiet_requests silence it in quiet hours; a reminder that reaches the sender is for a time the
@@ -116,39 +120,45 @@ async def send(
         ),
         "send_message",
     )
-    await _record(
-        ctx,
-        message_id=msg.message_id,
-        purpose=purpose,
-        item_id=item_id,
-        occurrence_id=occurrence_id,
-        raw_message_id=raw_message_id,
-    )
+    sent = Record(msg.message_id, purpose, item_id, occurrence_id, raw_message_id)
+    if later is not None:
+        later.append(sent)
+    else:
+        await record(ctx, sent)
     log.debug("sent %s message %s (item=%s, occ=%s)", purpose, msg.message_id, item_id, occurrence_id)
     return msg.message_id
 
 
-async def _record(
-    ctx: AppContext,
-    *,
-    message_id: int,
-    purpose: str,
-    item_id: int | None,
-    occurrence_id: int | None,
-    raw_message_id: int | None,
-) -> None:
-    """Store the message -> item mapping in its own session (one statement, no transaction around it). The message
-    is already out, so a DB error is only logged: failing here would make callers retry and send a duplicate."""
+@dataclass(frozen=True)
+class Record:
+    """The ``bot_messages`` row of a sent message: what it is (``purpose``) and what it is about."""
+
+    message_id: int
+    purpose: str
+    item_id: int | None = None
+    occurrence_id: int | None = None
+    raw_message_id: int | None = None
+
+
+async def record(ctx: AppContext, *records: Record) -> None:
+    """Store the message -> item mappings in one statement (no transaction around it). The messages are already
+    out, so a DB error is only logged: failing here would make callers retry and send duplicates."""
+    if not records:
+        return
+    rows = [
+        {
+            "chat_id": ctx.chat_id,
+            "message_id": r.message_id,
+            "purpose": r.purpose[:_PURPOSE_MAX],
+            "item_id": r.item_id,
+            "occurrence_id": r.occurrence_id,
+            "raw_message_id": r.raw_message_id,
+        }
+        for r in records
+    ]
     stmt = (
         insert(BotMessage)
-        .values(
-            chat_id=ctx.chat_id,
-            message_id=message_id,
-            purpose=purpose[:_PURPOSE_MAX],
-            item_id=item_id,
-            occurrence_id=occurrence_id,
-            raw_message_id=raw_message_id,
-        )
+        .values(rows)
         .on_conflict_do_nothing(index_elements=[BotMessage.chat_id, BotMessage.message_id])
     )
     try:
@@ -156,7 +166,8 @@ async def _record(
             await session.execute(stmt)
             await session.commit()
     except SQLAlchemyError:
-        log.exception("could not record bot message %s (purpose=%s)", message_id, purpose)
+        ids = ", ".join(str(r.message_id) for r in records)
+        log.exception("could not record bot message(s) %s (purpose=%s)", ids, records[0].purpose)
 
 
 async def edit(ctx: AppContext, message_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
@@ -187,8 +198,27 @@ async def edit(ctx: AppContext, message_id: int, text: str, markup: InlineKeyboa
         raise
 
 
+def react_soon(ctx: AppContext, message_id: int, emoji: str) -> asyncio.Task[None]:
+    """``react`` started now, without waiting for it (the capture router's 👀 while the job worker starts). A later
+    ``react`` on the same message waits for this one first: Telegram keeps the reaction set last, and a slow 👀 must
+    not replace the job's final 👌."""
+    task = asyncio.ensure_future(react(ctx, message_id, emoji))
+    ctx.reacting[message_id] = task
+
+    def _forget(done: asyncio.Task[None]) -> None:
+        if ctx.reacting.get(message_id) is done:
+            del ctx.reacting[message_id]
+
+    task.add_done_callback(_forget)
+    return task
+
+
 async def react(ctx: AppContext, message_id: int, emoji: str) -> None:
-    """Best effort: set the bot's single reaction on a message (replaces the previous one). Never raises."""
+    """Best effort: set the bot's single reaction on a message (replaces the previous one). Never raises. One still
+    on its way for the message (``react_soon``) goes first."""
+    earlier = ctx.reacting.get(message_id)
+    if earlier is not None and earlier is not asyncio.current_task() and not earlier.done():
+        await asyncio.wait([earlier])
     try:
         await ctx.bot.set_message_reaction(
             chat_id=ctx.chat_id,

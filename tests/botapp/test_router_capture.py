@@ -68,6 +68,26 @@ async def test_reply_to_a_reminder_edits_its_item(feed, updates, seed) -> None:
 
     [raw] = await seed.raws()
     assert raw.reply_item_id == created.item.id
+    # that instance (the 18:00 reminder of "в 9:00 и 18:00": «готово» closes the 18:00, not this morning's)
+    [job] = await seed.jobs()
+    assert job.payload == {"raw_id": raw.id, "item_id": created.item.id, "occurrence_id": created.occurrence.id}
+
+
+async def test_an_answer_to_not_heard_after_a_voice_edit_is_the_edit_again(feed, updates, seed) -> None:
+    """ "🎤 Не разобрал голосовое — повтори или напиши текстом" after a voice reply to a card: the text (or voice)
+    answer to it edits the item; it is no new message."""
+    created = await seed.item()
+    occ_id = created.occurrence.id
+    await seed.bot_message(702, purpose="unheard", item_id=created.item.id, occurrence_id=occ_id)
+
+    await feed(updates.message("перенеси на пятницу", reply_to=702))
+    await feed(updates.message(voice={"file_id": "v1", "file_unique_id": "uv1", "duration": 2}, reply_to=702))
+
+    raws = await seed.raws()
+    assert [r.reply_item_id for r in raws] == [created.item.id] * 2
+    jobs = await seed.jobs()
+    assert [j.kind for j in jobs] == ["edit", "edit"]
+    assert [j.payload["occurrence_id"] for j in jobs] == [occ_id, occ_id]
 
 
 async def test_reply_to_a_bot_message_without_item_is_a_plain_message(feed, updates, seed) -> None:

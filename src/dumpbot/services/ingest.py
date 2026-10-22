@@ -46,6 +46,7 @@ __all__ = [
     "message_to_raw_fields",
     "normalize_origin",
     "picked_item",
+    "rejected_transcript",
     "save_app_text",
     "save_incoming",
     "text_urls",
@@ -64,8 +65,9 @@ EDIT_KEY: Final = "_edit"
 # [↩️ Отменить] of an edit applied by description: {item id: what the edit changed} (``services.undo``).
 UNDO_KEY: Final = "_undo"
 APP_KEY: Final = "_app"  # a message from the Mini App: what the owner was told about it ({note, answer, edited})
-# A voice note whose transcript was not speech (docs/features/iteration-4.md §1): {"tries": [{stt, reason, text} …],
-# "job": {"kind", "payload"}} — the job [🔁 Ещё раз] queues again; the rejected transcript stays in ``transcript``.
+# A voice note / audio file whose transcript was not speech (docs/features/iteration-4.md §1): {"tries": [{stt, reason,
+# text} …]} on that part (the rejected transcript stays in ``transcript``), and on the voice note answered "Не разобрал"
+# also "job": {"kind", "payload"} — the job [🔁 Ещё раз] queues again (``rejected_transcript``).
 UNHEARD_KEY: Final = "_unheard"
 APP_SOURCE: Final = "app"  # RawMessage.source of "закинуть в свалку" from the Mini App ("telegram" otherwise)
 _TEXT_URL_RE: Final = re.compile(r"(?i)\b(?:https?://|www\.)[^\s<>\"'«»]+")
@@ -360,19 +362,29 @@ async def picked_item(session: AsyncSession, raw_id: int, text: str) -> int | No
     return int(ids[number - 1])
 
 
-async def enqueue_processing(session: AsyncSession, raw: RawMessage, now: datetime) -> None:
+def rejected_transcript(raw: RawMessage) -> bool:
+    """The part's transcript was rejected as not speech (``UNHEARD_KEY`` with its tries): kept for analysis only."""
+    marker = (raw.raw_json or {}).get(UNHEARD_KEY)
+    return isinstance(marker, dict) and "tries" in marker
+
+
+async def enqueue_processing(
+    session: AsyncSession, raw: RawMessage, now: datetime, *, occurrence_id: int | None = None
+) -> None:
     """Queue the processing job of a saved message. Does not commit.
 
-    - reply to a bot card (``reply_item_id``) -> ``edit {raw_id, item_id}``, dedupe ``edit:{raw_id}``;
+    - reply to a bot card (``reply_item_id``) -> ``edit {raw_id, item_id}``, dedupe ``edit:{raw_id}``; a reply to a
+      reminder names its instance too (``occurrence_id``: "готово" to the 18:00 one closes that one);
     - album part -> ``album {media_group_id, chat_id}``, dedupe ``album:{chat_id}:{gid}``, ``run_after`` =
       latest part + 2 s (each new part pushes it back while the job is still queued); a part that arrives after the
       album job started is processed on its own (``message``);
     - otherwise ``message {raw_id}``, dedupe ``msg:{raw_id}``.
     """
     if raw.reply_item_id is not None:
-        await jobs.enqueue(
-            session, "edit", {"raw_id": raw.id, "item_id": raw.reply_item_id}, dedupe_key=f"edit:{raw.id}"
-        )
+        payload: dict[str, Any] = {"raw_id": raw.id, "item_id": raw.reply_item_id}
+        if occurrence_id is not None:
+            payload["occurrence_id"] = occurrence_id
+        await jobs.enqueue(session, "edit", payload, dedupe_key=f"edit:{raw.id}")
     elif raw.media_group_id:
         if await _enqueue_album(session, raw, now) is None:
             log.info("album %s is already being processed; message %s goes alone", raw.media_group_id, raw.id)

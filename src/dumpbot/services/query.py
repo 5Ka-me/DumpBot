@@ -45,6 +45,7 @@ from dumpbot.domain import recurrence, timeresolve
 from dumpbot.domain.kinds import ACTIONABLE, CALENDAR_PERIODS
 from dumpbot.domain.prefs import Prefs
 from dumpbot.dto import Agenda, CardExtras, RelatedRef, Row, Step, UsageSummary
+from dumpbot.services.ingest import UNHEARD_KEY
 from dumpbot.services.items import current_occurrence, current_occurrence_order
 from dumpbot.services.related import message_words, subject_lexeme_array
 
@@ -471,17 +472,19 @@ async def card_extras(session: AsyncSession, item: Item, *, with_heard: bool = T
 
 async def heard(session: AsyncSession, raw_id: int | None) -> str | None:
     """The transcript of raw message ``raw_id`` when it is a voice note or an audio file (of every such part of its
-    album, in order); None for any other message or an empty transcript."""
+    album, in order); None for any other message or an empty transcript. A transcript rejected as not speech (an
+    audio file of music saved by its caption: ``UNHEARD_KEY`` with its tries) is not shown."""
     if raw_id is None:
         return None
-    cols = (RawMessage.content_type, RawMessage.transcript, RawMessage.media_group_id, RawMessage.chat_id)
+    unheard = RawMessage.raw_json[UNHEARD_KEY].label("unheard")
+    cols = (RawMessage.content_type, RawMessage.transcript, RawMessage.media_group_id, RawMessage.chat_id, unheard)
     row = (await session.execute(select(*cols).where(RawMessage.id == raw_id))).one_or_none()
     if row is None:
         return None
-    texts: Sequence[str | None] = [row.transcript] if row.content_type in _VOICE_TYPES else []
+    parts: Sequence[Any] = [row] if row.content_type in _VOICE_TYPES else []
     if row.media_group_id:
         stmt = (
-            select(RawMessage.transcript)
+            select(RawMessage.transcript, unheard)
             .where(
                 RawMessage.media_group_id == row.media_group_id,
                 RawMessage.chat_id == row.chat_id,
@@ -489,7 +492,8 @@ async def heard(session: AsyncSession, raw_id: int | None) -> str | None:
             )
             .order_by(RawMessage.message_id)
         )
-        texts = (await session.scalars(stmt)).all()
+        parts = (await session.execute(stmt)).all()
+    texts = [p.transcript for p in parts if not (isinstance(p.unheard, dict) and "tries" in p.unheard)]
     return " ".join(t.strip() for t in texts if t and t.strip()) or None
 
 

@@ -7,7 +7,7 @@ from datetime import datetime, time
 
 import pytest
 
-from dumpbot.ai.schemas import EditPatch
+from dumpbot.ai.schemas import EditPatch, When
 from dumpbot.services import items, query
 
 DAILY_9 = {"kind": "task", "title": "Зарядка", "rrule": "FREQ=DAILY", "when": {"time": "09:00"}}
@@ -454,3 +454,22 @@ async def test_attributes_stay_loaded_after_edits(session, make, now, prefs):
 async def test_unknown_item(session, prefs, now):
     with pytest.raises(items.NotFoundError):
         await items.apply_patch(session, 424242, patch(action="done"), prefs, now)
+
+
+# --- iteration 4, §4: a move is another day -------------------------------------------------------------------------
+
+
+async def test_moved_is_another_day_not_another_hour(session, make, now, prefs):
+    """The stale-items check counts moves to another day: «не в 10, а в 11» is no move, «на пятницу» is; a first
+    date for an item that had none (the bot's 19:00) is no move either."""
+    [c] = await make({"kind": "event", "title": "Врач", "when": {"day": "+1", "time": "10:00"}}, now=now)
+    hour = await items.apply_patch(session, c.item.id, EditPatch(when=When(text="в 11", time="11:00")), prefs, now)
+    assert hour.moved is False
+    day = await items.apply_patch(session, c.item.id, EditPatch(when=When(text="в пятницу", day="FR")), prefs, now)
+    assert day.moved is True
+    title = await items.apply_patch(session, c.item.id, EditPatch(title="Врач-терапевт"), prefs, now)
+    assert title.moved is False
+
+    [u] = await make({"kind": "task", "title": "Отчёт"}, now=now)
+    first = await items.apply_patch(session, u.item.id, EditPatch(when=When(text="завтра", day="+1")), prefs, now)
+    assert first.moved is False

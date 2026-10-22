@@ -63,3 +63,21 @@ async def test_a_failed_journal_write_breaks_no_call(api, db, monkeypatch, caplo
     assert reply.status == 200 and "open" in reply.data
     await asyncio.sleep(0.2)
     assert "could not write 1 journal event(s) (miniapp): RuntimeError" in caplog.text
+
+
+async def test_a_slow_journal_write_holds_up_no_call(api, db, monkeypatch) -> None:
+    """aiohttp answers the calls of one keep-alive connection one after another: the journal is written in the
+    background, so the app's refresh right after a ✅ never waits for the write before it (Supabase is ~150 ms away)."""
+    real = events.record
+
+    async def slow(*args: Any, **kwargs: Any) -> None:
+        await asyncio.sleep(0.5)
+        await real(*args, **kwargs)
+
+    monkeypatch.setattr(events, "record", slow)
+    assert (await api.get("/api/today")).status == 200
+    started = time.monotonic()
+    assert (await api.get("/api/today")).status == 200  # the same connection
+    assert time.monotonic() - started < 0.3
+    rows = await _wait_events(db, 2)
+    assert [e.data["route"] for e in rows] == ["GET /api/today", "GET /api/today"]  # in the order of the calls

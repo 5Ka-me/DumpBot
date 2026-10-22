@@ -425,9 +425,11 @@ Whisper:
 
 ```python
 def garbage.garbage_reason(text, *, duration=None, language=None) -> str | None
-    # любой признак: одна буква подряд ≥ 15 раз; > 40 символов на секунду записи (duration Telegram); при language
-    # "ru" — кириллица < 30 % букв; вся расшифровка — известная галлюцинация Whisper («Продолжение следует…»,
-    # «Субтитры сделал …», «Thank you for watching», «[Музыка]»…; без регистра, пунктуации, ё→е). Пустая — не мусор.
+    # любой признак: одна буква подряд ≥ 15 раз; > 40 символов на секунду записи (duration Telegram — целые
+    # секунды с отброшенной дробью: делится на duration + 1); при language "ru" — кириллица < 30 % букв, если букв
+    # ≥ 20 (MIN_SCRIPT_LETTERS: «Zoom с Lead в 15:00», «Deploy на prod», «OK.» — речь); вся расшифровка — известная
+    # галлюцинация Whisper («Продолжение следует…», «Субтитры сделал …», «Thank you for watching», «[Музыка]»…; без
+    # регистра, пунктуации, ё→е). Пустая — не мусор.
 class GarbageTranscript(AIError):   # reason, text (последняя отвергнутая), tries: [{stt, reason, text} | {stt, error}]
 backend.transcribe(audio, *, mime_type=None, language=None, judge: Callable[[str], str | None] | None = None)
     # judge отверг текст → ai_usage(ok=false, error="garbage transcript", цена как у успеха) → GarbageTranscript
@@ -437,9 +439,11 @@ LocalWhisperSTT(..., pause_s=LOCAL_PAUSE_S, monotonic=time.monotonic).pause_left
 ```
 `screen=True` (процессор): judge с duration и языком попытки; мусор → ещё одна попытка другим путём — следующий
 бэкенд порядка (ещё не пробованный), иначе тот же с аудио, сконвертированным в WAV (ffmpeg; нет ffmpeg — исходное
-аудио), и `language="ru"` (если язык и так ru, а WAV не вышло — второй попытки нет). Годная — возвращается; мусор
-снова или ошибка второй попытки → `GarbageTranscript` с обеими попытками. Платная вторая попытка тоже проходит
-`before_paid`. Chutes с `STT_CONVERT_WAV` уже WAV не конвертирует.
+аудио), и `language="ru"` (если язык и так ru, а WAV не вышло — второй попытки нет). Бэкенд, который и так
+отправляет WAV (`ChutesWhisperSTT.sends_wav` = `STT_CONVERT_WAV`), получает только `language="ru"`, а если язык и
+так ru — второй попытки нет: это был бы тот же платный запрос. Годная — возвращается; мусор снова или ошибка второй
+попытки → `GarbageTranscript` с обеими попытками. Платная вторая попытка тоже проходит `before_paid`. Chutes с
+`STT_CONVERT_WAV` уже WAV не конвертирует.
 Локальный Whisper, до которого не достучаться (`ClientConnectorError` — DNS, отказ; `ConnectionTimeoutError` —
 `LOCAL_CONNECT_TIMEOUT_S` = 10 с на соединение), — пауза `LOCAL_PAUSE_S` (600 с, в памяти процесса): `order()`
 пропускает бэкенды с `pause_left() > 0` (сразу chutes), WARNING `local STT cannot be reached` один раз за паузу;
@@ -571,6 +575,12 @@ def next_month_start(now: datetime, prefs: Prefs) -> datetime         # aware UT
 при любом исходе); `job_spend` / `job_budget(sessionmaker, prefs, now)` читают траты месяца из БД один раз за задачу
 (проверка перед платным STT и перед `extract()` — одно чтение) и прибавляют стоимость вызовов задачи с тех пор
 (записанных и нет); `prefetch_spend` начинает это чтение заранее (пока качается голосовое). Вне задачи — как раньше.
+Вызов, чей результат сохраняется до ответа, сохраняется вместе с ним (ревью итерации 4): `kept_rows()` забирает строки
+задачи (при ошибке блока возвращает их для `write_pending`), `with_rows(update_stmt, rows)` — тот же UPDATE с
+data-modifying WITH, вставляющим их (одно обращение, оба или ничего: расшифровка + строка STT), `insert_rows(session,
+rows)` — в транзакции (шаги разбивки + строка split, отвергнутая расшифровка + её попытки). Процесс, убитый до ответа
+(выход по watchdog, OOM на Render), не теряет оплаченный вызов: повтор задачи берёт сохранённый результат и вызова
+больше не делает.
 
 ### 4.9a services/events.py  [workers] (итерация 4, §5)
 
@@ -592,17 +602,18 @@ def moved_entries(occurrences, source: str) -> list[Entry]               # ма�
 
 | type | где | source / ids / data |
 |---|---|---|
-| `command` | `bot.journal.CommandJournal` (inner middleware роутера commands) | data `{"name": "today"}` — без аргументов |
+| `command` | `bot.journal.CommandJournal` (inner middleware роутера commands) | data `{"name": "today"}` — без аргументов; неизвестная команда — `{"name": "unknown"}` (набранное после «/» — текст владельца) |
 | `button` | `bot.journal.ButtonJournal` (inner middleware `dp.callback_query`: все роутеры) | source = purpose сообщения с кнопкой (reminder / digest / list / card / …); ids из CallbackData (`ItemCb`/`KindCb`/`SubCb`.id, `PickCb`/`UndoCb`.item, `ListCb`.i/o, `OccCb`.id); data `{"action": "o:done", "cb": <callback_data>}` (+ `"error"`, если обработчик упал) |
-| `miniapp` | `web.server.journal_middleware` (внешний) | source `miniapp`; item = `{id}` у `/api/items/…`, `/api/steps/…`; data `{"route": "POST /api/items/{id}/done", "status": 200}`; только прошедшие initData (не 401/403), без опросов `GET /api/jobs/{id}`, `GET /api/inbox/{id}` и картинок; ответ уходит (`prepare` + `write_eof`) до записи |
+| `miniapp` | `web.server.journal_middleware` (внешний) | source `miniapp`; item = `{id}` у `/api/items/…`, `/api/steps/…`; data `{"route": "POST /api/items/{id}/done", "status": 200}`; только прошедшие initData (не 401/403), без опросов `GET /api/jobs/{id}`, `GET /api/inbox/{id}` и картинок; пишется в фоне (`JournalWrites`: задачи на приложении, по порядку вызовов, дожидаются при остановке сервера) — aiohttp обрабатывает запросы одного keep-alive соединения по очереди, и следующий вызов не ждёт записи |
 | `reminder_sent` | `Scheduler._deliver` после `sent` | source `reminder`; item, occurrence; data `{"reminder": id, "late_min": N, "kb": "timed"\|"span"\|"series", "held"?: true}` (`kb` — набор кнопок, `views.reminder_kind`) |
 | `digest_item` | `Scheduler._send_digest` / `_send_weekly` после отправки | source `digest`; строка раздела (`views.morning_sections` без сделанных / `views.evening_sections` / `views.weekly_sections`): item, occurrence; data `{"digest": "morning", "sec": "o"}` (`"weekly"`) |
-| `edit` | `processor.handle_edit` / `handle_edit_time` / `_apply_edit` после ответа; `DigestCb` и `POST /api/today/move` (массовый перенос) | правка сообщением (ответ на карточку / напоминание, описанием, «🕒 Время»): source `text`, item, data `{"move": bool}` (`processor.moves(patch)`: новое время, не «когда-нибудь», не done/delete); перенос невыполненного: source `digest` / `miniapp`, item и occurrence каждой перенесённой, data `{"move": true}` |
+| `edit` | `processor.handle_edit` / `handle_edit_time` / `_apply_edit` после ответа; `DigestCb` и `POST /api/today/move` (массовый перенос) | правка сообщением (ответ на карточку / напоминание, описанием, «🕒 Время»): source `text`, item, data `{"move": bool}` (`PatchResult.moved`: запись встала на другой день — не новый час того же дня и не первая дата записи без своей); перенос невыполненного: source `digest` / `miniapp`, item и occurrence каждой перенесённой, data `{"move": true}` |
 | `stale_ask` | `Scheduler._ask_stale` после отправки | source `stale`; item; data `{"digests": N, "moves": M}` |
 
 Итерация 4, §4 — `"move": true` ставят: `ButtonJournal` у `MOVE_ACTIONS` (`o:tmr`, `o:nw`, `o:nm`, `dy`; без ошибки
-обработчика), Mini App через `web.http.journal_note` (`POST /api/items/{id}/when` с `due_local`, `…/snooze` с
-`tomorrow`, `PATCH /api/items/{id}` с новым `period`, не `someday`), `edit_entry`/`moved_entries`. Свои события
+обработчика), Mini App через `web.http.journal_note` (`POST /api/items/{id}/when` с `due_local` — только если
+`PatchResult.moved`, `…/snooze` с `tomorrow`, `PATCH /api/items/{id}` с новым `period`, не `someday`),
+`edit_entry`/`moved_entries`. Журнал пишется через `ctx.autocommit` (одно обращение без BEGIN/COMMIT). Свои события
 вызова Mini App — `web.http.journal_also` (пишутся вместе с `miniapp`, только при статусе < 400).
 
 ### 4.9b services/stale.py  [workers] (итерация 4, §4, §6)
@@ -613,14 +624,16 @@ DIGESTS_IN_A_ROW = 3; MOVES = 2
 class Stale: item_id: int; created_at: datetime; digests: int; moves: int
 def is_action(ev=Event) -> ColumnElement[bool]   # button | miniapp (кроме GET) | edit — действие по записи
 def is_move(ev=Event) -> ColumnElement[bool]     # действие с data.move = true
-async def candidates(session, *, limit=10) -> list[Stale]   # залежавшиеся, раньше сохранённые — первыми
-async def pick(session) -> Stale | None
+async def candidates(session, prefs=None, *, now=None, limit=10) -> list[Stale]   # раньше сохранённые — первыми
+async def pick(session, prefs=None, *, now=None) -> Stale | None
 async def asked_on(session, day: date, prefs) -> set[int]    # о каких записях спрашивали в этот локальный день
 async def unanswered_reminders(session, start, end) -> list[tuple[int, int]]   # (occurrence, item), §6
 ```
-Запись залежалась: открыта, не «когда-нибудь», не активный повтор; дайджестов (`digest_item`, разные `created_at`;
-обзор недели тоже) после последнего действия (или сохранения) ≥ 3, или переносов (`is_move`) после последнего
-вопроса (или сохранения) ≥ 2; вопрос без ответа (нет действия после `stale_ask`) не повторяется, «Оставить» — само
+Запись залежалась: открыта, не «когда-нибудь», не активный повтор; локальных дней (`prefs.tz`) с дайджестом о ней
+(`digest_item`: утренний, вечерний и обзор недели одного дня — один день) после последнего действия (или сохранения)
+≥ 3 — строки раздела сроков (`p`) обзора недели у записи, чей срок ещё идёт, не считаются, а запись, чей срок ещё не
+начался, не считается вовсе, — или переносов (`is_move`) после последнего вопроса (или сохранения) ≥ 2; действие с
+шагом чек-листа — действие и с его родителем; вопрос без ответа (нет действия после `stale_ask`) не повторяется, «Оставить» — само
 действие (сбрасывает счёт). Напоминание без реакции (§6): `reminder_sent` в [start, end), после него ни одного
 действия по записи, occurrence open/missed, запись открыта и не «когда-нибудь»; последнее такое на запись.
 
@@ -643,6 +656,9 @@ class PatchResult:
     reminders: list[Reminder]          # pending текущего occurrence
     warnings: list[str]
     deleted: bool = False
+    moved: bool = False                # итерация 4, §4: правка поставила запись на другой локальный день, чем та
+                                       # датированная, на которой она была (новый час того же дня и первая дата у
+                                       # записи без своей — не перенос)
 
 async def create_items(session, *, raw: RawMessage | None, extraction: Extraction, source: SourceKind,
                        source_text: str | None, source_meta: dict | None, urls: list[str], prefs: Prefs,
@@ -683,8 +699,12 @@ async def remove_reminders(session, item_id: int, *, prefs: Prefs | None = None,
 async def set_kind(session, item_id: int, kind: str) -> Item
 async def set_title(session, item_id: int, title: str) -> Item
 async def set_tags(session, item_id: int, tags: list[str]) -> Item
-async def apply_patch(session, item_id: int, patch: EditPatch, prefs: Prefs, now: datetime) -> PatchResult
-    """action: done/undone (текущее occurrence), delete, no_reminder, stop_recurrence, update:
+async def apply_patch(session, item_id: int, patch: EditPatch, prefs: Prefs, now: datetime, *,
+                      occurrence_id: int | None = None) -> PatchResult
+    """occurrence_id (итерация 4, ответ на напоминание этого раза): done, стоп и новое время — ему (18:00 из «в 9:00 и
+    18:00», когда утреннее не отмечено); без него done / стоп закрывают последнее open с due_at ≤ now (иначе самое
+    раннее open), новое время переносит самое раннее open.
+    action: done/undone (текущее occurrence), delete, no_reminder, stop_recurrence, update:
     title/kind/tags_add/tags_remove; when → resolve_when → перенос текущего open occurrence (или создание нового)
     на это время уведомления (только patch.lead этой же правки сдвигает его раньше; прежние leads разовой записи
     сбрасываются, серия хранит свои для следующих повторений); rrule → включить/заменить повтор (правило хранит
@@ -699,8 +719,11 @@ async def stop_recurrence(session, item_id: int, now: datetime | None = None, *,
                           occurrence_id: int | None = None, prefs: Prefs | None = None) -> Item
     """Итерация 4, §2: rec_active=False; **все** open-повторения впереди (due_at > now — и созданное заранее) →
     cancelled вместе с pending-напоминаниями. Уже наступившее остаётся open, а с `close` → done: `occurrence_id`
-    (напоминание, на котором нажали ⏹, даже отложенное вперёд), иначе самое раннее open с due_at ≤ now. Не осталось
-    открытых → запись done. Кнопка карточки / `/recurring` / Mini App — без `close`; фраза и ⏹ напоминания — с ним."""
+    (напоминание, на котором нажали ⏹ или на которое ответили фразой, даже отложенное вперёд), иначе последнее open с
+    due_at ≤ now; остальные наступившие и не отмеченные (утреннее из «в 9:00 и 18:00») → missed. Не осталось
+    открытых → запись done. Кнопка карточки / `/recurring` / Mini App — без `close`; фраза и ⏹ напоминания — с ним.
+    Сначала блокирует строку записи (SELECT … FOR UPDATE): `ensure_recurring`, создающий следующее повторение, берёт
+    ту же блокировку и видит остановку (иначе заранее созданное повторение пришло бы после ⏹)."""
 def day_time(item, occ, prefs) -> time             # итерация 4, §3: время суток для «📅 Выбрать день» — названное
                                                    # время записи (due + lead), у записи без своего — task_default_time
 def picker_days(item, occ, prefs, now) -> list[date]   # 7 дней: с сегодня, пока day_time сегодня впереди, иначе с завтра
@@ -712,7 +735,11 @@ async def ensure_recurring(session, prefs: Prefs, now: datetime) -> int
     (next_occurrence после названного времени последнего, max(due_at) + lead_shift, и после now) с напоминаниями
     (`catch_up`); open-повторения этой записи, у которых
     due_at < due_at нового и которые старше 12 ч, → status=missed, кроме тех, у кого есть pending-напоминание
-    с fire_at > now (отложенное кнопкой): они ждут его отправки. Возвращает число созданных."""
+    с fire_at > now (отложенное кнопкой): они ждут его отправки. Возвращает число созданных. Итерация 4: следующее
+    создаётся под блокировкой строки записи и после повторной проверки rec_active (остановку, закоммиченную
+    между выбором серий и вставкой, видно); остановленная серия, чьё последнее open-повторение стало missed, → done.
+    Правка с rrule и COUNT (ответ «каждый день в 9 и 18, 4 раза» в полдень) начинает DTSTART с первого ещё не
+    прошедшего времени дня, как и новая запись: прошедшее 09:00 не съедает один из COUNT."""
 async def move_to_tomorrow(session, occurrence_ids: list[int], prefs: Prefs, now: datetime, *,
                            day: date | None = None, keep_ahead: bool = False) -> list[Occurrence]
     """+1 день к локальной дате при том же времени суток; due в прошлом → на `day` (по умолчанию
@@ -917,6 +944,10 @@ class JobWorker:
 строки ai_usage, затем итог, и в лог уходит INFO `job 12 (message): ai 1.92 s, db 7 queries / 0.31 s, total 2.40 s`
 — время ИИ (LLM, STT) без БД внутри, число обращений к БД (операторы, `BEGIN`, `COMMIT`/`ROLLBACK`, пинги) и время,
 когда хоть одно шло (параллельные считаются раз), всё время задачи; только числа.
+Отмена (остановка процесса), пришедшая посреди запроса к БД, может выйти из SQLAlchemy её собственной ошибкой
+(`ResourceClosedError`), которую цикл поймал бы как `Exception` и пошёл дальше: `stop_if_cancelled()` в начале
+каждой итерации и перед ожиданием (`JobWorker.run`, `Scheduler.run`) поднимает `CancelledError`, если задачу
+просили остановиться, — остановка не висит.
 
 ### 4.13 services/ingest.py  [workers]
 
@@ -1018,8 +1049,10 @@ temperature 0 и фиксированный seed — повтор дал бы т
   `extract()`); у голосового траты читаются, пока файл качается (`usage.prefetch_spend`);
 - сохранение — одна транзакция: `BEGIN`, по INSERT на таблицу, `COMMIT`; raws не перечитываются (`_attach`),
   карточка новой записи без шагов и связей — без запросов (`CardExtras(heard=…)` из памяти);
-- после карточки: `bot_messages` (sender, autocommit), raws `done` (`_done`, один UPDATE), строки ai_usage (перед
-  реакцией), журнал, итог задачи. Повтор задачи после сбоя между сохранением и `done`: `_load_message` видит записи
+- после карточки: `bot_messages` (sender, autocommit; у сообщения с несколькими записями карточки уходят подряд, а
+  их строки — одним INSERT после последней: `sender.send(later=…)` + `sender.record`), raws `done` (`_done`, один
+  UPDATE), строки ai_usage (перед реакцией; строка STT — вместе с расшифровкой, строка split — вместе с шагами:
+  `usage.kept_rows`), журнал, итог задачи. Повтор задачи после сбоя между сохранением и `done`: `_load_message` видит записи
   этого raw → только `done`, без ИИ и карточки (у reply-правки то же по её once-key). Вопрос (`ASK_KEY`) и Mini App —
   `done` в транзакции записей, как раньше;
 - сообщения processor'а решают тихие часы сами (`sender.send(quiet_checked=True)`), `quiet_requests` не грузит prefs.
@@ -1027,30 +1060,43 @@ Reply-правка (`apply_patch` по шагам: блокировка, пер�
 не переделывалась.
 
 Итерация 4, §1 — голосовое, которое не речь: `_transcript` зовёт `stt.transcribe(screen=True, duration=raw.duration)`;
-`GarbageTranscript` → отвергнутая расшифровка в `raw.transcript`, попытки в `raw_json[UNHEARD_KEY]` (commit сразу:
-повтор задачи не платит за STT снова и видит то же). Любая такая часть (`_Content.unheard`) → записи **не
-создаются**, ИИ не вызывается: raws `done`, у первого в `UNHEARD_KEY.job` — задача для повтора (`message` / `album` /
-`edit` с item), ответ `views.unheard` «🎤 Не разобрал голосовое — повтори или напиши текстом» [🔁 Ещё раз] (AgainCb,
-`purpose="unheard"`) reply на голосовое и 🤔 (у альбома — на все части). Голосовой reply-правка — так же, правка не
-применяется. `retry_unheard(session, raw_id) -> "queued" | "already" | "missing"` ([🔁 Ещё раз]): raw `FOR UPDATE`,
-нет `UNHEARD_KEY.job` → already; иначе у raw (и всех частей альбома) убираются ключ и расшифровки голосовых, статус
-`new`, задача ставится снова (без dedupe: двойное нажатие останавливают блокировка строки и снятый ключ).
+`GarbageTranscript` → отвергнутая расшифровка в `raw.transcript`, попытки в `raw_json[UNHEARD_KEY]` (commit сразу,
+вместе со строками ai_usage этих попыток: повтор задачи не платит за STT снова и видит то же;
+`ingest.rejected_transcript`). Голосовое (`voice`), которое и есть всё сообщение (`_Content.unheard`: ни подписи, ни
+других частей, картинок, ссылок) → записи **не создаются**, ИИ не вызывается: raws `done`, у первого в
+`UNHEARD_KEY.job` — задача для повтора (`message` / `edit` с item и occurrence), ответ `views.unheard` «🎤 Не разобрал
+голосовое — повтори или напиши текстом» [🔁 Ещё раз] (AgainCb, `purpose="unheard"`) reply на голосовое и 🤔.
+Голосовой reply-правка — так же, правка не применяется, а сообщение записывается с item_id (и occurrence_id
+напоминания, на которое ответили): ответ на него текстом (как оно и просит) или голосом — снова правка этой записи,
+не новое сообщение. Аудиофайл (`audio`: музыка, чужая запись — «повторить» нечего), голосовое с подписью и часть
+альбома — обрабатываются по тому, что есть (подпись, другие части, иначе «Аудио: name»), отвергнутая расшифровка
+только хранится (не попадает ни в текст для ИИ, ни в «🎤 «…»»). `retry_unheard(session, raw_id) -> "queued" |
+"already" | "missing"` ([🔁 Ещё раз]): raw `FOR UPDATE`, нет `UNHEARD_KEY.job` → already; иначе у raw (и всех частей
+старого альбома) убираются ключ и отвергнутые расшифровки (годные остаются: за них не платить снова), статус `new`,
+задача ставится снова (без dedupe: двойное нажатие останавливают блокировка строки и снятый ключ).
 
 Итерация 4, §2 — повторы: фразы остановки («больше не напоминай», «закрывай вообще», «хватит повторять», «останови
 повтор», `domain.phrases`). Ответ на карточку / напоминание, который **только** такая фраза (`only_stop_request`, без
 картинок и «?»), ИИ не вызывает и бюджет не проверяет: `EditPatch(action="stop_recurrence")`. Иначе после ИИ
 `stop_phrase_patch`: фраза в тексте и правка модели `done` / `no_reminder` / `update` без нового времени →
 `stop_recurrence` (так же для правки описанием). `items.apply_patch(stop_recurrence)`: активный повтор → стоп + закрыть
-наступивший раз (`stop_recurrence(close=True)`), разовая (или уже остановленная) запись → done; `views.edit_applied` —
-«⏹ Остановил повтор «…» и закрыл этот раз» / «✅ Закрыл «…»». Несколько времён в день: `_save` сравнивает времена
-сообщения (`phrases.clock_times`, ≥ 2) с временами всех созданных записей (у серии — `rule_times`, у разовой —
-названное время), на 12-часовом циферблате; не хватает → у каждой серии сообщения предупреждение «понял только 09:00»
-(`phrases.understood_only`) в карточке. Ответ / правка описанием с rrule — так же (`lost_times_warning`).
+наступивший раз (`stop_recurrence(close=True)`: ответ на напоминание — его раз, `occurrence_id` из job "edit"),
+разовая (или уже остановленная) запись → done; `views.edit_applied` — «⏹ Остановил повтор «…» и закрыл этот раз» /
+«✅ Закрыл «…»». Несколько времён в день: `_save` сравнивает времена сообщения (`phrases.named_times`, ≥ 2) с
+временами всех созданных записей (у серии — `rule_times`, у разовой — названное время, у обеих — моменты
+уведомлений: due и напоминания, «напоминай в 9:45» до «в 10:00» — lead), одно сохранённое время на одно названное, и
+только голый час 1-12 («в 8», не «8:00» / «8 утра») может оказаться во второй половине суток (`phrases.lost_times`);
+не хватает → предупреждение «понял только 09:00» (`phrases.understood_only`) в карточке той серии, чья собственная
+фраза времени (`when_spec.text`) потеряла время (ни одной такой — у каждой серии сообщения). Числа после «в»,
+которые не время: суммы, даты, места («в 5 кабинете», «в 3 корпусе», «в 2 зала»), «в 1С». Ответ / правка описанием с
+rrule — так же (`lost_times_warning`, с моментами её lead).
 
 `handle_album(ctx, {"media_group_id"})` — все raw с этим media_group_id (по message_id), одна обработка: подпись(и) +
 до 4 картинок; результат привязывается к первому raw; остальные raw → done.
-`handle_edit(ctx, {"raw_id","item_id"})` — `extract(reply_item=item_snapshot)` → `apply_patch` → обновить карточку
-(новое сообщение-карточка reply на правку) + реакция 👌. `edit.action=delete` → карточка «🗑 Удалено» с кнопкой «Вернуть».
+`handle_edit(ctx, {"raw_id","item_id","occurrence_id"?})` — `extract(reply_item=item_snapshot)` → `apply_patch`
+(`occurrence_id`: ответ на напоминание этого раза) → обновить карточку (новое сообщение-карточка reply на правку) +
+реакция 👌. Траты месяца читаются параллельно со снимком записи, а уведомление о бюджете / ✍ / отсрочка — только
+когда запись нашлась (ответ на исчезнувшую запись бюджета не касается). `edit.action=delete` → карточка «🗑 Удалено» с кнопкой «Вернуть».
 Итерация 3, §3: выбранный кандидат правки описанием (item_id есть в `CANDIDATES_KEY`, есть `EDIT_KEY`) получает уже
 понятую правку — без второго `extract` и без проверки бюджета (`split` — сразу вызов split), ответ как при правке
 сразу (`_apply_edit`, once_key `edit:{raw}:{item}` в той же транзакции); запись удалили — «🤷 Не нашёл эту запись».
@@ -1151,8 +1197,10 @@ now в тихих часах и (`auto` или опоздало больше `HO
 конца тихих часов), устаревшие (`missed`), свёрнутый итог; не ушло — повтор на следующем тике (в пределах grace);
 (6) heartbeat: записать время в `settings.heartbeat_file`.
 (4a) итерация 4, §6 — обзор недели: по воскресеньям в `digest_weekly_time`, если `digest_weekly_enabled`; цель,
-окно, тихие часы и опоздание после простоя — как у дайджестов, ключ `digest:weekly:{YYYY-MM-DD}`, `build_weekly` →
-None → не отправлять; `views.weekly_review`, `purpose="digest"`;
+окно и тихие часы — как у дайджестов, ключ `digest:weekly:{YYYY-MM-DD}`, `build_weekly` → None → не отправлять;
+`views.weekly_review`, `purpose="digest"`. Обзор, на время которого бот лежал (между прошлым тиком / началом простоя
+и целью тиков не было), «должен» (в памяти процесса) и уходит поздно — на первом тике вне тихих часов в пределах
+`WEEKLY_LATE` (сутки) от цели: свернуть его, как вечерний итог в утренний, некуда;
 (4b) итерация 4, §4 — вопрос о залежавшемся (`_ask_stale`): не в тихие часы, не раньше цели утреннего дайджеста
 этого дня (`shift_out_of_quiet(digest_morning_time)`), ключ `stale:{YYYY-MM-DD}` (не больше одного в день;
 снимается, если отправка не удалась); запись — выбранная утренним дайджестом, иначе `stale.pick`; нет кандидата —
@@ -1169,14 +1217,20 @@ occurrence (ответ на вопрос текстом — правка зап�
 async def send(ctx: AppContext, text: str, markup: InlineKeyboardMarkup | ForceReply | None = None, *,
                reply_to: int | None = None, silent: bool = False, quiet_checked: bool = False, purpose: str,
                item_id: int | None = None, occurrence_id: int | None = None,
-               raw_message_id: int | None = None) -> int
+               raw_message_id: int | None = None, later: list[Record] | None = None) -> int
     """send_message в ctx.chat_id (HTML), reply_parameters(allow_sending_without_reply=True), повтор при
     TelegramRetryAfter (до 3 раз), запись BotMessage в своей сессии (autocommit). Возвращает message_id.
     quiet_checked (итерация 4, §7): тихие часы проверил вызывающий, silent — его решение (disable_notification
-    True/False), quiet_requests prefs не грузит."""
+    True/False), quiet_requests prefs не грузит. later: строка BotMessage не пишется, а добавляется туда —
+    `record(ctx, *records)` пишет несколько одним INSERT (карточки одного сообщения уходят подряд)."""
+async def record(ctx: AppContext, *records: Record) -> None   # Record(message_id, purpose, item_id, occurrence_id,
+                                                               # raw_message_id); ошибки только в лог
 async def edit(ctx: AppContext, message_id: int, text: str, markup: InlineKeyboardMarkup | None = None) -> None
     # "message is not modified" игнорировать
-async def react(ctx: AppContext, message_id: int, emoji: str) -> None   # best-effort, ошибки глушить
+async def react(ctx: AppContext, message_id: int, emoji: str) -> None   # best-effort, ошибки глушить; реакция на
+                                                                        # это сообщение, ещё летящая, — сначала
+def react_soon(ctx, message_id, emoji) -> asyncio.Task[None]   # 👀 capture: без ожидания (воркер стартует сразу), в
+                                                               # ctx.reacting — итоговая реакция задачи ждёт её
 async def lookup(session, chat_id: int, message_id: int) -> BotMessage | None
 ```
 Эмодзи реакций (только из разрешённого списка Telegram): 👀 получено, 👌 сохранено, ✍ отложено (ИИ недоступен/бюджет),
@@ -1258,7 +1312,8 @@ def edit_applied(item, occ, reminders, patch: EditPatch, prefs, now, *, title_be
 # unheard_again() — «🎤 Распознаю ещё раз…» без кнопок; settings_stt_menu(prefs, *, local_stt, local_down) —
 # «(недоступен)» у «Локальный» на паузе.
 # §4: stale_question(item, occ, reminders, prefs, now, *, moves) — «🕸 📌 «Сделать карту» висит 15 дней. Что
-# делаем?» (+ «Переносили уже 2 раза.», строка времени карточки; запись сегодняшняя — «переносили уже 2 раза»)
+# делаем?» (+ «Переносили уже 2 раза.», строка времени карточки; запись сегодняшняя — «переносили уже 2 раза», а
+# без двух переносов — «так и не сделано»)
 # [✅ Сделано] [💤 Когда-нибудь] / [🗑 Удалить] [Оставить] (StaleCb); после нажатия stale_done (как reminder_done) /
 # stale_someday / deleted_card / stale_kept. §6: weekly_sections(data), weekly_review(data, prefs, now, *, lines) —
 # «🗓 Обзор недели, вс 25 окт»: разделы сроков (как в утреннем), «🌙 Когда-нибудь» (+ «… и ещё N — в /someday»),
@@ -1281,7 +1336,8 @@ def help_text() -> str
 `/start` при `OWNER_ID=0`: отвечает любому «Твой Telegram ID: N — впиши его в .env как OWNER_ID и перезапусти».
 
 `capture`: всё, что не команда. `?…` → force_query. Reply разбирается по тому, на что он: сообщение бота с item_id
-(карточка, напоминание) → `reply_item_id`; своё сообщение → записи из его raw (альбом — из всех частей): одна →
+(карточка, напоминание, «🎤 Не разобрал» после голосовой правки) → `reply_item_id` (у напоминания и «Не разобрал» —
+и их occurrence_id: в payload job "edit", `ingest.enqueue_processing(occurrence_id=…)`); своё сообщение → записи из его raw (альбом — из всех частей): одна →
 `reply_item_id`, несколько → `views.edit_candidates` (`purpose="pick"`, reply raw → done, ids в
 `raw_json[CANDIDATES_KEY]`), ни одной → обычное сообщение; текст на `purpose="ask"` → job "clarify"
 {raw_id, option: текст}, dedupe `clarify:{raw_id}` (как у кнопок); число на `purpose="pick"` → job "edit"
@@ -1328,7 +1384,10 @@ DigestCb после переноса пишет в журнал `edit` на ка
 неделе»), сообщение → `reminder_moved`; `smd` [💤 Когда-нибудь] — `apply_patch(when={period: someday})`; `pick`
 [📅 Выбрать день] — сообщение → `day_picker` (`items.picker_days`), `rem` [← Назад] — снова напоминание; DayCb
 `dy:<occ>:<YYYYMMDD>` — `items.move_to_day` (прошедший день — тост «Этот день уже прошёл…» и пикер заново);
-[Другая дата…] — ItemCb `time` (диалог «🕒 Время»); `stop` [⏹ Хватит повторять] / [⏹ Больше не повторять] —
+[Другая дата…] — ItemCb `time` (диалог «🕒 Время», открытый из напоминания: в данных FSM `origin="reminder"` и
+`occ_id` — [✖️ Отмена], ответ и закрытие диалога возвращают сообщение к напоминанию с его кнопками, а не к карточке;
+job "edit_time" получает `reminder {message_id, occurrence_id}`: переносится этот раз, напоминание после правки —
+`reminder_moved`); `stop` [⏹ Хватит повторять] / [⏹ Больше не повторять] —
 `stop_recurrence(close=True, occurrence_id=…)`, сообщение → `reminder_done` (или `reminder_stopped`, если этот раз уже
 не open), повтор уже остановлен — тост. Не open occurrence у кнопок срока — «Уже сделано» / «Напоминание уже
 неактуально». DayCb пишется в журнал с occurrence (`bot.journal.OCC_FIELD`).

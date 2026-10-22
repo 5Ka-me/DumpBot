@@ -128,6 +128,12 @@ class ChutesWhisperSTT(_HttpSTT):
         parts = urlsplit(settings.stt_url)
         self._model = f"{parts.netloc}{parts.path}"[:128] or "whisper"
 
+    @property
+    def sends_wav(self) -> bool:
+        """Every audio goes to the chute as 16 kHz WAV (``STT_CONVERT_WAV``): a second try "as WAV" would be the very
+        same request (``RoutedSTT``)."""
+        return bool(self._settings.stt_convert_wav)
+
     async def transcribe(
         self, audio: bytes, *, mime_type: str | None = None, language: str | None = None, judge: Judge | None = None
     ) -> str:
@@ -362,8 +368,10 @@ class RoutedSTT:
 
     ``screen`` (docs/features/iteration-4.md §1): a transcript that is not speech (``ai.garbage``, by ``duration`` and
     the language asked for) is rejected by its backend and tried once more by another path — the next backend of the
-    order, else the same one with the audio converted to WAV and ``language="ru"``. A usable second transcript is
-    returned; garbage again (or a second try that fails) -> ``GarbageTranscript`` with both tries.
+    order, else the same one with the audio converted to WAV and ``language="ru"`` (a backend that sends WAV anyway,
+    ``sends_wav``, gets only Russian asked for, and nothing when it was asked for already: the same request would
+    cost again for the same answer). A usable second transcript is returned; garbage again (or a second try that
+    fails) -> ``GarbageTranscript`` with both tries.
     """
 
     def __init__(self, chutes: SpeechToText, local: SpeechToText | None = None) -> None:
@@ -441,13 +449,16 @@ class RoutedSTT:
         duration: float | None,
     ) -> str:
         """One more transcript of an audio whose first one was not speech: the next backend of the order
-        (``untried``), else the same one with the audio as WAV and ``language="ru"``. Garbage again, or an error ->
-        ``first`` with this try added."""
+        (``untried``), else the same one with the audio as WAV and ``language="ru"`` — unless that is the request it
+        sent already (``first`` at once). Garbage again, or an error -> ``first`` with this try added."""
         tried = first.tries[0]["stt"]
         if untried:
             name, again = untried[0], call
         else:
-            name, again = tried, await _as_wav_ru(call)
+            # A backend that converts every audio to WAV itself (chutes with STT_CONVERT_WAV) only needs Russian asked
+            # for; with Russian asked for already, the second try would send the very same request (and pay for it).
+            sends_wav = _sends_wav(self._backends[tried])
+            name, again = tried, _Call(call.audio, call.mime_type, "ru") if sends_wav else await _as_wav_ru(call)
             if again == call:  # the very same request again would give the same answer
                 log.info("STT %s: transcript rejected (%s), nothing else to try", tried, first.reason)
                 raise first
@@ -494,6 +505,11 @@ async def _as_wav_ru(call: _Call) -> _Call:
     except AIError as e:
         log.warning("STT: no WAV for the second try (%s)", type(e).__name__)
         return _Call(call.audio, call.mime_type, "ru")
+
+
+def _sends_wav(backend: SpeechToText) -> bool:
+    """The backend converts every audio to WAV before sending it (``ChutesWhisperSTT.sends_wav``)."""
+    return bool(getattr(backend, "sends_wav", False))
 
 
 def _pause_left(backend: SpeechToText) -> float:

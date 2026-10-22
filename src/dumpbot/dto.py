@@ -60,6 +60,9 @@ class PatchResult:
     reminders: list[Reminder]  # pending reminders of the current occurrence
     warnings: list[str] = field(default_factory=list)
     deleted: bool = False
+    # The edit moved the item from the day it was on to another one (docs/features/iteration-4.md §4: a move the
+    # stale-items check counts); not a new hour on the same day, nor a first date for an item that had none.
+    moved: bool = False
 
 
 @dataclass

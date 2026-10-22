@@ -1,7 +1,8 @@
-"""End-to-end, iteration 4 (docs/features/iteration-4.md): a task left hanging -> three digests without an action ->
-"🕸 «Сделать карту» висит 1 день. Что делаем?" right after the digest -> [Оставить] (the count starts afresh) -> asked
-again three digests later -> [💤 Когда-нибудь] -> the Sunday weekly review lists it under "🌙 Когда-нибудь" -> its
-[✅ 1] closes it (§4, §6); a task moved twice by its reminder's [📅 Завтра] is asked about too.
+"""End-to-end, iteration 4 (docs/features/iteration-4.md): a task left hanging -> digests on three days without an
+action (the evening and the morning digest of one day are one) -> "🕸 «Сделать карту» висит 2 дня. Что делаем?" right
+after the morning digest -> [Оставить] (the count starts afresh) -> asked again three days later -> [💤 Когда-нибудь]
+-> the Sunday weekly review lists it under "🌙 Когда-нибудь" -> its [✅ 1] closes it (§4, §6); a task moved twice by
+its reminder's [📅 Завтра] is asked about too.
 
 Harness: conftest.py (``e2e``); the clock starts on Tue 2026-10-06 10:12 Europe/Warsaw.
 """
@@ -67,28 +68,30 @@ async def test_a_hanging_task_is_asked_about_kept_put_off_and_reviewed(e2e: Any)
     item = await e2e.item("Сделать карту")
 
     assert questions(await tick(e2e, local(2026, 10, 6, 18, 0))) == []  # its reminder, ignored
-    assert questions(await tick(e2e, local(2026, 10, 6, 21, 0))) == []  # evening digest: 1
-    morning = await tick(e2e, local(2026, 10, 7, 9, 0))  # morning digest: 2
+    assert questions(await tick(e2e, local(2026, 10, 6, 21, 0))) == []  # evening digest: day 1
+    morning = await tick(e2e, local(2026, 10, 7, 9, 0))  # morning digest: day 2
     assert len(morning) == 1 and "Сделать карту" in morning[0].text
-    sent = await tick(e2e, local(2026, 10, 7, 21, 0))  # evening digest: 3 -> the question right after it
+    assert questions(await tick(e2e, local(2026, 10, 7, 21, 0))) == []  # evening digest: still day 2
+    sent = await tick(e2e, local(2026, 10, 8, 9, 0))  # morning digest: day 3 -> the question right after it
     digest_msg, question = sent
-    assert digest_msg.text.startswith("🌙 <b>Итоги дня</b>")
-    assert question.text == "🕸 📌 «Сделать карту» висит 1 день. Что делаем?\n⏰ вчера 18:00 · просрочено"
+    assert digest_msg.text.startswith("☀️ <b>Доброе утро!</b>")
+    assert question.text == "🕸 📌 «Сделать карту» висит 2 дня. Что делаем?\n⏰ вт 6 окт 18:00 · просрочено"
     assert [text for text, _ in question.buttons] == ["✅ Сделано", "💤 Когда-нибудь", "🗑 Удалить", "Оставить"]
     asked = [e for e in await e2e.all(Event) if e.type == "stale_ask"]
     assert [(e.item_id, e.data) for e in asked] == [(item.id, {"digests": 3, "moves": 0})]
 
-    e2e.clock.set(local(2026, 10, 7, 21, 5))
+    e2e.clock.set(local(2026, 10, 8, 9, 5))
     kept = await press(e2e, question, f"st:keep:{item.id}")
     assert kept.text.startswith("👌 Оставил «Сделать карту» как есть")
     assert (await e2e.item("Сделать карту")).status == "open"
 
-    assert questions(await tick(e2e, local(2026, 10, 8, 9, 0))) == []  # 1 since [Оставить]
-    assert questions(await tick(e2e, local(2026, 10, 8, 21, 0))) == []  # 2
-    again = questions(await tick(e2e, local(2026, 10, 9, 9, 0)))  # 3: asked again (a new day)
-    assert len(again) == 1 and "висит 3 дня" in again[0].text
+    assert questions(await tick(e2e, local(2026, 10, 8, 21, 0))) == []  # day 1 since [Оставить]
+    assert questions(await tick(e2e, local(2026, 10, 9, 9, 0))) == []  # day 2
+    assert questions(await tick(e2e, local(2026, 10, 9, 21, 0))) == []  # still day 2
+    again = questions(await tick(e2e, local(2026, 10, 10, 9, 0)))  # day 3: asked again (a new day)
+    assert len(again) == 1 and "висит 4 дня" in again[0].text
 
-    e2e.clock.set(local(2026, 10, 9, 9, 30))
+    e2e.clock.set(local(2026, 10, 10, 9, 30))
     put_off = await press(e2e, again[0], f"st:smd:{item.id}")
     assert put_off.text == "💤 «Сделать карту» — когда-нибудь, запись в /someday"
     assert (await e2e.item("Сделать карту")).someday is True

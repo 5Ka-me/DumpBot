@@ -203,6 +203,39 @@ async def test_other_date_asks_for_the_time_as_text(feed, updates, seed, tg) -> 
     assert edit.text.startswith("🕒 Когда? Напиши новое время для <b>Посмотреть Raspberry Pi</b>")
 
 
+REMINDER_TEXT = "🔔 <b>Посмотреть Raspberry Pi</b>\n🗓 на этой неделе (до вс 11 окт)"
+SPAN_BUTTONS = ["✅ Готово", "➡️ След. неделя", "📅 Выбрать день", "💤 Когда-нибудь"]
+
+
+async def test_other_date_cancelled_is_the_reminder_again(feed, updates, seed, tg, get_buttons) -> None:
+    """[Другая дата…] then [✖️ Отмена]: the message is the reminder again (with its buttons), not the item's card."""
+    created = await seed.item("Посмотреть Raspberry Pi", when=WEEK)
+    message_id = await _reminder(seed, created)
+    await feed(updates.callback(ItemCb(a="time", id=created.item.id), message_id=message_id))
+    await feed(updates.callback(ItemCb(a="back", id=created.item.id), message_id=message_id))
+
+    prompt, back = tg.edits
+    assert prompt.text.startswith("🕒 Когда?")
+    assert back.text == REMINDER_TEXT
+    assert [label for label, _ in get_buttons(back.reply_markup)] == SPAN_BUTTONS
+
+
+async def test_other_date_answered_moves_that_instance_from_its_reminder(feed, updates, seed, tg, get_buttons) -> None:
+    """The answer queues "🕒 Время" for that instance and with the reminder message: the prompt turns back into the
+    reminder (the job then shows the move there), not into a card."""
+    created = await seed.item("Посмотреть Raspberry Pi", when=WEEK)
+    message_id = await _reminder(seed, created)
+    await feed(updates.callback(ItemCb(a="time", id=created.item.id), message_id=message_id))
+    await feed(updates.message("в субботу в 11", reply_to=message_id))
+
+    _, back = tg.edits
+    assert back.text == REMINDER_TEXT
+    assert [label for label, _ in get_buttons(back.reply_markup)] == SPAN_BUTTONS
+    [job] = await seed.jobs()
+    assert job.kind == "edit_time"
+    assert job.payload["reminder"] == {"message_id": message_id, "occurrence_id": created.occurrence.id}
+
+
 # --- a series: ⏹ ---------------------------------------------------------------------------------------------------
 
 

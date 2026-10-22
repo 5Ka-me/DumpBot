@@ -9,14 +9,17 @@ host's health check and the keep-alive ping (``dumpbot.keepalive``). ``WebServer
 (a search is message text).
 
 Every authorized ``/api`` call goes into the events journal (docs/features/iteration-4.md §5, ``services.events``)
-after its answer was sent: ``miniapp`` with the route pattern and the status, the item of ``/api/items/{id}`` and
-``/api/steps/{id}``, and what the handler noted (``http.journal_note``: ``"move": true`` for a new time or a snooze to
-tomorrow — §4 counts moves) plus its own events (``http.journal_also``: the items moved by «📅 Перенести
-невыполненное на завтра»). Polls (``GET /api/jobs/{id}``, ``GET /api/inbox/{id}``) and pictures are not journaled.
+in the background (``JournalWrites``: the next call on the same connection never waits for it; the writes keep the
+order of the calls and are awaited when the server stops): ``miniapp`` with the route pattern and the status, the
+item of ``/api/items/{id}`` and ``/api/steps/{id}``, and what the handler noted (``http.journal_note``: ``"move":
+true`` for a new time on another day or a snooze to tomorrow — §4 counts moves) plus its own events
+(``http.journal_also``: the items moved by «📅 Перенести невыполненное на завтра»). Polls (``GET /api/jobs/{id}``,
+``GET /api/inbox/{id}``) and pictures are not journaled.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import Any, Final
@@ -25,6 +28,7 @@ from aiohttp import web
 from aiohttp.abc import AbstractAccessLogger
 from aiohttp.web_request import BaseRequest
 from aiohttp.web_response import StreamResponse
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from dumpbot.context import AppContext
 from dumpbot.services import events
@@ -45,6 +49,33 @@ ITEM_ROUTES: Final = ("/api/items/{id}", "/api/steps/{id}")  # their {id} is an 
 UNAUTHORIZED: Final = frozenset({401, 403})
 
 
+class JournalWrites:
+    """The journal events of answered calls, written in the background (aiohttp answers the calls of one keep-alive
+    connection one after another: a write awaited in the middleware — a transaction, three round trips to Supabase —
+    would hold up the app's refresh right after a ✅), one after another in the order of the calls (a lock), and
+    awaited before the app stops (``drain``)."""
+
+    def __init__(self) -> None:
+        self.tasks: set[asyncio.Task[None]] = set()
+        self._order = asyncio.Lock()
+
+    def write(self, sessionmaker: async_sessionmaker[AsyncSession], *entries: events.Entry) -> None:
+        task = asyncio.create_task(self._write(sessionmaker, entries))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _write(self, sessionmaker: async_sessionmaker[AsyncSession], entries: tuple[events.Entry, ...]) -> None:
+        async with self._order:
+            await events.record(sessionmaker, *entries)  # never raises
+
+    async def drain(self, _app: web.Application | None = None) -> None:
+        if self.tasks:
+            await asyncio.gather(*self.tasks, return_exceptions=True)
+
+
+JOURNAL: Final = web.AppKey("journal_writes", JournalWrites)
+
+
 class _AccessLog(AbstractAccessLogger):
     """``GET /api/items/12 200 14 ms`` at DEBUG: the path only (no query string, no headers)."""
 
@@ -60,6 +91,8 @@ def build_web_app(ctx: AppContext, *, static_dir: str | Path | None = None) -> w
         client_max_size=MAX_BODY,
     )
     app[CTX] = ctx
+    app[JOURNAL] = JournalWrites()
+    app.on_cleanup.append(app[JOURNAL].drain)
     app[files.IMAGES] = files.ImageCache()
     app[STATIC] = Path(static_dir) if static_dir else Path()
     app.add_routes([*api_lists.routes(), *api_items.routes(), *api_inbox.routes(), *files.routes()])
@@ -71,19 +104,14 @@ def build_web_app(ctx: AppContext, *, static_dir: str | Path | None = None) -> w
 
 @web.middleware
 async def journal_middleware(request: web.Request, handler: Handler) -> web.StreamResponse:
-    """A ``miniapp`` event per authorized ``/api`` call, written after its answer went out (the journal never delays
-    the app; a failed write is only logged)."""
+    """A ``miniapp`` event per authorized ``/api`` call, written in the background (``JournalWrites``: the journal
+    never delays the app, nor the next call on the connection; a failed write is only logged). One statement without
+    a transaction around it (``ctx.autocommit``)."""
     response = await handler(request)
     entry = api_entry(request, response.status)
-    if entry is None:
-        return response
-    try:  # send the answer now; aiohttp sees it is finished and does not send it again
-        await response.prepare(request)
-        await response.write_eof()
-    except ConnectionError:  # the app went away: the call happened all the same
-        pass
-    more: list[events.Entry] = request.get(JOURNAL_EXTRA, []) if response.status < 400 else []
-    await events.record(ctx_of(request).sessionmaker, entry, *more)
+    if entry is not None:
+        more: list[events.Entry] = request.get(JOURNAL_EXTRA, []) if response.status < 400 else []
+        request.app[JOURNAL].write(ctx_of(request).autocommit, entry, *more)
     return response
 
 

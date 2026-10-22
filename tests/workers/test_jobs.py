@@ -422,3 +422,23 @@ def test_backoff_is_capped() -> None:
     assert jobs.backoff(1) == timedelta(minutes=2)
     assert jobs.backoff(5) == timedelta(minutes=32)
     assert jobs.backoff(9) == jobs.backoff(500) == timedelta(hours=6)
+
+
+async def _a_cancel_turned_into_a_database_error() -> int:
+    """What SQLAlchemy may do when the task is cancelled mid-query: its own error instead of ``CancelledError``."""
+    asyncio.current_task().cancel()  # type: ignore[union-attr]
+    try:
+        await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        raise sa_exc.ResourceClosedError("This result object is closed.") from None
+    return 0
+
+
+async def test_a_cancel_the_database_swallowed_still_stops_the_worker(ctx, monkeypatch) -> None:
+    """The shutdown cancels the worker while it waits for a query: the cancel must not get lost in the loop's
+    ``except Exception`` (the shutdown would wait for ever)."""
+    worker = JobWorker(ctx, {}, poll_interval_s=60)
+    monkeypatch.setattr(worker, "run_once", _a_cancel_turned_into_a_database_error)
+    running = asyncio.create_task(worker.run())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, 2)

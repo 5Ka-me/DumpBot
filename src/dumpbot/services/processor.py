@@ -94,7 +94,15 @@ from dumpbot.dto import BudgetState, CardExtras, CreatedItem, PatchResult, Row
 from dumpbot.services import events as journal
 from dumpbot.services import items as items_svc
 from dumpbot.services import query, undo, usage
-from dumpbot.services.ingest import APP_KEY, APP_SOURCE, ASK_KEY, CANDIDATES_KEY, EDIT_KEY, UNHEARD_KEY
+from dumpbot.services.ingest import (
+    APP_KEY,
+    APP_SOURCE,
+    ASK_KEY,
+    CANDIDATES_KEY,
+    EDIT_KEY,
+    UNHEARD_KEY,
+    rejected_transcript,
+)
 from dumpbot.workers.jobs import BUDGET_REASON, Handler, RetryLater, describe_error, enqueue, try_once
 from dumpbot.workers.jobs import WATCH_NAME as JOBS_WATCH
 
@@ -136,6 +144,8 @@ VISION_MIME: Final[dict[str, str]] = {
     "image/gif": "image/gif",
 }
 _FINISHED: Final = ("done", "ignored")
+_AT: Final = frozenset({"exact", "slot", "relative"})  # precisions of a time of day the owner gave
+_EDIT_PAYLOAD: Final = ("raw_id", "item_id", "occurrence_id")  # what [🔁 Ещё раз] queues again for a voice reply
 # Edits by target that a message from the Mini App (no [↩️ Отменить] there) applies only after the owner picked the
 # item, even when the search found one.
 CONFIRM_ACTIONS: Final = frozenset({"delete", "done", "no_reminder", "stop_recurrence"})
@@ -178,7 +188,9 @@ class _Content:
     forward_origin: dict[str, Any] | None = None
     link_titles: dict[str, str] = field(default_factory=dict)
     force_query: bool = False
-    unheard: bool = False  # a voice note's transcript was not speech (twice): nothing is saved, "Не разобрал"
+    # A voice note whose transcript was not speech (twice), and nothing else to go on (no caption, no other part):
+    # nothing is saved, "Не разобрал".
+    unheard: bool = False
     # Transcripts / link titles being stored meanwhile (``_gather`` with ``meanwhile``): awaited by ``_stored``.
     writes: list[asyncio.Task[None]] = field(default_factory=list)
 
@@ -249,7 +261,8 @@ async def handle_clarify(ctx: AppContext, payload: dict[str, Any]) -> None:
 
 
 async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
-    """Job "edit" ``{raw_id, item_id}``: a reply to an item card, or the item picked among edit candidates.
+    """Job "edit" ``{raw_id, item_id, occurrence_id?}``: a reply to an item card (``occurrence_id``: to a reminder of
+    that instance), or the item picked among edit candidates.
 
     A pick from the list of an edit by description gets the edit already read from that message (``EDIT_KEY``):
     applied without the AI, answered like an edit applied at once (with [↩️ Отменить]). Otherwise (a reply to a card,
@@ -257,6 +270,7 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     The patch is applied at most once per (raw, item): a once-key is committed together with it.
     """
     raw_id, item_id = int(payload["raw_id"]), int(payload["item_id"])
+    occurrence_id = _opt_int(payload.get("occurrence_id"))
     key = f"edit:{raw_id}:{item_id}"
     fresh = ctx.take_fresh(raw_id)
     if fresh is not None:  # the reply the capture router saved a moment ago: nothing applied from it yet
@@ -281,14 +295,18 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
         # A picked candidate re-reads an already processed message: reuse its OCR text instead of the pictures.
         content = await _gather(ctx, [raw], prefs, with_images=not raw.image_text)
         if content.unheard:  # a voice reply that is not speech: no edit, "Не разобрал" with [🔁 Ещё раз]
-            await _unheard(ctx, [raw], prefs, {"kind": "edit", "payload": {"raw_id": raw.id, "item_id": item_id}})
+            job = {"kind": "edit", "payload": {k: v for k, v in payload.items() if k in _EDIT_PAYLOAD}}
+            await _unheard(ctx, [raw], prefs, job, item_id=item_id, occurrence_id=occurrence_id)
             return
         # «Закрывай вообще», «хватит повторять» and nothing more (iteration 4, §2): no AI needed to stop the series
         # (a one-off: done) — nor any budget.
         with_ai = content.force_query or bool(content.images) or not phrases.only_stop_request(content.text)
-        budget = _check_budget(ctx, prefs, [raw]) if with_ai else _nothing()
-        snapshot, _ = await _together(_snapshot(ctx, item_id, prefs, now), budget)
+        # The month's spend is read side by side with the item; what it leads to (a notice, ✍, deferring) only once
+        # the item is known to be there: a reply to a deleted item needs no AI and gets no budget message.
+        spend = usage.job_budget(ctx.autocommit, prefs, clock.utcnow()) if with_ai else _nothing()
+        snapshot, _ = await _together(_snapshot(ctx, item_id, prefs, now), spend)
         if with_ai:
+            await _check_budget(ctx, prefs, [raw])
             out = await _extract(ctx, prefs, _extract_input(content, raw, prefs, reply_item=snapshot))
             if out.extraction.intent == "query" and out.extraction.query is not None:  # "?…" wins over the reply
                 await _reply_query(ctx, [raw], content, out.extraction.query, prefs, _image_text(out.extraction))
@@ -320,7 +338,7 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     async with ctx.sessionmaker() as session:
         if not await try_once(session, key):
             return  # applied concurrently
-        result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
+        result = await items_svc.apply_patch(session, item_id, patch, prefs, now, occurrence_id=occurrence_id)
         if patch.rrule and (lost := lost_times_warning(content.text, result.item)) is not None:
             result.warnings.append(lost)
         view = await _patch_view(session, result, prefs, heard=_heard([raw]))
@@ -337,14 +355,7 @@ async def handle_edit(ctx: AppContext, payload: dict[str, Any]) -> None:
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, [raw], sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
-    await journal.record(ctx.sessionmaker, journal.edit_entry(item_id, move=moves(patch)))
-
-
-def moves(patch: EditPatch) -> bool:
-    """A text edit that moves the item to another time (not "когда-нибудь", not closing or deleting it): the
-    stale-items check counts those (docs/features/iteration-4.md §4)."""
-    when = patch.when
-    return when is not None and when.period != "someday" and patch.action not in ("done", "delete")
+    await journal.record(ctx.autocommit, journal.edit_entry(item_id, move=result.moved))
 
 
 def _picked_patch(raw: RawMessage, item_id: int) -> EditPatch | None:
@@ -375,12 +386,13 @@ async def _apply_picked(
 
 
 async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str, Any] | None:
-    """Job "edit_time" ``{item_id, text, message_id?, now?, app?}`` from the card's "🕒 Время" button.
+    """Job "edit_time" ``{item_id, text, message_id?, now?, app?, reminder?}`` from the card's "🕒 Время" button.
 
     ``message_id`` (the user's text message) gets the reply card and reactions; ``now`` (ISO time the text was
     sent) keeps "завтра" right when the job runs late. Both are optional. With ``message_id`` the patch is applied
     at most once (a once-key is committed together with it). ``app`` (the Mini App): nothing goes to the chat, the
-    outcome is returned for ``Job.result``.
+    outcome is returned for ``Job.result``. ``reminder`` ``{message_id, occurrence_id}``: the prompt was a reminder's
+    [Другая дата…] — that instance moves, and the reminder message shows the move ("➡️ перенёс · …").
 
     Only the time changes (when / repetition / lead of the model's patch; a title, category or "удали" read into
     the answer is dropped). An answer without a usable time changes nothing: "🤷 Не понял время…" and 🤔.
@@ -389,6 +401,8 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str
     text = str(payload.get("text") or "").strip()
     message_id = _opt_int(payload.get("message_id"))
     app = bool(payload.get("app"))
+    reminder = payload.get("reminder") if isinstance(payload.get("reminder"), dict) else {}
+    occurrence_id = _opt_int(reminder.get("occurrence_id"))
     if not text:
         return _outcome(False, "empty", TIME_NOT_UNDERSTOOD_TEXT) if app else None
     key = f"edit-time-done:{item_id}:{message_id}" if message_id is not None else None
@@ -426,18 +440,31 @@ async def handle_edit_time(ctx: AppContext, payload: dict[str, Any]) -> dict[str
     async with ctx.sessionmaker() as session:
         if key is not None and not await try_once(session, key):
             return None  # applied by an earlier run of this job
-        result = await items_svc.apply_patch(session, item_id, patch, prefs, now)
+        result = await items_svc.apply_patch(session, item_id, patch, prefs, now, occurrence_id=occurrence_id)
         view = await _patch_view(session, result, prefs)
         await session.commit()
         events = items_svc.take_parent_events(session)
     if not app:
         await _send_patch_card(ctx, prefs, view, result, reply_to=message_id)
+        await _reminder_moved(ctx, prefs, _opt_int(reminder.get("message_id")), result)
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))  # a step's new time
     if message_id:
         await sender.react(ctx, message_id, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
-    await journal.record(ctx.sessionmaker, journal.edit_entry(item_id, move=moves(patch)))
+    await journal.record(ctx.autocommit, journal.edit_entry(item_id, move=result.moved))
     return _outcome(True, item_id=item_id, warnings=list(result.warnings)) if app else None
+
+
+async def _reminder_moved(ctx: AppContext, prefs: Prefs, message_id: int | None, result: PatchResult) -> None:
+    """The reminder whose [Другая дата…] asked for the new time shows the move, as after a day of the picker
+    (``views.reminder_moved``); best effort."""
+    if message_id is None or result.deleted:
+        return
+    view = views.reminder_moved(result.item, result.occurrence, result.reminders, prefs, clock.utcnow())
+    try:
+        await sender.edit(ctx, message_id, view[0], view[1])
+    except TelegramAPIError as e:
+        log.info("reminder %s not redrawn after the new time (%s)", message_id, type(e).__name__)
 
 
 def _outcome(ok: bool, reason: str | None = None, message: str | None = None, **extra: Any) -> dict[str, Any]:
@@ -527,7 +554,11 @@ async def _split(
         fresh = await _reload(session, raws)
         _finish(fresh, image_text)
         _app_update(fresh, note=why, edited=[item_id])
-        await session.commit()
+        # The split call is stored with its steps: /usage counts it as soon as the checklist shows (and a crash
+        # before the reaction does not lose what was paid for).
+        async with usage.kept_rows() as rows:
+            await usage.insert_rows(session, rows)
+            await session.commit()
     if not app:
         await _present_split(ctx, prefs, item_id, why, created=bool(created), card_message=card_message, raws=raws)
     await _react(ctx, raws, sender.REACT_SAVED)
@@ -875,6 +906,9 @@ async def _save(
             await _send_ask(ctx, prefs, raws, ask)
         return
     heard = _heard(raws)
+    # The cards go out one after another, their bot_messages rows together after the last one (no database wait
+    # between two cards of one message).
+    sent: list[sender.Record] = []
     if heard and created and not shown and not _is_app(raws):
         # Only notes / ideas from a voice note: no card, but the owner sees what was heard (a garbled transcript) —
         # a message per item, so that its buttons and a reply to it are about that item alone.
@@ -889,6 +923,7 @@ async def _save(
                 purpose=sender.PURPOSE_HEARD,
                 item_id=saved.item.id,
                 raw_message_id=primary.id,
+                later=sent,
             )
     for created_item, (text, markup) in shown:
         occ = created_item.occurrence
@@ -902,7 +937,9 @@ async def _save(
             item_id=created_item.item.id,
             occurrence_id=occ.id if occ is not None else None,
             raw_message_id=primary.id,
+            later=sent,
         )
+    await sender.record(ctx, *sent)
     if done_later:
         await _done(ctx, raws, image_text)
     await _react(ctx, raws, sender.REACT_SAVED)
@@ -941,27 +978,40 @@ async def _cards(
 def _lost_times(text: str, created: Sequence[CreatedItem], prefs: Prefs) -> dict[int, str]:
     """«⚠️ понял только 09:00» for the series of a message that named more times than its items kept (iteration 4,
     §2: "каждый день в 9:00 и 18:00" saved with 09:00 only). The times of all items of the message count — "в 9 пить
-    таблетки, в 18 гулять" may well be two series — compared on a 12-hour dial (``phrases.lost_times``)."""
-    named = phrases.clock_times(text)
-    series = [c.item for c in created if c.item.rec_active and c.item.rrule]
+    таблетки, в 18 гулять" may well be two series — and so do the moments they notify at ("в 10:00 планёрка,
+    напоминай в 9:45": 09:45 is the lead's); one kept time stands for one named time, and only a bare hour may have
+    been saved in the other half of the day (``phrases.lost_times``). The warning goes on the series whose own time
+    phrase lost a time; when none's does (the model wrote one time there), on every series of the message."""
+    named = phrases.named_times(text)
+    series = [c for c in created if c.item.rec_active and c.item.rrule]
     if len(named) < 2 or not series:
         return {}
     kept = {c.item.id: _kept_times(c, prefs) for c in created}
     if not phrases.lost_times(named, [t for times in kept.values() for t in times]):
         return {}
-    return {item.id: phrases.understood_only(kept[item.id]) for item in series if kept[item.id]}
+    own = [c for c in series if phrases.lost_times(phrases.named_times(_time_phrase(c.item)), kept[c.item.id])]
+    return {c.item.id: phrases.understood_only(times) for c in own or series if (times := _series_times(c.item))}
+
+
+def _time_phrase(item: Item) -> str:
+    """The words the item's time was read from (``When.text``, kept in ``when_spec``)."""
+    return str((item.when_spec or {}).get("text") or "")
 
 
 def _kept_times(created: CreatedItem, prefs: Prefs) -> list[time]:
     """The times of day an item keeps: a series its rule's ones (``_series_times``), a one-off at a time of day the
-    time stated for it."""
+    time stated for it — and the moments either notifies at (its due and reminders: a lead's moment was named too)."""
     item, res = created.item, created.resolution
+    tz = prefs.zone
+    occ = created.occurrence
+    moments = [occ.due_at, *(r.fire_at for r in created.reminders)] if occ is not None and occ.precision in _AT else []
+    out = [m.astimezone(tz).time().replace(second=0, microsecond=0) for m in moments]
     if item.rrule:
-        return _series_times(item)
+        return [*_series_times(item), *out]
     at = res.stated_at or res.due_at
-    if at is None or res.precision not in ("exact", "slot", "relative"):
-        return []
-    return [at.astimezone(prefs.zone).time()]
+    if at is None or res.precision not in _AT:
+        return out
+    return [at.astimezone(tz).time(), *out]
 
 
 def _series_times(item: Item) -> list[time]:
@@ -970,14 +1020,22 @@ def _series_times(item: Item) -> list[time]:
     return list(recurrence.rule_times(item.rrule)) or ([start.time()] if start is not None else [])
 
 
+def _series_moments(item: Item) -> list[time]:
+    """``_series_times`` and the moments its leads notify at ("в 10, напомни за 15 минут": 10:00 and 09:45)."""
+    times = _series_times(item)
+    day = datetime(2000, 1, 2)
+    leads = [(datetime.combine(day, t) - timedelta(minutes=n)).time() for t in times for n in item.lead_minutes or []]
+    return [*times, *leads]
+
+
 def lost_times_warning(text: str, item: Item) -> str | None:
     """«понял только 09:00» for a series an edit gave a rule ("каждый день в 9 и 18" in reply to a card) that kept
     fewer times than the message named; None when nothing was lost (or the item is no active series)."""
     if not (item.rec_active and item.rrule):
         return None
-    named = phrases.clock_times(text)
+    named = phrases.named_times(text)
     kept = _series_times(item)
-    if len(named) < 2 or not kept or not phrases.lost_times(named, kept):
+    if len(named) < 2 or not kept or not phrases.lost_times(named, _series_moments(item)):
         return None
     return phrases.understood_only(kept)
 
@@ -1215,7 +1273,7 @@ async def _apply_edit(
     await cards.after_steps(ctx, events, prefs, clock.utcnow(), silent=_quiet(prefs))
     await _react(ctx, raws, sender.REACT_SAVED)
     ctx.scheduler_wakeup.set()
-    await journal.record(ctx.sessionmaker, journal.edit_entry(item_id, move=moves(patch)))
+    await journal.record(ctx.autocommit, journal.edit_entry(item_id, move=applied.result.moved))
 
 
 async def _send_candidates(
@@ -1385,7 +1443,7 @@ async def _read(
     urls: list[str] = []
     images: list[tuple[bytes, str]] = []
     origin: dict[str, Any] | None = None
-    unheard = False
+    rejected: list[RawMessage] = []
     for raw in raws:
         if raw.text and raw.text.strip():
             texts.append(raw.text.strip())
@@ -1394,7 +1452,7 @@ async def _read(
         if raw.content_type in VOICE_TYPES:
             transcript = await _transcript(ctx, raw, prefs, raws, writes)
             if _is_unheard(raw):
-                unheard = True
+                rejected.append(raw)
             elif transcript:
                 texts.append(transcript)
         elif raw.content_type in IMAGE_TYPES and with_images and len(images) < MAX_IMAGES:
@@ -1405,6 +1463,12 @@ async def _read(
     if not with_images and primary.image_text:
         texts.append(primary.image_text)
     force_query = any(r.force_query for r in raws)
+    # "Не разобрал — повтори" only for a voice note that is all there is: an audio file (music, a recording someone
+    # sent) cannot be repeated, and a caption or another part is something to go on — those are processed on what
+    # there is (the caption, the other parts, else «Аудио: name»), the rejected transcript kept aside.
+    unheard = (
+        bool(rejected) and all(r.content_type == "voice" for r in rejected) and not texts and not images and not urls
+    )
     text = "\n\n".join(texts)
     if force_query:
         text = _strip_question_mark(text)
@@ -1439,7 +1503,9 @@ async def _transcript(
 
     A transcript that is not speech (docs/features/iteration-4.md §1: ``RoutedSTT`` with ``screen`` already tried a
     second path) is kept for analysis — in ``transcript``, the tries in ``raw_json[UNHEARD_KEY]`` — and "" is
-    returned; ``_is_unheard`` tells the caller (a re-run of the job reads the same from the stored raw).
+    returned; ``_is_unheard`` tells the caller (a re-run of the job reads the same from the stored raw). The
+    transcript is stored together with the ai_usage rows of its calls (``_store``): a crash before the reply does
+    not lose what was paid for.
 
     The paid call needs a budget check: the month's spend is read while the file downloads (``usage.prefetch_spend``),
     and the transcript is stored by a task in ``writes`` (``_gather``).
@@ -1475,15 +1541,18 @@ async def _transcript(
         await _keep_unheard(ctx, raw, garbage)
         return ""
     text = text.strip()
-    writes.append(asyncio.ensure_future(_store(ctx, raw, "transcript", text)))
+    writes.append(asyncio.ensure_future(_store(ctx, raw, "transcript", text, with_usage=True)))
     log.info("message %s transcribed (%d chars)", raw.message_id, len(text))
     return text
 
 
-async def _store(ctx: AppContext, raw: RawMessage, column: str, value: Any) -> None:
-    """One column of a raw message, committed at once (a transcript: a retry must not pay for it again)."""
-    async with ctx.autocommit() as session:
-        await session.execute(update(RawMessage).where(RawMessage.id == raw.id).values({column: value}))
+async def _store(ctx: AppContext, raw: RawMessage, column: str, value: Any, *, with_usage: bool = False) -> None:
+    """One column of a raw message, committed at once (a transcript: a retry must not pay for it again).
+    ``with_usage``: the ai_usage rows the job kept so far (the STT calls that made the transcript) go in the same
+    statement (``usage.with_rows``): stored together, or neither (then they wait for ``write_pending``)."""
+    stmt = update(RawMessage).where(RawMessage.id == raw.id).values({column: value})
+    async with usage.kept_rows(enabled=with_usage) as rows, ctx.autocommit() as session:
+        await session.execute(usage.with_rows(stmt, rows))
         await session.commit()
     set_committed_value(raw, column, value)  # as stored: attaching the raw later writes nothing (``_attach``)
 
@@ -1500,7 +1569,9 @@ async def _keep_unheard(ctx: AppContext, raw: RawMessage, garbage: GarbageTransc
         if fresh is not None:
             fresh.transcript = garbage.text
             fresh.raw_json = {**(fresh.raw_json or {}), UNHEARD_KEY: marker}
-            await session.commit()
+            async with usage.kept_rows() as rows:  # the rejected (paid) tries, stored with what they made
+                await usage.insert_rows(session, rows)
+                await session.commit()
     set_committed_value(raw, "transcript", garbage.text)
     set_committed_value(raw, "raw_json", {**(raw.raw_json or {}), UNHEARD_KEY: marker})
     reasons = ", ".join(t.get("reason") or t.get("error") or "?" for t in garbage.tries)
@@ -1508,8 +1579,8 @@ async def _keep_unheard(ctx: AppContext, raw: RawMessage, garbage: GarbageTransc
 
 
 def _is_unheard(raw: RawMessage) -> bool:
-    """The voice note's transcript was rejected as not speech (``UNHEARD_KEY``)."""
-    return isinstance((raw.raw_json or {}).get(UNHEARD_KEY), dict)
+    """The part's transcript was rejected as not speech (``UNHEARD_KEY`` with its tries)."""
+    return rejected_transcript(raw)
 
 
 def _job_of(raws: Sequence[RawMessage]) -> dict[str, Any]:
@@ -1520,9 +1591,19 @@ def _job_of(raws: Sequence[RawMessage]) -> dict[str, Any]:
     return {"kind": "message", "payload": {"raw_id": primary.id}}
 
 
-async def _unheard(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, job: dict[str, Any]) -> None:
+async def _unheard(
+    ctx: AppContext,
+    raws: list[RawMessage],
+    prefs: Prefs,
+    job: dict[str, Any],
+    *,
+    item_id: int | None = None,
+    occurrence_id: int | None = None,
+) -> None:
     """No items: the raws are done, the first one keeps ``job`` (what [🔁 Ещё раз] queues again), the owner gets
-    "🎤 Не разобрал голосовое — повтори или напиши текстом" with [🔁 Ещё раз] and 🤔."""
+    "🎤 Не разобрал голосовое — повтори или напиши текстом" with [🔁 Ещё раз] and 🤔. ``item_id`` / ``occurrence_id``
+    (a voice reply to a card or reminder): the message is about that item, so an answer to it — what it asks for,
+    by text or by voice — is the edit again, not a new message."""
     primary = raws[0]
     async with ctx.sessionmaker() as session:
         fresh = await _reload(session, raws)
@@ -1543,6 +1624,8 @@ async def _unheard(ctx: AppContext, raws: list[RawMessage], prefs: Prefs, job: d
             prefs=prefs,
             reply_to=primary.message_id,
             purpose=sender.PURPOSE_UNHEARD,
+            item_id=item_id,
+            occurrence_id=occurrence_id,
             raw_message_id=primary.id,
         )
     await _react(ctx, raws, sender.REACT_ASK)
@@ -1555,10 +1638,11 @@ RETRY_MISSING: Final = "missing"
 
 
 async def retry_unheard(session: AsyncSession, raw_id: int) -> str:
-    """[🔁 Ещё раз] under "🎤 Не разобрал…": the same voice note is transcribed again. The message (an album: all of
-    its parts) forgets its transcripts and the rejection and goes back to ``new``, and the job that processed it
-    (``UNHEARD_KEY`` "job") is queued again. ``RETRY_QUEUED``; ``RETRY_ALREADY`` when it was retried already (a
-    second press: the raw row is locked, so it waits for the first one and then finds nothing to retry);
+    """[🔁 Ещё раз] under "🎤 Не разобрал…": the same voice note is transcribed again. The message (an album, from
+    before audio files were processed on what they had: all of its parts) forgets the rejection and the rejected
+    transcripts — only those: a usable one is not paid for again — and goes back to ``new``, and the job that
+    processed it (``UNHEARD_KEY`` "job") is queued again. ``RETRY_QUEUED``; ``RETRY_ALREADY`` when it was retried
+    already (a second press: the raw row is locked, so it waits for the first one and then finds nothing to retry);
     ``RETRY_MISSING`` without the message. Does not commit."""
     raw = await session.get(RawMessage, raw_id, with_for_update=True, populate_existing=True)
     if raw is None:
@@ -1574,11 +1658,11 @@ async def retry_unheard(session: AsyncSession, raw_id: int) -> str:
         )
         raws += list((await session.scalars(stmt.with_for_update())).all())
     for part in raws:
+        if part.content_type in VOICE_TYPES and rejected_transcript(part):
+            part.transcript = None
         data = dict(part.raw_json or {})
         data.pop(UNHEARD_KEY, None)
         part.raw_json = data
-        if part.content_type in VOICE_TYPES:
-            part.transcript = None
         part.status = "new"
         part.processed_at = None
     # No dedupe key: the lock and the removed marker keep a double press from queueing it twice, and a voice note
@@ -2118,14 +2202,16 @@ def _clarified_key(raw_id: int) -> str:
 
 
 def _said(raws: Sequence[RawMessage]) -> str:
-    """What the owner said in a message: its texts and voice transcripts."""
-    return _join(*(part for raw in raws for part in (raw.text, raw.transcript)))
+    """What the owner said in a message: its texts and voice transcripts (not one rejected as not speech)."""
+    return _join(*(part for raw in raws for part in (raw.text, None if _is_unheard(raw) else raw.transcript)))
 
 
 def _heard(raws: Sequence[RawMessage]) -> str | None:
     """What the bot heard in the voice notes / audio files among ``raws`` (their transcripts, in order) — the
     "🎤 «…»" line of every reply to them (docs/features/iteration-3.md §6); None without any."""
-    texts = [r.transcript.strip() for r in raws if r.content_type in VOICE_TYPES and r.transcript]
+    texts = [
+        r.transcript.strip() for r in raws if r.content_type in VOICE_TYPES and r.transcript and not _is_unheard(r)
+    ]
     return " ".join(t for t in texts if t) or None
 
 

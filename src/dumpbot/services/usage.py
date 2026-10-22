@@ -10,7 +10,11 @@ round trip before it counts):
   writes them in one statement (the processor before its final reaction, the job worker after the job in any case);
 - ``job_spend`` reads the month's spend from the database once per job (``prefetch_spend`` can start that early) and
   adds what the job's own calls cost since: the budget check before the paid STT call and the one before
-  ``extract()`` cost one round trip together, not one each.
+  ``extract()`` cost one round trip together, not one each;
+- a call whose result is stored before the reply (a transcript, a checklist) has its rows stored with it
+  (``kept_rows`` + ``with_rows`` in the same statement, or ``insert_rows`` in the same transaction): a process
+  killed before the reply (the watchdog's exit, Render out of memory) loses nothing that was paid for — the re-run
+  reuses the stored result and would never record the call again.
 """
 
 from __future__ import annotations
@@ -18,15 +22,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import Update, func, insert, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from dumpbot import clock
@@ -39,12 +43,15 @@ __all__ = [
     "JobUsage",
     "budget_state",
     "deferred",
+    "insert_rows",
     "job_budget",
+    "kept_rows",
     "month_spend",
     "month_start",
     "next_month_start",
     "prefetch_spend",
     "record_usage",
+    "with_rows",
     "write_pending",
 ]
 
@@ -105,6 +112,38 @@ async def write_pending(sessionmaker: async_sessionmaker[AsyncSession], job: Job
             await session.commit()
     except Exception as e:
         log.warning("could not record AI usage (%d row(s)): %s: %s", len(batch), type(e).__name__, e)
+
+
+@asynccontextmanager
+async def kept_rows(*, enabled: bool = True) -> AsyncIterator[list[dict[str, Any]]]:
+    """The rows ``record_usage`` kept so far in this job, taken out to be stored with what the block writes
+    (``with_rows`` / ``insert_rows``); when the block fails they go back, for ``write_pending``. Empty outside a job
+    (or without ``enabled``)."""
+    job = _job.get()
+    rows: list[dict[str, Any]] = []
+    if enabled and job is not None:
+        rows = list(job.rows)
+        job.rows.clear()
+    try:
+        yield rows
+    except BaseException:
+        if job is not None and rows:
+            job.rows[:0] = rows
+        raise
+
+
+def with_rows(stmt: Update, rows: list[dict[str, Any]]) -> Update:
+    """``stmt`` that also inserts ``rows`` into ai_usage (a data-modifying WITH: one statement, one round trip, and
+    both or neither stored)."""
+    if not rows:
+        return stmt
+    return stmt.add_cte(insert(AiUsage.__table__).values(rows).cte("ai_usage_rows"))
+
+
+async def insert_rows(session: AsyncSession, rows: list[dict[str, Any]]) -> None:
+    """``rows`` into ai_usage within ``session``'s transaction (no commit)."""
+    if rows:
+        await session.execute(insert(AiUsage.__table__), rows)
 
 
 def prefetch_spend(sessionmaker: async_sessionmaker[AsyncSession], prefs: Prefs, now: datetime) -> None:

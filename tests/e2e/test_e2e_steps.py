@@ -181,6 +181,7 @@ async def test_split_button_turns_the_card_into_a_checklist(e2e: Any) -> None:
         "due_local": "2026-10-06 19:00"
     }
     assert request.line("NOTE ") is None
+    await e2e.idle()  # the job's own bookkeeping comes after the redraw (the split row itself is stored with the steps)
     async with e2e.ctx.sessionmaker() as s:
         purposes = (await s.scalars(select(AiUsage.purpose).order_by(AiUsage.id))).all()
     assert list(purposes) == ["extract", "split"]

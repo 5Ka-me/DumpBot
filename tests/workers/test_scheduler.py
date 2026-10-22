@@ -492,3 +492,23 @@ async def test_explicit_time_reminder_is_sent_in_quiet_hours(ctx, no_digests, ma
     await make_items({"kind": "event", "title": "Поезд", "when": {"time": "23:30"}}, now=t0)
     await Scheduler(ctx).tick(local(2026, 10, 6, 23, 31))  # the 23:30 reminder, a minute late
     assert len(bot.sent) == 1
+
+
+async def test_a_cancel_a_database_error_swallowed_still_stops_the_scheduler(ctx, monkeypatch) -> None:
+    """A cancel that lands mid-query may come out as the database layer's own error (logged by the tick's
+    ``except Exception``): the loop still stops instead of holding the shutdown."""
+    from sqlalchemy.exc import ResourceClosedError
+
+    scheduler = Scheduler(ctx)
+
+    async def tick(now) -> None:
+        asyncio.current_task().cancel()  # type: ignore[union-attr]
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            raise ResourceClosedError("This result object is closed.") from None
+
+    monkeypatch.setattr(scheduler, "tick", tick)
+    running = asyncio.create_task(scheduler.run())
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(running, 2)

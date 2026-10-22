@@ -128,6 +128,8 @@ _EVENTS_KEY: Final = "dumpbot.parent_events"  # Session.info key of ParentEvents
 WARN_CHECKLIST_RRULE: Final = "задача с шагами не повторяется: отметки шагов были бы общими для всех раз"
 WARN_STEP_RRULE: Final = "шаг чек-листа не повторяется"
 _FUZZY: Final = ("period", "soon")  # precisions of a span's occurrence: due at its reminder (2), not a named day
+# Precisions of an occurrence the item has without a date of its own (the bot's 19:00 for a task without a time).
+_UNDATED: Final = frozenset({"default", "none", "someday"})
 # Precisions a snoozed occurrence keeps; any other (a time the bot chose, a span) becomes the exact new time.
 _SNOOZE_KEEPS: Final = frozenset({"exact", "slot", "relative", "date", "fallback"})
 # A stated time at the end of a title: "(15:00)", "(пт 9 окт 15:00)", "(пт 9 окт)", "(9 окт 2027 15:00)".
@@ -999,28 +1001,35 @@ async def stop_recurrence(
     """rec_active=False, and every open instance still ahead (due after ``now``: the next one, made in advance, and
     any other) is cancelled with its pending reminders — none of them comes any more (docs/features/iteration-4.md
     §2). An instance already due stays open (it is on today's list), unless ``close``: then it is done — the
-    instance ``occurrence_id`` (the reminder ⏹ was pressed on, even if it was snoozed ahead), else the earliest open
-    one already due. With nothing open left the item is done (a stopped series has nothing more to do).
+    instance ``occurrence_id`` (the reminder ⏹ was pressed on or the stop phrase replied to, even if it was snoozed
+    ahead), else the latest open one already due — and the other instances already due that nobody ticked (this
+    morning's of "в 9:00 и 18:00") are missed. With nothing open left the item is done (a stopped series has nothing
+    more to do).
+
+    The item's row is locked first: the scheduler making the next instance (``ensure_recurring``) skips the series
+    while the stop is under way and then sees it stopped, or the stop waits for that instance and cancels it.
 
     ``now``, ``close``, ``occurrence_id`` and ``prefs`` are optional extensions of the contract (default: the current
     time, nothing closed, the owner's prefs).
     """
     now = _utc(now) if now is not None else clock.utcnow()
-    item = await _get_item(session, item_id)
+    item = await lock_item(session, item_id)
     item.rec_active = False
     closed: Occurrence | None = None
-    if close:
-        if occurrence_id is not None:
-            closed = await session.get(Occurrence, occurrence_id)
-            if closed is not None and (closed.item_id != item.id or closed.status != "open"):
-                closed = None
-        else:
-            first = await _first_open(session, item.id)
-            closed = first if first is not None and first.due_at <= now else None
-    for occ in await _open_occurrences(session, item.id, after=now):
-        if closed is None or occ.id != closed.id:
+    if close and occurrence_id is not None:  # that one, if it is still open (after ✅: none, the others are missed)
+        closed = await _given_open(session, item.id, occurrence_id)
+    elif close:
+        closed = await _latest_due_open(session, item.id, now)
+    for occ in await _open_all(session, item.id):
+        if closed is not None and occ.id == closed.id:
+            continue
+        if occ.due_at > now:
             occ.status = "cancelled"
-            await _cancel_pending(session, [occ.id])
+        elif close:  # due already and never ticked: it was missed, the series is over
+            occ.status = "missed"
+        else:
+            continue
+        await _cancel_pending(session, [occ.id])
     if closed is not None:
         prefs = prefs if prefs is not None else await _owner_prefs(session)
         await mark_done(session, closed.id, now, prefs)
@@ -1064,7 +1073,13 @@ async def clear_time(session: AsyncSession, item_id: int) -> Item:
 
 
 async def apply_patch(
-    session: AsyncSession, item_id: int, patch: EditPatch, prefs: Prefs, now: datetime
+    session: AsyncSession,
+    item_id: int,
+    patch: EditPatch,
+    prefs: Prefs,
+    now: datetime,
+    *,
+    occurrence_id: int | None = None,
 ) -> PatchResult:
     """Apply an EditPatch. Order: delete (exclusive) -> title/kind/tags -> done/undone -> rrule -> when -> lead
     -> no_reminder / stop_recurrence ("сделал, теперь каждую неделю" closes this instance, then starts the rule).
@@ -1079,6 +1094,11 @@ async def apply_patch(
     (time of day from the new/current time). An item that becomes actionable without any time gets the default
     reminder; one that stops being actionable (task -> idea) loses it: the open ``default`` occurrences (the 19:00 a
     task without a time got) are cancelled with their reminders, times the owner set (exact, slot, date…) stay.
+
+    ``occurrence_id``: the instance the edit is about (a reply to its reminder): done, a stop and a new time go to it
+    — the 18:00 of "в 9:00 и 18:00" when this morning's was never ticked; without it done / a stop close the latest
+    instance already due, a new time moves the earliest open one. ``PatchResult.moved``: the edit put the item on
+    another day than the dated one it was on (the stale-items check counts those, docs/features/iteration-4.md §4).
     """
     now = _utc(now)
     item = await _get_item(session, item_id)
@@ -1092,15 +1112,21 @@ async def apply_patch(
     _apply_fields(item, patch)
 
     if patch.action == "done" or (patch.action == "stop_recurrence" and not (item.rec_active and item.rrule)):
-        await _patch_done(session, item, prefs, now)
+        await _patch_done(session, item, prefs, now, occurrence_id=occurrence_id)
     elif patch.action == "undone":
         await _patch_undone(session, item, prefs, now)
 
     scheduled = False
-    if patch.rrule and patch.action != "stop_recurrence":
-        scheduled = await _set_rrule(session, item, patch, prefs, now, warnings)
+    new_rule = bool(patch.rrule) and patch.action != "stop_recurrence"
+    first = await _edited_open(session, item.id, occurrence_id) if new_rule or patch.when is not None else None
+    was = first.due_at if first is not None and first.precision not in _UNDATED else None
+    placed: list[Occurrence] = []
+    if new_rule:
+        scheduled = await _set_rrule(session, item, patch, prefs, now, warnings, first=first, placed=placed)
     if not scheduled and patch.when is not None:
-        scheduled = await _reschedule(session, item, patch.when, patch.lead, prefs, now, warnings)
+        scheduled = await _reschedule(
+            session, item, patch.when, patch.lead, prefs, now, warnings, first=first, placed=placed
+        )
     if not scheduled and patch.lead:
         await _shift_by_lead(session, item, patch.lead, prefs, now)
     if not scheduled and not was_actionable and item.kind in ACTIONABLE:
@@ -1111,10 +1137,20 @@ async def apply_patch(
     if patch.action == "no_reminder":
         await remove_reminders(session, item.id, prefs=prefs, now=now)
     elif patch.action == "stop_recurrence" and item.rec_active:
-        await stop_recurrence(session, item.id, now, close=True, prefs=prefs)
+        await stop_recurrence(session, item.id, now, close=True, occurrence_id=occurrence_id, prefs=prefs)
 
     _touch(item)
-    return await _patch_result(session, item, warnings)
+    result = await _patch_result(session, item, warnings)
+    result.moved = bool(placed) and _another_day(was, placed[-1], prefs)
+    return result
+
+
+def _another_day(was: datetime | None, occ: Occurrence, prefs: Prefs) -> bool:
+    """The occurrence an edit placed is open on another local day than ``was`` (None: the item had no date)."""
+    if was is None or occ.status != "open":
+        return False
+    tz = prefs.zone
+    return occ.due_at.astimezone(tz).date() != was.astimezone(tz).date()
 
 
 def _apply_fields(item: Item, patch: EditPatch) -> None:
@@ -1127,9 +1163,15 @@ def _apply_fields(item: Item, patch: EditPatch) -> None:
         item.tags = [t for t in _clean_tags([*(item.tags or []), *patch.tags_add]) if t not in drop]
 
 
-async def _patch_done(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> None:
+async def _patch_done(
+    session: AsyncSession, item: Item, prefs: Prefs, now: datetime, *, occurrence_id: int | None = None
+) -> None:
+    """Done: the instance ``occurrence_id`` when it is open, else the latest one already due (the 18:00 reminder
+    answered «готово», with this morning's never ticked), else the earliest open one; an item without one is done
+    itself."""
     await _lock_parent(session, item)  # a step: decided on fresh rows
-    occ = await _first_open(session, item.id)
+    occ = await _given_open(session, item.id, occurrence_id) if occurrence_id is not None else None
+    occ = occ or await _latest_due_open(session, item.id, now) or await _first_open(session, item.id)
     if occ is not None:
         await mark_done(session, occ.id, now, prefs)
     elif item.status == "open" and not item.rec_active:
@@ -1171,8 +1213,12 @@ async def _reschedule(
     prefs: Prefs,
     now: datetime,
     warnings: list[str],
+    *,
+    first: Occurrence | None = None,
+    placed: list[Occurrence] | None = None,
 ) -> bool:
-    """Move the current open occurrence (or create one) to ``when``. False if ``when`` gives no time.
+    """Move the current open occurrence (``first``: the one the edit is about; else the earliest open one) — or
+    create one — to ``when``; the occurrence it ends up in goes to ``placed``. False if ``when`` gives no time.
 
     "Когда-нибудь" drops the dates instead (``_make_someday``); a fuzzy span ("на следующей неделе") is kept on
     the item, any other time clears it. An instance of a series moved to a span becomes a plain date. The new time is
@@ -1181,7 +1227,7 @@ async def _reschedule(
     old one goes ("Встреча (15:00)" moved to 17:00 is "Встреча"). A series given a new lead re-places its other
     instances still ahead too (``_relead``).
     """
-    first = await _first_open(session, item.id)
+    first = first or await _first_open(session, item.id)
     old_stated = _stated_at(item, first, prefs) if first is not None else None
     when = _keep_future_date(when, first, prefs, now)
     stated, precision, when_warnings, confirm = timeresolve.resolve_when(when, now, prefs)
@@ -1213,6 +1259,8 @@ async def _reschedule(
         _retitle(item, old_stated, stated, due, precision, prefs)
     item.needs_confirm = confirm
     occ = await _move(session, item, first, due, precision)
+    if placed is not None:
+        placed.append(occ)
     await _reopen_for_time(session, item, prefs, now)
     await _replan(session, item, occ, prefs, now, role=when.role, catch_up=bool(series and leads))
     return True
@@ -1296,9 +1344,18 @@ async def _relead(
 
 
 async def _set_rrule(
-    session: AsyncSession, item: Item, patch: EditPatch, prefs: Prefs, now: datetime, warnings: list[str]
+    session: AsyncSession,
+    item: Item,
+    patch: EditPatch,
+    prefs: Prefs,
+    now: datetime,
+    warnings: list[str],
+    *,
+    first: Occurrence | None = None,
+    placed: list[Occurrence] | None = None,
 ) -> bool:
-    """Enable or replace the recurrence and move the first open occurrence to the rule's next date.
+    """Enable or replace the recurrence and move the first open occurrence (``first``: the one the edit is about)
+    to the rule's next date (it goes to ``placed``).
 
     Returns False (with a warning) when the rule is invalid or never occurs again, and for a checklist: a parent's
     ticks would be shared by every instance, a repeating step would never let its parent close.
@@ -1312,7 +1369,7 @@ async def _set_rrule(
         warnings.append(timeresolve.WARN_BAD_RRULE)
         return False
     tz = prefs.zone
-    first = await _first_open(session, item.id)
+    first = first or await _first_open(session, item.id)
     # A cancelled occurrence is no time of the item any more ("когда-нибудь", a task turned into an idea).
     reference = first or await _latest_kept(session, item.id)
     # The series repeats the time the owner stated: the reference occurrence's due plus its lead.
@@ -1331,6 +1388,11 @@ async def _set_rrule(
         if patch.when is not None and not (patch.when.day or patch.when.at or patch.when.period):
             day = min(day, now.astimezone(tz).date())  # a time only: today counts while one of its times is ahead
         dtstart = datetime.combine(day, times[0])
+        if ";COUNT=" in f";{rule}":
+            # COUNT is counted from DTSTART: a time of that day already past must not use one up ("каждый день в 9 и
+            # 18, 4 раза" said at noon: 18:00 today, then two days), as ``timeresolve`` starts a new item's series.
+            ahead = [t for t in times if timeresolve.localize(day, t, tz) >= now]
+            dtstart = datetime.combine(day, ahead[0]) if ahead else datetime.combine(day + timedelta(days=1), times[0])
     after, inclusive = now, True
     if first is None and reference is not None and reference.status == "done" and reference.due_at >= now:
         # Nothing open, just marked done ahead of time: the series continues after that instance.
@@ -1361,6 +1423,8 @@ async def _set_rrule(
         return False
 
     occ = await _move(session, item, first, due, _rec_precision(item))
+    if placed is not None:
+        placed.append(occ)
     # Instances generated by the old rule are dropped; overdue ones are left to be marked missed.
     for other in await _open_occurrences(session, item.id, after=now):
         if other.id != occ.id:
@@ -1487,7 +1551,7 @@ async def ensure_recurring(session: AsyncSession, prefs: Prefs, now: datetime) -
     )
     created = 0
     for item in (await session.scalars(stmt)).all():
-        if await _create_next(session, item, prefs, now) is not None:
+        if await _create_next(session, item, prefs, now, guard=True) is not None:
             created += 1
     await _mark_superseded(session, now)
     return created
@@ -1500,10 +1564,29 @@ async def _ensure_next(session: AsyncSession, item: Item, prefs: Prefs, now: dat
     return await _create_next(session, item, prefs, now)
 
 
-async def _create_next(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Occurrence | None:
+async def _create_next(
+    session: AsyncSession, item: Item, prefs: Prefs, now: datetime, *, guard: bool = False
+) -> Occurrence | None:
     """Next occurrence whose stated time is after both the latest existing one's (its due plus the lead shift) and
     ``now``; an exhausted or broken rule deactivates the series. One whose lead moment has passed notifies at its
-    stated time."""
+    stated time.
+
+    ``guard`` (``ensure_recurring``, which picked the series without a lock): the item's row is read again under
+    ``FOR KEY SHARE SKIP LOCKED`` first. A stop (``stop_recurrence`` locks the row ``FOR UPDATE``) under way skips the
+    series this time, one committed meanwhile is seen, and one that comes after has to wait for this transaction —
+    and then cancels the new instance: no instance of a stopped series is left with a reminder still to come. The
+    key-share lock does not block the plain updates of the row (a ✅ touching ``updated_at``)."""
+    if guard:
+        stmt = (
+            select(Item)
+            .where(Item.id == item.id)
+            .with_for_update(key_share=True, skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        locked = await session.scalar(stmt)
+        if locked is None or not locked.rec_active or locked.status == "deleted" or not locked.rrule:
+            return None
+        item = locked
     max_due = await session.scalar(select(func.max(Occurrence.due_at)).where(Occurrence.item_id == item.id))
     tz = _rec_zone(item, prefs)
     dtstart = item.rec_dtstart_local or datetime.combine(
@@ -1557,6 +1640,13 @@ async def _mark_superseded(session: AsyncSession, now: datetime) -> None:
         occ.status = "missed"
     if stale:
         await _cancel_pending(session, [occ.id for occ in stale])
+        # A stopped series whose last open instance was missed now has nothing more to do: done, like a stop that
+        # left nothing open (it would sit in /tasks and the weekly review otherwise).
+        stopped = select(Item).where(
+            Item.id.in_({occ.item_id for occ in stale}), Item.rec_active.is_(False), Item.status == "open"
+        )
+        for item in (await session.scalars(stopped)).all():
+            await _close_if_finished(session, item, now)
 
 
 def _rec_zone(item: Item, prefs: Prefs) -> ZoneInfo:
@@ -1732,6 +1822,30 @@ async def _first_open(session: AsyncSession, item_id: int) -> Occurrence | None:
         .limit(1)
     )
     return await session.scalar(stmt)
+
+
+async def _latest_due_open(session: AsyncSession, item_id: int, now: datetime) -> Occurrence | None:
+    """The latest open occurrence already due (this evening's of "в 9:00 и 18:00", not this morning's)."""
+    stmt = (
+        select(Occurrence)
+        .where(Occurrence.item_id == item_id, Occurrence.status == "open", Occurrence.due_at <= now)
+        .order_by(Occurrence.due_at.desc(), Occurrence.id.desc())
+        .limit(1)
+    )
+    return await session.scalar(stmt)
+
+
+async def _given_open(session: AsyncSession, item_id: int, occurrence_id: int | None) -> Occurrence | None:
+    """Occurrence ``occurrence_id`` when it is an open one of the item (else None: an old or foreign id)."""
+    if occurrence_id is None:
+        return None
+    occ = await session.get(Occurrence, occurrence_id)
+    return occ if occ is not None and occ.item_id == item_id and occ.status == "open" else None
+
+
+async def _edited_open(session: AsyncSession, item_id: int, occurrence_id: int | None) -> Occurrence | None:
+    """The open occurrence an edit is about: ``occurrence_id`` (a reply to its reminder), else the earliest open."""
+    return await _given_open(session, item_id, occurrence_id) or await _first_open(session, item_id)
 
 
 async def _latest_kept(session: AsyncSession, item_id: int) -> Occurrence | None:

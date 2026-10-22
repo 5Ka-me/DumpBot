@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
@@ -198,6 +199,43 @@ async def test_react_is_best_effort(make_ctx, fake_bot, bad_request, retry_after
     fake_bot.fail("set_message_reaction", exc[error])
     await sender.react(make_ctx(None), 9, "🫡")
     assert any("reaction on message 9 failed" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_reaction_still_on_its_way_goes_first(make_ctx, fake_bot, monkeypatch):
+    """The capture router's 👀 is sent while the job starts (``react_soon``): a job quicker than Telegram's answer to
+    the 👀 must not have its 👌 replaced by it (Telegram keeps the reaction set last)."""
+    ctx = make_ctx()
+    order: list[str] = []
+
+    async def slow_seen(**kwargs):
+        emoji = kwargs["reaction"][0].emoji
+        if emoji == sender.REACT_SEEN:
+            await asyncio.sleep(0.3)
+        order.append(emoji)
+        return True
+
+    monkeypatch.setattr(fake_bot, "set_message_reaction", slow_seen)
+    seen = sender.react_soon(ctx, 7, sender.REACT_SEEN)
+    await sender.react(ctx, 7, sender.REACT_SAVED)
+    await seen
+    assert order == ["👀", "👌"]
+    assert ctx.reacting == {}  # forgotten once done
+
+
+async def test_reactions_of_other_messages_do_not_wait(make_ctx, fake_bot, monkeypatch):
+    ctx = make_ctx()
+    blocked = asyncio.Event()
+
+    async def stuck(**kwargs):
+        if kwargs["message_id"] == 7:
+            await blocked.wait()
+        return True
+
+    monkeypatch.setattr(fake_bot, "set_message_reaction", stuck)
+    seen = sender.react_soon(ctx, 7, sender.REACT_SEEN)
+    await asyncio.wait_for(sender.react(ctx, 8, sender.REACT_SAVED), 1)
+    blocked.set()
+    await seen
 
 
 def test_reaction_constants_are_allowed_emoji():

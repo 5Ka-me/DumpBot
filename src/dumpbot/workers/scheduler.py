@@ -25,7 +25,10 @@
    done (``digest.has_summary``; overdue items alone show up in the morning digest anyway): ``digest.folded_key``
    marks its day, and that morning digest shows the day's summary as "Вчерашний итог (не успел прислать)";
 4a. the weekly review (docs/features/iteration-4.md §6): on Sundays at ``digest_weekly_time``, like a digest —
-   the same target out of quiet hours and window, once-key ``digest:weekly:{YYYY-MM-DD}``, an empty one not sent;
+   the same target out of quiet hours and window, once-key ``digest:weekly:{YYYY-MM-DD}``, an empty one not sent —
+   but one the bot was down for (no tick between the one before its time and now) still goes out late, on the first
+   tick out of quiet hours within ``WEEKLY_LATE`` (a day) of its time: there is no next review to fold it into, as an
+   evening digest has the morning one;
 4b. the stale question (§4): at most one a day (once-key ``stale:{YYYY-MM-DD}``), never in quiet hours nor before
    that day's morning digest is due: "«Сделать карту» висит 15 дней. Что делаем?" about the first of
    ``services.stale.candidates``. The morning digest picks it first and shows it even mid-span; the question follows
@@ -71,7 +74,7 @@ from dumpbot.db.models import Item, Occurrence, OnceKey, Reminder
 from dumpbot.domain import quiet, timeresolve
 from dumpbot.domain.prefs import Prefs
 from dumpbot.services import app_state, digest, events, items, stale
-from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, try_once
+from dumpbot.workers.jobs import describe_error, forget_once, safe_traceback, stop_if_cancelled, try_once
 
 __all__ = [
     "CLAIM_LIMIT",
@@ -84,6 +87,7 @@ __all__ = [
     "STALE_CHECK_EVERY",
     "STALL_AFTER",
     "STUCK_AFTER",
+    "WEEKLY_LATE",
     "Downtime",
     "Scheduler",
 ]
@@ -95,6 +99,7 @@ STUCK_AFTER: Final = timedelta(minutes=2)
 CLAIM_LIMIT: Final = 20
 MAX_SEND_ATTEMPTS: Final = 5
 DIGEST_WINDOW: Final = timedelta(hours=3)
+WEEKLY_LATE: Final = timedelta(hours=24)  # a weekly review not sent at its time still goes out this long after it
 DIGEST_KINDS: Final = ("morning", "evening")
 WEEKLY: Final = "weekly"
 SUNDAY: Final = 6
@@ -163,6 +168,10 @@ class Scheduler:
         # a candidate again after finding none.
         self._stale_pick: tuple[date, stale.Stale] | None = None
         self._stale_next: datetime | None = None
+        # The weekly review: the Sunday whose review is out (or known to be: no more looks), and the one the bot was
+        # down for at its time, still owed (it goes out late).
+        self._weekly_done: date | None = None
+        self._weekly_owed: date | None = None
 
     @property
     def stall_limit_s(self) -> float:
@@ -173,6 +182,7 @@ class Scheduler:
         log.info("scheduler started")
         self._ctx.watchdog.watch(WATCH_NAME, self.stall_limit_s)
         while True:
+            stop_if_cancelled()  # a cancel that a database error swallowed mid-tick still stops the loop
             self._alive()
             self._ctx.scheduler_wakeup.clear()  # before the tick: a wakeup during it is not lost
             try:
@@ -183,6 +193,7 @@ class Scheduler:
                 await asyncio.sleep(0)
                 continue
             delay = await self._sleep_for(clock.utcnow())
+            stop_if_cancelled()
             try:
                 await asyncio.wait_for(self._ctx.scheduler_wakeup.wait(), delay)
             except TimeoutError:
@@ -198,7 +209,7 @@ class Scheduler:
             await self._step("reminders", self._send_due(now, prefs))
             await self._step("recurring", self._ensure_recurring(now, prefs))
             await self._step("digests", self._digests(now, prefs, since))
-            await self._step("weekly", self._weekly(now, prefs))
+            await self._step("weekly", self._weekly(now, prefs, since))
             await self._step("stale", self._ask_stale(now, prefs))
             await self._step("downtime", self._report_downtime(now, prefs))
             await self._progress()
@@ -414,7 +425,7 @@ class Scheduler:
         entry = events.Entry(
             events.REMINDER_SENT, source=events.SRC_REMINDER, item_id=item_id, occurrence_id=occ_id, data=info
         )
-        await events.record(self._ctx.sessionmaker, entry)
+        await events.record(self._ctx.autocommit, entry)
         return True
 
     async def _send_failed(self, reminder_id: int, error: Exception) -> bool:
@@ -502,24 +513,32 @@ class Scheduler:
         log.info("%s digest for %s sent", kind, day)
         if ask is not None:
             self._stale_pick = (_local_day(now, prefs), ask)
-        await events.record(self._ctx.sessionmaker, *digest_entries(kind, data, now))
+        await events.record(self._ctx.autocommit, *digest_entries(kind, data, now))
 
-    async def _weekly(self, now: datetime, prefs: Prefs) -> None:
+    async def _weekly(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
         """The weekly review on Sundays at ``digest_weekly_time``: target out of quiet hours, sent within
-        ``DIGEST_WINDOW`` (late after a downtime too), never inside quiet hours, once (``digest:weekly:{day}``)."""
+        ``DIGEST_WINDOW``, never inside quiet hours, once (``digest:weekly:{day}``). One the bot was down for (no
+        tick between ``since`` — the tick before, or the start of the downtime — and its target) is owed: it goes out
+        late, on the first tick out of quiet hours within ``WEEKLY_LATE`` of the target (the evening digest has the
+        next morning one to fold into; the review has nothing)."""
         if not prefs.digest_weekly_enabled:
             return
         tz = prefs.zone
         today = _local_day(now, prefs)
         for day in (today, today - timedelta(days=1)):  # a time inside quiet hours may be shifted past midnight
-            if day.weekday() != SUNDAY:
+            if day.weekday() != SUNDAY or day == self._weekly_done:
                 continue
             nominal = timeresolve.localize(day, prefs.digest_weekly_time, tz).astimezone(UTC)
             target = quiet.shift_out_of_quiet(nominal, prefs)
-            if target <= now < target + DIGEST_WINDOW:
-                if not quiet.in_quiet_hours(now, prefs):
-                    await self._send_weekly(day.isoformat(), nominal, now, prefs)
-                break
+            if not target <= now < target + WEEKLY_LATE:
+                continue
+            if since is not None and since < target:  # no tick at its time: the bot was down (or this tick is it)
+                self._weekly_owed = day
+            due = now < target + DIGEST_WINDOW or self._weekly_owed == day
+            if due and not quiet.in_quiet_hours(now, prefs):
+                await self._send_weekly(day.isoformat(), nominal, now, prefs)
+                self._weekly_done = day  # sent, empty, or sent before: its key is taken
+            break
 
     async def _send_weekly(self, day: str, nominal: datetime, now: datetime, prefs: Prefs) -> None:
         key = f"digest:{WEEKLY}:{day}"
@@ -540,7 +559,7 @@ class Scheduler:
                 await session.commit()
                 raise
         log.info("weekly review for %s sent", day)
-        await events.record(self._ctx.sessionmaker, *weekly_entries(data))
+        await events.record(self._ctx.autocommit, *weekly_entries(data))
 
     def _stale_due(self, now: datetime, prefs: Prefs) -> bool:
         """The stale question may go out now: not in quiet hours, today's morning digest due already."""
@@ -553,7 +572,7 @@ class Scheduler:
         """The item today's stale question will ask about, when one is due now and none was asked today."""
         if not self._stale_due(now, prefs) or await session.get(OnceKey, stale_key(_local_day(now, prefs))):
             return None
-        return await stale.pick(session)
+        return await stale.pick(session, prefs, now=now)
 
     async def _ask_stale(self, now: datetime, prefs: Prefs) -> None:
         """At most one "«…» висит N дней. Что делаем?" a day (``stale_key``), never in quiet hours nor before the
@@ -569,7 +588,7 @@ class Scheduler:
         async with self._ctx.sessionmaker() as session:
             if await session.get(OnceKey, key) is not None:
                 return
-            found = picked or await stale.pick(session)
+            found = picked or await stale.pick(session, prefs, now=now)
             self._stale_pick = None
             item = await items.get_item(session, found.item_id) if found is not None else None
             if found is None or item is None or item.status != "open":
@@ -604,7 +623,7 @@ class Scheduler:
             item_id=found.item_id,
             data={"digests": found.digests, "moves": found.moves},
         )
-        await events.record(self._ctx.sessionmaker, entry)
+        await events.record(self._ctx.autocommit, entry)
 
     async def _fold_missed_evening(self, now: datetime, prefs: Prefs, since: datetime | None) -> None:
         """An evening digest the bot was down for (no tick between ``since`` and its target) that can no longer go

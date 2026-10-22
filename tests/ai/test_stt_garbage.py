@@ -175,6 +175,37 @@ async def test_without_ffmpeg_and_russian_already_there_is_nothing_else_to_try(n
     assert len(chutes.calls) == 1 and len(exc.value.tries) == 1
 
 
+async def test_a_backend_that_sends_wav_anyway_is_not_asked_the_same_again(wav) -> None:
+    """chutes with STT_CONVERT_WAV converts every audio itself: "as WAV in Russian" with Russian asked for already
+    is the very same (paid) request."""
+    chutes = Backend("chutes", NOISE, SPEECH)
+    chutes.sends_wav = True  # type: ignore[attr-defined]
+    with pytest.raises(GarbageTranscript) as exc:
+        await RoutedSTT(chutes).transcribe(AUDIO, mime_type="audio/ogg", language="ru", screen=True)
+    assert len(chutes.calls) == 1 and len(exc.value.tries) == 1
+    assert wav == []
+
+    chutes = Backend("chutes", NOISE, SPEECH)  # another language asked for first: Russian is the other path
+    chutes.sends_wav = True  # type: ignore[attr-defined]
+    assert await RoutedSTT(chutes).transcribe(AUDIO, mime_type="audio/ogg", language=None, screen=True) == SPEECH
+    assert chutes.calls[1] == {"audio": AUDIO, "mime_type": "audio/ogg", "language": "ru"}  # it converts it itself
+    assert wav == []
+
+
+async def test_production_chutes_is_not_paid_twice_for_the_same_request(fake, make_settings, wav) -> None:
+    """The real backend with STT_CONVERT_WAV and Russian (the production setup, no local Whisper): one request."""
+    fake.stt_ok(NOISE)
+    fake.stt_ok(NOISE)
+    chutes = ChutesWhisperSTT(make_settings(stt_convert_wav=True))
+    try:
+        with pytest.raises(GarbageTranscript):
+            await RoutedSTT(chutes).transcribe(AUDIO, mime_type="audio/ogg", language="ru", screen=True, duration=4)
+    finally:
+        await chutes.close()
+    assert len(fake.stt_requests) == 1
+    assert fake.stt_requests[0]["language"] == "ru"
+
+
 async def test_a_failed_second_try_keeps_the_first_rejection() -> None:
     chutes, local = Backend("chutes", NOISE), Backend("local", AIUnavailable("timeout"))
     with pytest.raises(GarbageTranscript) as exc:
@@ -191,11 +222,11 @@ async def test_a_paid_second_try_checks_the_budget() -> None:
 
 
 async def test_the_judge_knows_the_duration_and_the_language_of_each_try(wav) -> None:
-    long_text = "Купить хлеб " * 10  # 120 characters
-    chutes = Backend("chutes", long_text, "Hello there my friend", SPEECH)
+    long_text = "Купить хлеб " * 11  # 132 characters
+    chutes = Backend("chutes", long_text, "Hello there my good old friend from work", SPEECH)
     with pytest.raises(GarbageTranscript) as exc:
         await RoutedSTT(chutes).transcribe(AUDIO, language=None, screen=True, duration=2)
-    # 60 characters a second; then Latin letters when Russian was asked for
+    # 44 characters a second (up to 3 s); then Latin letters when Russian was asked for
     assert [t["reason"] for t in exc.value.tries] == [garbage.TOO_FAST, garbage.NOT_CYRILLIC]
 
 

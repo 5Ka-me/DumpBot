@@ -44,6 +44,13 @@ def test_command_name(text: str, name: str | None) -> None:
     assert command_name(text) == name
 
 
+def test_command_name_of_an_unknown_command_is_no_text() -> None:
+    known = {"today", "tasks"}
+    assert command_name("/today@dump_bot", known=known) == "today"
+    assert command_name("/todo_pozvonit_mame", known=known) == "unknown"
+    assert command_name("купить хлеб", known=known) is None
+
+
 @pytest.mark.parametrize(
     ("cb", "action"),
     [

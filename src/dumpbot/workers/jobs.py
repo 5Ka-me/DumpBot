@@ -67,6 +67,7 @@ __all__ = [
     "pending_job",
     "requeue_deferred",
     "safe_traceback",
+    "stop_if_cancelled",
     "try_once",
 ]
 
@@ -108,6 +109,16 @@ class RetryLater(Exception):
         self.reason = reason
         self.at = at
         self.count_attempt = count_attempt
+
+
+def stop_if_cancelled() -> None:
+    """Raise ``CancelledError`` when the current task was asked to stop. A loop that keeps going after an
+    ``Exception`` needs it: a cancellation that lands mid-query can come out of the database layer as one of its own
+    errors (SQLAlchemy's ``ResourceClosedError``), the loop would log it and go on — and the shutdown would wait for
+    ever."""
+    task = asyncio.current_task()
+    if task is not None and task.cancelling():
+        raise asyncio.CancelledError
 
 
 def backoff(attempts: int) -> timedelta:
@@ -267,6 +278,7 @@ class JobWorker:
         log.info("job worker started (%d handlers)", len(self._handlers))
         self._ctx.watchdog.watch(WATCH_NAME, STALL_AFTER.total_seconds())
         while True:
+            stop_if_cancelled()
             self._ctx.watchdog.beat(WATCH_NAME)
             self._ctx.jobs_wakeup.clear()  # before claiming: a wakeup during the run is not lost
             handled = 0
@@ -278,6 +290,7 @@ class JobWorker:
                 await asyncio.sleep(0)  # more jobs may be due: go again, but let other tasks run
                 continue
             timeout = await self._wait_time()
+            stop_if_cancelled()  # not one more wait (up to the poll interval) on the way out
             try:
                 await asyncio.wait_for(self._ctx.jobs_wakeup.wait(), timeout)
             except TimeoutError:

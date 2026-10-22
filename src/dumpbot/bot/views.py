@@ -1493,8 +1493,8 @@ def stale_question(
     moves: int = 0,
 ) -> MenuView:
     """ "🕸 📌 «Сделать карту» висит 15 дней. Что делаем?" with how often it was moved and the card's time line;
-    [✅ Сделано] [💤 Когда-нибудь] / [🗑 Удалить] [Оставить]. An item saved today (moved twice already): "🕸 📌 «…»
-    переносили уже 2 раза. Что делаем?"."""
+    [✅ Сделано] [💤 Когда-нибудь] / [🗑 Удалить] [Оставить]. An item saved today: "🕸 📌 «…» переносили уже 2 раза.
+    Что делаем?" when it was moved twice, else (sat in the digests) "🕸 📌 «…» так и не сделано. Что делаем?"."""
     tz = prefs.zone
     days = (_local(now, tz).date() - _local(item.created_at, tz).date()).days
     title = f"{_kind_emoji(item.kind)} «{q(item.title)}»"
@@ -1503,8 +1503,10 @@ def stale_question(
         lines = [f"{STALE_MARK} {title} висит {days} {plural_ru(days, 'день', 'дня', 'дней')}. Что делаем?"]
         if moves >= 2:
             lines.append(f"Переносили уже {times}.")
-    else:
+    elif moves >= 2:
         lines = [f"{STALE_MARK} {title} переносили уже {times}. Что делаем?"]
+    else:
+        lines = [f"{STALE_MARK} {title} так и не сделано. Что делаем?"]
     if (line := _time_line(item, occ, reminders, prefs, now)) is not None:
         lines.append(line)
     return fit("\n".join(lines)), stale_keyboard(item.id)

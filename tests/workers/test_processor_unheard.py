@@ -3,6 +3,8 @@
 A rejected transcript is tried once more by another path; garbage twice -> no items, the transcript and the tries are
 kept with the raw message, "🎤 Не разобрал голосовое — повтори или напиши текстом" with [🔁 Ещё раз] and 🤔;
 [🔁 Ещё раз] (``processor.retry_unheard``) transcribes the same file again. A paused local Whisper is skipped.
+Only a voice note that is all the message has gets "Не разобрал": an audio file, a caption or another part of an
+album is something to go on, and the rejected transcript is only kept aside.
 """
 
 from __future__ import annotations
@@ -15,8 +17,8 @@ from sqlalchemy import select
 from dumpbot.ai import garbage, stt
 from dumpbot.bot import sender, views
 from dumpbot.bot.cbdata import AgainCb
-from dumpbot.db.models import Item, Job, RawMessage
-from dumpbot.services import processor
+from dumpbot.db.models import BotMessage, Item, RawMessage
+from dumpbot.services import processor, query
 from dumpbot.services.ingest import UNHEARD_KEY
 
 OGG = b"OGG-BYTES"
@@ -43,7 +45,8 @@ def voice(add_raw, bot):
             "duration": 4,
         }
         values.update(kw)
-        return await add_raw(None, **values)
+        text = values.pop("text", None)
+        return await add_raw(text, **values)
 
     return _add
 
@@ -124,7 +127,7 @@ async def test_the_only_backend_tries_again_as_wav(ctx, voice, bot, stt, wav, fa
 
 async def test_too_much_text_for_a_short_note_is_garbage(ctx, voice, bot, stt, wav, fake_ai, items_of_raw) -> None:
     raw = await voice(duration=2)
-    stt.results = ["Купить хлеб и молоко, " * 5] * 2  # 110 characters in 2 seconds, twice
+    stt.results = ["Купить хлеб и молоко, " * 6] * 2  # 132 characters in (at most) 3 seconds, twice
     await processor.handle_message(ctx, {"raw_id": raw.id})
     assert await items_of_raw(raw.id) == [] and fake_ai.inputs == []
     assert bot.texts == [views.UNHEARD_TEXT]
@@ -219,30 +222,123 @@ async def test_a_voice_reply_that_is_not_speech_changes_nothing(
     assert (await get(Item, item_id)).title == "Отчёт за квартал"
 
 
-async def test_an_album_part_that_is_not_speech(ctx, add_raw, bot, stt, wav, fake_ai, items_of_raw, db) -> None:
+MUSIC = "Динамичная музыка"
+
+
+async def test_an_audio_file_that_is_not_speech_goes_on_its_caption(
+    ctx, add_raw, bot, stt, wav, fake_ai, items_of_raw, get
+) -> None:
+    """A forwarded instrumental mp3 with a caption: "repeat" means nothing for a file — it is saved by its caption."""
+    bot.files["mp3"] = b"MP3"
+    raw = await add_raw(
+        "Трек для монтажа ролика", content_type="audio", file_id="mp3", file_name="track.mp3", duration=150
+    )
+    stt.results = [MUSIC, MUSIC]
+    fake_ai.push({"items": [{"kind": "link", "title": "Трек для монтажа ролика"}]})
+
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert fake_ai.inputs[0].text == "Трек для монтажа ролика"  # the caption, not the made-up words
+    assert [i.title for i in await items_of_raw(raw.id)] == ["Трек для монтажа ролика"]
+    assert views.UNHEARD_TEXT not in bot.texts and all(MUSIC not in t for t in bot.texts)
+    stored = await get(RawMessage, raw.id)
+    assert stored.status == "done" and stored.transcript == MUSIC  # kept for analysis
+    assert [t["reason"] for t in stored.raw_json[UNHEARD_KEY]["tries"]] == [garbage.HALLUCINATION] * 2
+    assert "job" not in stored.raw_json[UNHEARD_KEY]  # nothing to try again
+    assert bot.reactions[-1] == (raw.message_id, "👌")
+    async with ctx.sessionmaker() as session:  # a redrawn card shows no "🎤 «Динамичная музыка»" either
+        assert await query.heard(session, raw.id) is None
+
+
+async def test_an_audio_file_that_is_not_speech_without_a_caption_is_kept_as_audio(
+    ctx, add_raw, bot, stt, wav, fake_ai, items_of_raw
+) -> None:
+    bot.files["mp3"] = b"MP3"
+    raw = await add_raw(None, content_type="audio", file_id="mp3", file_name="track.mp3", duration=150)
+    stt.results = [MUSIC, MUSIC]
+
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert fake_ai.inputs == []
+    assert [(i.kind, i.title) for i in await items_of_raw(raw.id)] == [("other", "Аудио: track.mp3")]
+    assert views.UNHEARD_TEXT not in bot.texts
+    assert bot.reactions == [(raw.message_id, "👌")]
+
+
+async def test_a_voice_note_with_a_caption_goes_on_the_caption(
+    ctx, voice, bot, stt, wav, fake_ai, items_of_raw
+) -> None:
+    raw = await voice(text="купить батарейки")
+    stt.results = [NOISE, NOISE]
+    fake_ai.push({"items": [{"kind": "purchase", "title": "Купить батарейки"}]})
+
+    await processor.handle_message(ctx, {"raw_id": raw.id})
+
+    assert fake_ai.inputs[0].text == "купить батарейки"
+    assert [i.title for i in await items_of_raw(raw.id)] == ["Купить батарейки"]
+    assert views.UNHEARD_TEXT not in bot.texts and all(NOISE not in t for t in bot.texts)  # no "🎤 «ааа…»"
+
+
+async def test_an_album_part_that_is_not_speech_leaves_the_others(
+    ctx, add_raw, bot, stt, wav, fake_ai, items_of_raw, db
+) -> None:
     for n, file_id in enumerate(("a1", "a2")):
         bot.files[file_id] = f"MP3-{n}".encode()
         await add_raw(None, content_type="audio", file_id=file_id, duration=30, media_group_id="G", message_id=500 + n)
-    stt.results = ["Купить хлеб", NOISE, NOISE]
+    stt.results = ["Купить хлеб", MUSIC, MUSIC]
+    fake_ai.push(SAVE_TASK)
 
     await processor.handle_album(ctx, {"media_group_id": "G", "chat_id": ctx.settings.owner_id})
 
     raws = await db(select(RawMessage).order_by(RawMessage.message_id))
     assert [r.status for r in raws] == ["done", "done"]
-    assert await items_of_raw(raws[0].id) == [] and fake_ai.inputs == []
-    assert raws[0].raw_json[UNHEARD_KEY]["job"] == {
-        "kind": "album",
-        "payload": {"media_group_id": "G", "chat_id": ctx.settings.owner_id},
-    }
-    assert bot.reactions == [(500, "🤔"), (501, "🤔")]
+    assert fake_ai.inputs[0].text == "Купить хлеб"  # the usable part
+    assert [i.title for i in await items_of_raw(raws[0].id)] == ["Купить хлеб"]
+    assert UNHEARD_KEY not in raws[0].raw_json and UNHEARD_KEY in raws[1].raw_json
+    assert views.UNHEARD_TEXT not in bot.texts
+    assert bot.reactions == [(500, "👌"), (501, "👌")]
+
+
+async def test_again_forgets_only_the_rejected_transcripts(ctx, add_raw, db, jobs_all) -> None:
+    """An album answered "Не разобрал" before audio files went on their usable parts: [🔁 Ещё раз] transcribes the
+    rejected part again, the usable one is not paid for twice."""
+    album = {"content_type": "audio", "duration": 30, "media_group_id": "G", "status": "done"}
+    job = {"kind": "album", "payload": {"media_group_id": "G", "chat_id": ctx.settings.owner_id}}
+    first = await add_raw(None, message_id=500, transcript="Купить хлеб", raw_json={UNHEARD_KEY: {"job": job}}, **album)
+    tries = [{"stt": "chutes", "reason": garbage.HALLUCINATION, "text": MUSIC}]
+    await add_raw(None, message_id=501, transcript=MUSIC, raw_json={UNHEARD_KEY: {"tries": tries}}, **album)
 
     async with ctx.sessionmaker() as session:
-        assert await processor.retry_unheard(session, raws[0].id) == processor.RETRY_QUEUED
+        assert await processor.retry_unheard(session, first.id) == processor.RETRY_QUEUED
         await session.commit()
+
     raws = await db(select(RawMessage).order_by(RawMessage.message_id))
-    assert [(r.status, r.transcript) for r in raws] == [("new", None), ("new", None)]
-    [job] = await db(select(Job))
-    assert job.kind == "album"
+    assert [(r.status, r.transcript) for r in raws] == [("new", "Купить хлеб"), ("new", None)]
+    assert all(UNHEARD_KEY not in r.raw_json for r in raws)
+    [queued] = await jobs_all()
+    assert (queued.kind, queued.payload) == ("album", job["payload"])
+
+
+async def test_not_heard_after_a_voice_reply_to_a_reminder_is_about_its_item(
+    ctx, voice, bot, stt, wav, fake_ai, make_items, t0, db, jobs_all
+) -> None:
+    """ "Не разобрал" answered by text (as it asks) or by voice is the edit of the item again, not a new message: the
+    message is recorded with the item and the instance the voice note replied to."""
+    [created] = await make_items({"kind": "task", "title": "Отчёт", "when": {"day": "+1", "time": "15:00"}}, now=t0)
+    item_id, occ_id = created.item.id, created.occurrence.id
+    raw = await voice(reply_item_id=item_id)
+    stt.results = [NOISE, NOISE]
+
+    await processor.handle_edit(ctx, {"raw_id": raw.id, "item_id": item_id, "occurrence_id": occ_id})
+
+    assert bot.texts == [views.UNHEARD_TEXT]
+    [message] = await db(select(BotMessage))
+    assert (message.purpose, message.item_id, message.occurrence_id) == (sender.PURPOSE_UNHEARD, item_id, occ_id)
+    async with ctx.sessionmaker() as session:
+        assert await processor.retry_unheard(session, raw.id) == processor.RETRY_QUEUED
+        await session.commit()
+    [again] = await jobs_all()
+    assert again.payload == {"raw_id": raw.id, "item_id": item_id, "occurrence_id": occ_id}
 
 
 async def test_a_paused_local_whisper_is_skipped(

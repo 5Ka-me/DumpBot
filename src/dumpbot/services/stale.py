@@ -1,18 +1,22 @@
 """Stale items and reminders nobody reacted to, read from the events journal (docs/features/iteration-4.md §4, §6).
 
-An open item is *stale* when it sat in ``DIGESTS_IN_A_ROW`` (3) digests with nothing done about it, or was moved
-``MOVES`` (2) times: the scheduler then asks about it once — "«Сделать карту» висит 15 дней. Что делаем?" [✅ Сделано]
-[💤 Когда-нибудь] [🗑 Удалить] [Оставить] — at most one such question a day, never in quiet hours
+An open item is *stale* when it sat in digests on ``DIGESTS_IN_A_ROW`` (3) days with nothing done about it, or was
+moved ``MOVES`` (2) times: the scheduler then asks about it once — "«Сделать карту» висит 15 дней. Что делаем?"
+[✅ Сделано] [💤 Когда-нибудь] [🗑 Удалить] [Оставить] — at most one such question a day, never in quiet hours
 (``workers.scheduler``).
 
 What counts, from ``services.events``:
 
 - an *action* on an item (``is_action``): a button press naming it (its reminder, a list's [✅ N], a card…), a Mini
-  App call on it other than a read (``GET``), a change by a text message or the bulk move (``edit``);
+  App call on it other than a read (``GET``), a change by a text message or the bulk move (``edit``); an action on a
+  step of its checklist ([☑ N], the Mini App's step toggle) is an action on the parent too;
 - a *move*: an action marked ``"move": true`` ([📅 Завтра], [➡️ След. неделя / месяц], a day of the picker, a new
-  time from the Mini App, a text edit that moved it, «📅 Перенести невыполненное на завтра»);
-- the item's digests in a row: the digests (``digest_item`` events, the lines of one digest share their time) since
-  its last action, or since it was saved; the weekly review is a digest too;
+  time on another day from the Mini App or a text edit, «📅 Перенести невыполненное на завтра»);
+- the item's digests in a row: the local days with a digest listing it (``digest_item`` events) since its last action,
+  or since it was saved — the morning, the evening digest and the weekly review of one day are one day, so "3" means
+  about three days, not one missed reminder and a day. An item whose span has not begun is not counted at all, and
+  the weekly review's "сроки" lines of an item still in its span do not count (§4: a span is left alone while it runs,
+  the review lists it on purpose);
 - its moves since the last question about it (``stale_ask``), or since it was saved;
 - a question left unanswered (no action after it) is not asked again; [Оставить] is an action (and so is any other
   touch of the item), so after it the digests are counted afresh and so are the moves.
@@ -30,10 +34,11 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Final
 
-from sqlalchemy import ColumnElement, and_, distinct, exists, func, not_, or_, select
+from sqlalchemy import ColumnElement, Date, and_, cast, distinct, exists, func, not_, or_, select, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
+from dumpbot import clock
 from dumpbot.db.models import Event, Item, Occurrence
 from dumpbot.domain import timeresolve
 from dumpbot.domain.prefs import Prefs
@@ -55,11 +60,14 @@ DIGESTS_IN_A_ROW: Final = 3
 MOVES: Final = 2
 ACTION_TYPES: Final = (events.BUTTON, events.MINIAPP, events.EDIT)
 _NOT_DONE: Final = ("open", "missed")
+WEEKLY: Final = "weekly"  # data["digest"] of the weekly review's lines
+SPAN_SECTION: Final = "p"  # data["sec"] of its "сроки" section (``views.SEC_PERIOD``)
 
 
 @dataclass(frozen=True)
 class Stale:
-    """A stale item: when it was saved, its digests since the last action and its moves since the last question."""
+    """A stale item: when it was saved, its digest days since the last action and its moves since the last
+    question."""
 
     item_id: int
     created_at: datetime
@@ -82,12 +90,24 @@ def is_move(ev: Any = Event) -> ColumnElement[bool]:
     return and_(is_action(ev), ev.data[events.MOVE].as_boolean().is_(True))
 
 
-async def candidates(session: AsyncSession, *, limit: int = 10) -> list[Stale]:
-    """The stale items, saved first first (see the module docstring)."""
+async def candidates(
+    session: AsyncSession, prefs: Prefs | None = None, *, now: datetime | None = None, limit: int = 10
+) -> list[Stale]:
+    """The stale items, saved first first (see the module docstring); days are local (``prefs.tz``)."""
+    tz = (prefs or Prefs()).tz
+    today = (now or clock.utcnow()).astimezone((prefs or Prefs()).zone).date()
+    step = aliased(Item)  # an action on a step of a checklist ([☑ N]) is one on its parent too
+    acts = union_all(
+        select(Event.item_id.label("item_id"), Event.created_at.label("at")).where(
+            Event.item_id.is_not(None), is_action()
+        ),
+        select(step.parent_id.label("item_id"), Event.created_at.label("at"))
+        .join(step, step.id == Event.item_id)
+        .where(step.parent_id.is_not(None), is_action()),
+    ).subquery("acts")
     last_act = (
-        select(Event.item_id.label("item_id"), func.max(Event.created_at).label("at"))
-        .where(Event.item_id.is_not(None), is_action())
-        .group_by(Event.item_id)
+        select(acts.c.item_id.label("item_id"), func.max(acts.c.at).label("at"))
+        .group_by(acts.c.item_id)
         .subquery("last_act")
     )
     last_ask = (
@@ -97,12 +117,19 @@ async def candidates(session: AsyncSession, *, limit: int = 10) -> list[Stale]:
         .subquery("last_ask")
     )
     shown = aliased(Event)
+    in_span = and_(Item.period_end.is_not(None), Item.period_end >= today)
+    review_span_line = and_(
+        func.coalesce(shown.data["digest"].astext, "") == WEEKLY,
+        func.coalesce(shown.data["sec"].astext, "") == SPAN_SECTION,
+    )
     digests = (
-        select(func.count(distinct(shown.created_at)))
+        select(func.count(distinct(cast(func.timezone(tz, shown.created_at), Date))))
         .where(
             shown.item_id == Item.id,
             shown.type == events.DIGEST_ITEM,
             shown.created_at > func.greatest(Item.created_at, last_act.c.at),  # GREATEST skips NULL
+            not_(and_(in_span, review_span_line)),
+            or_(Item.period_start.is_(None), Item.period_start <= today),  # a span not begun is not hanging
         )
         .scalar_subquery()
     )
@@ -141,9 +168,9 @@ async def candidates(session: AsyncSession, *, limit: int = 10) -> list[Stale]:
     return [Stale(row.item_id, row.created_at, int(row.digests), int(row.moves)) for row in rows]
 
 
-async def pick(session: AsyncSession) -> Stale | None:
+async def pick(session: AsyncSession, prefs: Prefs | None = None, *, now: datetime | None = None) -> Stale | None:
     """The item to ask about now, if any."""
-    found = await candidates(session, limit=1)
+    found = await candidates(session, prefs, now=now, limit=1)
     return found[0] if found else None
 
 

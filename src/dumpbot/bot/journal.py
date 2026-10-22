@@ -1,7 +1,8 @@
 """Journal middlewares of the bot (docs/features/iteration-4.md §5, ``services.events``).
 
 - ``CommandJournal`` (inner middleware of the commands router): a ``command`` event after a slash command was
-  handled — the command's name only, never its arguments (``/search …`` carries message text).
+  handled — the command's name only, never its arguments (``/search …`` carries message text), and only a name the
+  bot knows: anything else typed after "/" ("/купить_хлеб") is ``unknown`` (it is the owner's text too).
 - ``ButtonJournal`` (inner middleware of every callback query handler, registered on the dispatcher): a ``button``
   event after a press was handled — the action of its callback data (``o:done``, ``ld:undo``, ``s:stt_mode``), the
   item / occurrence it names, and as the source the purpose of the bot message it is on (reminder, digest, list,
@@ -16,7 +17,7 @@ swallows its errors.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from typing import TYPE_CHECKING, Any, Final
 
 from aiogram import BaseMiddleware
@@ -34,6 +35,7 @@ log = logging.getLogger(__name__)
 Handler = Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]]
 
 NAME_MAX: Final = 32
+UNKNOWN_COMMAND: Final = "unknown"  # the name journaled for a command the bot does not have
 ACTION_MAX: Final = 32
 # Callback data field naming the item / occurrence of a press (classes not listed name neither).
 ITEM_FIELD: Final[dict[type[CallbackData], str]] = {
@@ -52,15 +54,19 @@ MOVE_ACTIONS: Final = frozenset({"o:tmr", "o:nw", "o:nm", "dy"})
 
 
 class CommandJournal(BaseMiddleware):
-    """``command`` event after a command handler of the router it is registered on."""
+    """``command`` event after a command handler of the router it is registered on; ``known``: the commands the bot
+    has (any other name is journaled as ``unknown``)."""
+
+    def __init__(self, known: Collection[str] | None = None) -> None:
+        self.known = frozenset(known) if known is not None else None
 
     async def __call__(self, handler: Handler, event: TelegramObject, data: dict[str, Any]) -> Any:
         result = await handler(event, data)
         ctx: AppContext | None = data.get("ctx")
         if ctx is not None and isinstance(event, Message):
-            name = command_name(event.text or event.caption or "")
+            name = command_name(event.text or event.caption or "", known=self.known)
             if name:
-                await events.record(ctx.sessionmaker, events.Entry(events.COMMAND, data={"name": name}))
+                await events.record(ctx.autocommit, events.Entry(events.COMMAND, data={"name": name}))
         return result
 
 
@@ -86,15 +92,19 @@ class ButtonJournal(BaseMiddleware):
         except Exception as e:  # never let the journal break a button
             log.warning("could not describe a button press for the journal: %s", type(e).__name__)
             return
-        await events.record(ctx.sessionmaker, entry)
+        await events.record(ctx.autocommit, entry)
 
 
-def command_name(text: str) -> str | None:
-    """``/today@dump_bot args`` -> ``today``; None when the text is not a command."""
+def command_name(text: str, *, known: Collection[str] | None = None) -> str | None:
+    """``/today@dump_bot args`` -> ``today``; None when the text is not a command. With ``known``, a name not among
+    them is ``UNKNOWN_COMMAND`` ("/kupit_hleb" is the owner's text, the journal keeps none)."""
     head = text.strip().split(maxsplit=1)[0] if text.strip() else ""
     if not head.startswith("/") or len(head) < 2:
         return None
-    return head[1:].split("@", 1)[0].lower()[:NAME_MAX] or None
+    name = head[1:].split("@", 1)[0].lower()[:NAME_MAX] or None
+    if name is not None and known is not None and name not in known:
+        return UNKNOWN_COMMAND
+    return name
 
 
 def button_entry(

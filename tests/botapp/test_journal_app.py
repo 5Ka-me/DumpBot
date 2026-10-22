@@ -35,6 +35,14 @@ async def test_a_command_is_journaled_by_name_only(feed, updates, seed, tg) -> N
     ]
 
 
+async def test_an_unknown_command_keeps_nothing_the_owner_typed(feed, updates, seed, tg) -> None:
+    """ "/kupit_hleb_i_moloko" is a note typed after "/": the journal keeps no text, only that it was a command."""
+    await feed(updates.message("/kupit_hleb_i_moloko"))
+    assert tg.sent  # "🤷 Не знаю такой команды"
+    [row] = await _events(seed)
+    assert (row.type, row.data) == ("command", {"name": "unknown"})
+
+
 async def test_a_plain_message_is_no_command(feed, updates, seed) -> None:
     await feed(updates.message("купить хлеб"))
     assert await _events(seed) == []

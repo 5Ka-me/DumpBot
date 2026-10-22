@@ -84,7 +84,8 @@ async def is_command(message: Message) -> bool:
 def make_router() -> Router:
     router = Router(name="commands")
     router.message.filter(F.chat.type == ChatType.PRIVATE)
-    router.message.middleware(CommandJournal())  # a "command" event after each (iteration 4, §5)
+    # A "command" event after each (iteration 4, §5): its name, or "unknown" for one the bot does not have.
+    router.message.middleware(CommandJournal(known=[name for name, _ in BOT_COMMANDS]))
     router.message.register(cmd_start, Command("start"))
     router.message.register(cmd_help, Command("help"))
     router.message.register(cmd_cancel, Command("cancel"))

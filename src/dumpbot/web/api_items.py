@@ -254,10 +254,12 @@ async def set_when(request: web.Request) -> web.Response:
         raise bad_request("Нужно либо text, либо due_local")
     if "due_local" in body:
         value = body["due_local"]
-        journal_note(request, move=True)  # the stale-items check counts moves (docs/features/iteration-4.md §4)
 
         async def op(session: AsyncSession, item: Item, prefs: Prefs, now: datetime) -> Change:
             result = await items.apply_patch(session, item.id, EditPatch(when=_due_when(item, value)), prefs, now)
+            # The stale-items check counts moves to another day (docs/features/iteration-4.md §4): not a new hour, not
+            # the first date of an item that had none.
+            journal_note(request, move=result.moved)
             return Change(message="🕒 Время изменено", warnings=list(result.warnings))
 
         return await _change(request, op)

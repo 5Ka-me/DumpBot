@@ -18,10 +18,10 @@ OWNER = 4242
 
 
 async def _shown(sessionmaker, item_id: int, at: datetime, count: int = 3) -> None:
-    """``count`` digests listed the item (eight hours apart, before ``at``) and nothing was done about it."""
+    """Digests listed the item on ``count`` days (a day apart, before ``at``) and nothing was done about it."""
     async with sessionmaker() as session:
         for n in range(count):
-            at_n = at - timedelta(hours=8 * (count - n))
+            at_n = at - timedelta(days=count - n)
             session.add(Event(type=events.DIGEST_ITEM, item_id=item_id, created_at=at_n, data={"digest": "morning"}))
         await session.commit()
 
@@ -92,7 +92,7 @@ async def test_the_question_of_a_span_item_puts_it_into_that_morning_digest(
     ctx, make_items, local, bot, sessionmaker
 ) -> None:
     [created] = await make_items(
-        {"kind": "task", "title": "Raspberry Pi", "when": {"period": "this_week"}}, now=local(2026, 10, 5, 8)
+        {"kind": "task", "title": "Raspberry Pi", "when": {"period": "next_week"}}, now=local(2026, 10, 4, 8)
     )
     await _shown(sessionmaker, created.item.id, local(2026, 10, 7, 9))
 
@@ -100,7 +100,7 @@ async def test_the_question_of_a_span_item_puts_it_into_that_morning_digest(
 
     digest_msg, question = bot.sent
     assert "🗓 <b>На этой неделе</b> (до вс 11 окт)\n1. 📌 Raspberry Pi" in digest_msg["text"]
-    assert "«Raspberry Pi» висит 2 дня" in question["text"]
+    assert "«Raspberry Pi» висит 3 дня" in question["text"]
 
 
 async def test_without_a_candidate_the_next_look_waits(ctx, make_items, local, bot, sessionmaker, monkeypatch) -> None:
@@ -109,9 +109,9 @@ async def test_without_a_candidate_the_next_look_waits(ctx, make_items, local, b
     looks: list[datetime] = []
     real_pick = stale.pick
 
-    async def counting_pick(session):
+    async def counting_pick(session, *args, **kwargs):
         looks.append(datetime.now())
-        return await real_pick(session)
+        return await real_pick(session, *args, **kwargs)
 
     monkeypatch.setattr(stale, "pick", counting_pick)
     scheduler = Scheduler(ctx)
@@ -199,8 +199,47 @@ async def test_a_late_weekly_review_after_a_downtime(ctx, set_prefs, make_items,
     assert len(bot.sent) == 1 and "Обзор недели" in bot.sent[0]["text"]
 
 
-async def test_a_weekly_review_too_late_is_dropped(ctx, set_prefs, make_items, local, bot) -> None:
+async def test_a_weekly_review_after_its_window_is_not_sent_without_a_downtime(
+    ctx, set_prefs, make_items, local, bot
+) -> None:
+    """The first tick ever, after the window: nothing says the bot was down at its time (a fresh start)."""
     await set_prefs(digest_morning_enabled=False, digest_evening_enabled=False, quiet_enabled=False)
     await make_items({"kind": "idea", "title": "Испанский", "when": {"period": "someday"}}, now=local(2026, 10, 6, 8))
     await Scheduler(ctx).tick(local(2026, 10, 11, 22, 1))  # the window is three hours
     assert bot.sent == []
+
+
+async def test_a_weekly_review_the_bot_was_down_for_goes_out_late(ctx, set_prefs, make_items, local, bot) -> None:
+    """Down from Sun 18:30 to 22:30 (a Render restart): the review is not dropped — it goes out at 22:30."""
+    await set_prefs(digest_morning_enabled=False, digest_evening_enabled=False)
+    await make_items({"kind": "idea", "title": "Испанский", "when": {"period": "someday"}}, now=local(2026, 10, 6, 8))
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(local(2026, 10, 11, 18, 30))
+    assert bot.sent == []
+    await scheduler.tick(local(2026, 10, 11, 22, 30))  # past the window
+    assert [m["text"].startswith("🗓 <b>Обзор недели</b>, вс 11 окт") for m in bot.sent] == [True]
+    await scheduler.tick(local(2026, 10, 11, 22, 31))
+    assert len(bot.sent) == 1
+
+
+async def test_a_weekly_review_owed_over_quiet_hours_goes_out_in_the_morning(
+    ctx, set_prefs, make_items, local, bot
+) -> None:
+    await set_prefs(digest_morning_enabled=False, digest_evening_enabled=False)
+    await make_items({"kind": "idea", "title": "Испанский", "when": {"period": "someday"}}, now=local(2026, 10, 6, 8))
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(local(2026, 10, 11, 18, 30))
+    await scheduler.tick(local(2026, 10, 12, 7, 30))  # back in quiet hours
+    await scheduler.tick(local(2026, 10, 12, 7, 31))
+    assert [m["text"] for m in bot.sent if "Обзор недели" in m["text"]] == []
+    await scheduler.tick(local(2026, 10, 12, 8, 0))  # quiet hours over: Monday, still within a day
+    assert [m["text"].startswith("🗓 <b>Обзор недели</b>, вс 11 окт") for m in bot.sent] == [True]
+
+
+async def test_a_weekly_review_owed_for_more_than_a_day_is_dropped(ctx, set_prefs, make_items, local, bot) -> None:
+    await set_prefs(digest_morning_enabled=False, digest_evening_enabled=False)
+    await make_items({"kind": "idea", "title": "Испанский", "when": {"period": "someday"}}, now=local(2026, 10, 6, 8))
+    scheduler = Scheduler(ctx)
+    await scheduler.tick(local(2026, 10, 11, 18, 30))
+    await scheduler.tick(local(2026, 10, 12, 19, 30))  # back on Monday evening: last week's review is old news
+    assert [m["text"] for m in bot.sent if "Обзор недели" in m["text"]] == []

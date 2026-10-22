@@ -87,10 +87,12 @@ async def test_two_times_a_day_then_stop(e2e: Any) -> None:
     assert edit.text.endswith("🔁 повтор остановлен")
     assert e2e.tg.toasts()[-1] == "⏹ Повтор остановлен"
     item = await e2e.item("Выпить таблетки")
-    assert item.rec_active is False
-    # only this morning's instance, never ticked, is still open (it stays on the overdue list)
-    open_ = [o for o in await e2e.occurrences(item.id) if o.status == "open"]
-    assert [wall(o.due_at) for o in open_] == ["2026-10-07 09:00"]
+    # this morning's instance, never ticked, was missed: nothing is left open, the stopped series is done (not an
+    # overdue item for ever)
+    assert (item.rec_active, item.status) == (False, "done")
+    statuses = {wall(o.due_at): o.status for o in await e2e.occurrences(item.id)}
+    assert (statuses["2026-10-07 09:00"], statuses["2026-10-07 18:00"]) == ("missed", "done")
+    assert "open" not in statuses.values()
     assert await reminders_at(e2e, local(2026, 10, 8, 9, 0)) == []
     assert await reminders_at(e2e, local(2026, 10, 8, 18, 0)) == []
 

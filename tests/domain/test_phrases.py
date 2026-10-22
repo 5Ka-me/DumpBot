@@ -6,7 +6,15 @@ from datetime import time
 
 import pytest
 
-from dumpbot.domain.phrases import clock_times, lost_times, only_stop_request, stop_request, understood_only
+from dumpbot.domain.phrases import (
+    NamedTime,
+    clock_times,
+    lost_times,
+    named_times,
+    only_stop_request,
+    stop_request,
+    understood_only,
+)
 
 # --- stop phrases -------------------------------------------------------------------------------------------------
 
@@ -97,6 +105,12 @@ def test_not_a_stop(text: str | None):
         ("iPhone15 в 2026 году", []),
         ("1.10 в банк", []),
         ("", []),
+        # places and the accounting software after "в": no times
+        ("каждый вторник в 18:00 кружок в 5 кабинете", [time(18)]),
+        ("по пятницам в 17:00 сдать отчёт в 1С", [time(17)]),
+        ("в 10:00 пара в 3 корпусе", [time(10)]),
+        ("в 9 тренировка в 2 зала, в 3 круга", [time(9)]),
+        ("встреча в 9 с Олегом и в 18 с Машей", [time(9), time(18)]),  # "с" after a space is a time's company
     ],
 )
 def test_clock_times(text: str, times: list[time]):
@@ -107,6 +121,28 @@ def test_lost_times_compares_on_a_twelve_hour_dial():
     assert lost_times([time(9), time(18)], [time(9)]) == [time(18)]
     assert lost_times([time(9), time(6)], [time(9), time(18)]) == []  # "в 6" saved as 18:00
     assert lost_times([time(9), time(18)], []) == [time(9), time(18)]
+
+
+def test_named_times_know_a_bare_hour():
+    assert named_times("в 8 и 20:00, в 7 утра, в 6 вечера, в 9.30, в 10 часов") == [
+        NamedTime(time(8), either_half=True),
+        NamedTime(time(20)),
+        NamedTime(time(7)),
+        NamedTime(time(18)),
+        NamedTime(time(9, 30)),
+        NamedTime(time(10), either_half=True),
+    ]
+
+
+def test_only_a_bare_hour_may_be_the_other_half_of_the_day():
+    """ "8:00 и 20:00" kept as 08:00 lost 20:00 (the 12-hour dial would have hidden it); "в 6" kept as 18:00 did not."""
+    assert lost_times(named_times("каждый день в 8:00 и 20:00"), [time(8)]) == [time(20)]
+    assert lost_times(named_times("в 9 и в 6"), [time(9), time(18)]) == []
+
+
+def test_one_kept_time_stands_for_one_named_time():
+    assert lost_times(named_times("в 8 и в 20"), [time(8)]) == [time(20)]  # one 08:00 is not both
+    assert lost_times(named_times("в 8 и в 20"), [time(8), time(20)]) == []
 
 
 def test_understood_only():

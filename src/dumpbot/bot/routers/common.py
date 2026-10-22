@@ -16,7 +16,8 @@ from dumpbot.bot import sender, views
 from dumpbot.bot.cards import card_view  # the routers call it as common.card_view
 from dumpbot.bot.cbdata import ItemCb
 from dumpbot.bot.keyboards import button, markup
-from dumpbot.bot.states import ANSWER_TTL, PROMPT_TTL, EditStates, SettingsStates, expired
+from dumpbot.bot.states import ANSWER_TTL, ORIGIN_REMINDER, PROMPT_TTL, EditStates, SettingsStates, expired
+from dumpbot.db.models import Occurrence
 from dumpbot.domain.recurrence import describe_rrule_ru
 from dumpbot.services import items
 
@@ -73,6 +74,24 @@ def _rule_text(rule: str | None) -> str:
         return describe_rrule_ru(rule)
     except ValueError:
         return rule
+
+
+async def prompt_origin_view(session: AsyncSession, data: dict[str, Any], prefs: Prefs, now: datetime) -> View | None:
+    """What an edit prompt turns back into: the reminder it was opened from ([Другая дата…] of the day picker,
+    ``ORIGIN_REMINDER``: the message stays a reminder, with its buttons), else the item's card. None without the
+    item."""
+    item = await items.get_item(session, data["item_id"])
+    if item is None:
+        return None
+    occ_id = data.get("occ_id")
+    if data.get("origin") == ORIGIN_REMINDER and isinstance(occ_id, int) and item.status != "deleted":
+        occ = await session.get(Occurrence, occ_id)
+        if occ is not None and occ.item_id == item.id and occ.status in ("open", "done"):
+            parent = await items.get_item(session, item.parent_id) if item.parent_id is not None else None
+            if occ.status == "done":
+                return views.reminder_done(item, occ, prefs, now)
+            return views.reminder_message(item, occ, None, prefs, now, parent_title=parent.title if parent else None)
+    return await card_view(session, item, prefs, now)
 
 
 def message_id_of(callback: CallbackQuery) -> int | None:
@@ -167,8 +186,7 @@ async def _prompt_origin(
 ) -> View | None:
     if current in EditStates and isinstance(data.get("item_id"), int):
         async with ctx.sessionmaker() as session:
-            item = await items.get_item(session, data["item_id"])
-            return await card_view(session, item, prefs, now) if item is not None else None
+            return await prompt_origin_view(session, data, prefs, now)
     if current == SettingsStates.value.state:
         field = views.ASK_FIELDS.get(str(data.get("field")))
         return views.settings_view(field.menu if field else "main", prefs)

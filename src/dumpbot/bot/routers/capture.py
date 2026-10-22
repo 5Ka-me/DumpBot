@@ -3,7 +3,9 @@
 Fast and AI-free: save (idempotent per chat/message id) + enqueue in one transaction -> react 👀 -> wake the job
 worker. A leading "?" forces query mode (the text is stored as is; the processor strips the "?"). A reply goes by
 what it answers (``reply_target``):
-- a bot message linked to an item (card, reminder) -> an edit of that item (job "edit");
+- a bot message linked to an item (card, reminder, "🎤 Не разобрал" after a voice reply) -> an edit of that item
+  (job "edit"); a reminder's (and that "Не разобрал"'s) instance goes with it: "готово" to the 18:00 reminder of
+  "в 9:00 и 18:00" is about the 18:00 one;
 - the owner's own message -> an edit of the item saved from it; several items -> "Какую запись изменить?";
 - the clarifying question 🤔 (text) -> its answer (job "clarify", like an option button);
 - "Какую запись изменить?" with a number -> that item (job "edit", like its button);
@@ -36,6 +38,10 @@ if TYPE_CHECKING:
     from dumpbot.dto import Row
 
 log = logging.getLogger(__name__)
+
+# Bot messages about one instance of their item: a reply to them is about that instance (the reminder of the 18:00 of
+# a series, not this morning's), not just the item.
+INSTANCE_PURPOSES: Final = frozenset({"reminder", sender.PURPOSE_UNHEARD})
 
 # Content worth saving; service messages (pins, auto-delete timer changes…) are ignored. "unknown" (a type newer
 # than this aiogram) is kept: better an "other" item than a lost message.
@@ -71,6 +77,7 @@ class Reply:
     """What a reply answers; the default (nothing) means a plain new message."""
 
     item_id: int | None = None  # edit this item (job "edit")
+    occurrence_id: int | None = None  # ... this instance of it (a reply to its reminder)
     candidates: tuple[Row, ...] = ()  # the owner's own message gave several items: ask which one
     clarify_raw: int | None = None  # answer to the clarifying question about this raw message
     pick: tuple[int, int] | None = None  # (raw id of the edit, item id) picked from the candidates by number
@@ -102,11 +109,18 @@ async def capture(message: Message, ctx: AppContext) -> None:
     elif len(reply.candidates) > 1:
         await _ask_which(ctx, message, reply.candidates)
         return
-    await save(ctx, message, force_query=reply.question, reply_item_id=reply.item_id)
+    await save(
+        ctx, message, force_query=reply.question, reply_item_id=reply.item_id, reply_occurrence_id=reply.occurrence_id
+    )
 
 
 async def save(
-    ctx: AppContext, message: Message, *, force_query: bool = False, reply_item_id: int | None = None
+    ctx: AppContext,
+    message: Message,
+    *,
+    force_query: bool = False,
+    reply_item_id: int | None = None,
+    reply_occurrence_id: int | None = None,
 ) -> None:
     """Save the message (``?`` at the start forces query mode too), queue its job, react 👀, wake the worker."""
     async with ctx.sessionmaker() as session:
@@ -114,15 +128,18 @@ async def save(
             session, message, force_query=force_query or is_force_query(message), reply_item_id=reply_item_id
         )
         if created:
-            await ingest.enqueue_processing(session, raw, clock.utcnow())
+            await ingest.enqueue_processing(session, raw, clock.utcnow(), occurrence_id=reply_occurrence_id)
         await session.commit()
     if not created:  # a redelivered update: it was queued (and reacted to) the first time
         log.info("message %s was already saved", message.message_id)
         return
     if not raw.media_group_id:  # its job ("message", or "edit" for a reply to a card) takes it as it is
         ctx.keep_fresh(raw)
-    ctx.jobs_wakeup.set()  # the worker starts while the reaction is on its way
-    await sender.react(ctx, message.message_id, sender.REACT_SEEN)
+    # The worker starts while the reaction is on its way; the job's own reaction waits for this one (a slow 👀 must
+    # not replace its final 👌).
+    seen = sender.react_soon(ctx, message.message_id, sender.REACT_SEEN)
+    ctx.jobs_wakeup.set()
+    await seen
 
 
 async def reply_target(session: AsyncSession, ctx: AppContext, message: Message) -> Reply:
@@ -140,7 +157,8 @@ async def reply_target(session: AsyncSession, ctx: AppContext, message: Message)
     if row is None:
         return Reply()
     if row.item_id is not None:
-        return Reply(item_id=row.item_id)
+        occurrence_id = row.occurrence_id if row.purpose in INSTANCE_PURPOSES else None
+        return Reply(item_id=row.item_id, occurrence_id=occurrence_id)
     if row.purpose == sender.PURPOSE_QUESTION:
         return Reply(question=True)
     text = (message.text or "").strip()

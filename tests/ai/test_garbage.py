@@ -43,11 +43,17 @@ def test_digits_and_punctuation_are_not_letters() -> None:
 
 
 def test_more_than_forty_characters_per_second() -> None:
+    # Telegram's duration is whole seconds, cut down: a "1 s" note is up to 2 s long, so it is measured as duration + 1
     text = "Купить хлеб " * 9  # 108 characters
-    assert garbage_reason(text, duration=2) == garbage.TOO_FAST  # 54 / s
-    assert garbage_reason(text, duration=3) is None  # 36 / s
+    assert garbage_reason(text, duration=1) == garbage.TOO_FAST  # 54 / s even over 2 s
+    assert garbage_reason(text, duration=2) is None  # 36 / s over 3 s
     assert garbage_reason(text, duration=None) is None  # unknown: not judged
     assert garbage_reason(text, duration=0) is None
+
+
+def test_a_fast_speaker_just_under_two_seconds_is_speech() -> None:
+    # 46 characters in a note Telegram calls 1 s (it may be 1.9 s): a quick list, not a page made up from noise
+    assert garbage_reason("Купить хлеб, молоко, яйца, сыр и масло завтра", duration=1, language="ru") is None
 
 
 def test_cyrillic_share_only_for_russian() -> None:
@@ -58,9 +64,18 @@ def test_cyrillic_share_only_for_russian() -> None:
 
 
 def test_cyrillic_share_threshold() -> None:
-    # 3 Cyrillic letters of 10 = 30 %: enough; 2 of 10: not
-    assert garbage_reason("абв abcdefg", language="ru") is None
-    assert garbage_reason("аб abcdefgh", language="ru") == garbage.NOT_CYRILLIC
+    # 6 Cyrillic letters of 20 = 30 %: enough; 5 of 20: not
+    assert garbage_reason("абвгде abcdefghijklmn", language="ru") is None
+    assert garbage_reason("абвгд abcdefghijklmno", language="ru") == garbage.NOT_CYRILLIC
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["Zoom с Lead в 15:00", "Zoom call в 3", "Deploy на prod", "Code review", "Pull request", "OK.", "Okay."],
+)
+def test_short_notes_with_english_words_are_speech(text: str) -> None:
+    # under 20 letters the share says nothing (and a second try would only hear the same words again)
+    assert garbage_reason(text, duration=3, language="ru") is None
 
 
 @pytest.mark.parametrize(
